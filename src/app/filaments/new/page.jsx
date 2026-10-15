@@ -18,7 +18,7 @@ function NewFilamentContent() {
     const [initialData, setInitialData] = useState(undefined);
     const [formKey, setFormKey] = useState(0);
     const [titleKey, setTitleKey] = useState("new.title");
-    const { dirtyRef, onDirtyChange, showUnsavedDialog, handleBack, guardLink, navigate, confirmNav, cancelNav, } = useUnsavedChanges("/");
+    const { dirtyRef, onDirtyChange, showUnsavedDialog, handleBack, navigate, confirmNav, cancelNav, } = useUnsavedChanges("/");
     // Pending populate-from action (held while confirmation is shown)
     const pendingPopulateRef = useRef(null);
     // INI picker state
@@ -71,12 +71,6 @@ function NewFilamentContent() {
     const [prusamentOpen, setPrusamentOpen] = useState(false);
     const [prusamentLoading, setPrusamentLoading] = useState(false);
     const prusamentRef = useRef(null);
-    // TDS import state
-    const [tdsOpen, setTdsOpen] = useState(false);
-    const [tdsUrl, setTdsUrl] = useState("");
-    const [tdsLoading, setTdsLoading] = useState(false);
-    const tdsRef = useRef(null);
-    const tdsFileRef = useRef(null);
     // Clone picker state
     const [cloneSearch, setCloneSearch] = useState("");
     const [cloneOptions, setCloneOptions] = useState([]);
@@ -367,9 +361,6 @@ function NewFilamentContent() {
             if (prusamentRef.current && !prusamentRef.current.contains(e.target)) {
                 setPrusamentOpen(false);
             }
-            if (tdsRef.current && !tdsRef.current.contains(e.target)) {
-                setTdsOpen(false);
-            }
         }
         document.addEventListener("mousedown", handleClick);
         return () => document.removeEventListener("mousedown", handleClick);
@@ -525,7 +516,8 @@ function NewFilamentContent() {
                 type: data.material || "PLA",
                 color: data.colorHex || "#808080",
                 diameter: data.diameter ?? 1.75,
-                cost: data.priceUsd ?? null,
+                // Prusament quotes USD; enter the actual purchase cost in INR.
+                cost: null,
                 temperatures: {
                     nozzle: data.nozzleTempMax ?? null,
                     nozzleFirstLayer: data.nozzleTempMin ?? data.nozzleTempMax ?? null,
@@ -547,136 +539,6 @@ function NewFilamentContent() {
         }
         finally {
             setPrusamentLoading(false);
-        }
-    };
-    // Apply extracted TDS data to the form
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const applyTdsResult = (result, sourceUrl) => {
-        const d = result.data;
-        setInitialData({
-            name: d.name || "",
-            vendor: d.vendor || "",
-            type: d.type || "PLA",
-            density: d.density ?? null,
-            diameter: d.diameter ?? 1.75,
-            temperatures: {
-                nozzle: d.temperatures?.nozzle ?? null,
-                nozzleFirstLayer: d.temperatures?.nozzleRangeMin ?? d.temperatures?.nozzle ?? null,
-                nozzleRangeMin: d.temperatures?.nozzleRangeMin ?? null,
-                nozzleRangeMax: d.temperatures?.nozzleRangeMax ?? null,
-                bed: d.temperatures?.bed ?? null,
-                // GH #518: the AI used to be prompted for bedRangeMin (since
-                // dropped — the schema doesn't store bed ranges). The fallback
-                // here was also semantically wrong: the AI's "minimum
-                // operating bed temp" was being routed to "first-layer bed
-                // temp", but first-layer is typically the HIGHER value (better
-                // adhesion), not the lower. Fall back to the recommended bed
-                // temp only.
-                bedFirstLayer: d.temperatures?.bed ?? null,
-            },
-            dryingTemperature: d.dryingTemperature ?? null,
-            dryingTime: d.dryingTime ?? null,
-            glassTempTransition: d.glassTempTransition ?? null,
-            heatDeflectionTemp: d.heatDeflectionTemp ?? null,
-            shoreHardnessA: d.shoreHardnessA ?? null,
-            shoreHardnessD: d.shoreHardnessD ?? null,
-            maxVolumetricSpeed: d.maxVolumetricSpeed ?? null,
-            minPrintSpeed: d.minPrintSpeed ?? null,
-            maxPrintSpeed: d.maxPrintSpeed ?? null,
-            netFilamentWeight: d.netFilamentWeight ?? null,
-            spoolWeight: d.spoolWeight ?? null,
-            ...(sourceUrl ? { tdsUrl: sourceUrl } : {}),
-        });
-        setTitleKey("new.fromTds");
-        setFormKey((k) => k + 1);
-        setTdsOpen(false);
-        setTdsUrl("");
-        toast(t("new.toast.extractedFromTds", { count: result.fieldsExtracted }));
-    };
-    // Get AI config from Electron store (if available)
-    const getAiConfig = async () => {
-        const api = window.electronAPI;
-        if (api?.getConfig) {
-            const cfg = await api.getConfig();
-            return {
-                apiKey: cfg.aiApiKey || cfg.geminiApiKey || undefined,
-                provider: cfg.aiProvider || undefined,
-            };
-        }
-        return { apiKey: undefined, provider: undefined };
-    };
-    // Handle TDS extraction from URL
-    const handleTds = async () => {
-        const url = tdsUrl.trim();
-        if (!url)
-            return;
-        if (dirtyRef.current) {
-            guardPopulate(() => { handleTdsFetch(url); });
-            return;
-        }
-        handleTdsFetch(url);
-    };
-    const handleTdsFetch = async (url) => {
-        setTdsLoading(true);
-        try {
-            const { apiKey, provider } = await getAiConfig();
-            const res = await fetch("/api/tds", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ url, apiKey, provider }),
-            });
-            const result = await res.json();
-            if (!res.ok) {
-                toast(result.error || t("new.toast.tdsExtractFailed"), "error");
-                return;
-            }
-            applyTdsResult(result, url);
-        }
-        catch {
-            toast(t("new.toast.tdsExtractFailed"), "error");
-        }
-        finally {
-            setTdsLoading(false);
-        }
-    };
-    // Handle TDS extraction from uploaded file
-    const handleTdsFile = async (e) => {
-        const file = e.target.files?.[0];
-        if (!file)
-            return;
-        e.target.value = ""; // reset so same file can be re-selected
-        if (dirtyRef.current) {
-            guardPopulate(() => { handleTdsFileFetch(file); });
-            return;
-        }
-        handleTdsFileFetch(file);
-    };
-    const handleTdsFileFetch = async (file) => {
-        setTdsLoading(true);
-        try {
-            const { apiKey, provider } = await getAiConfig();
-            const formData = new FormData();
-            formData.append("file", file);
-            if (apiKey)
-                formData.append("apiKey", apiKey);
-            if (provider)
-                formData.append("provider", provider);
-            const res = await fetch("/api/tds", {
-                method: "POST",
-                body: formData,
-            });
-            const result = await res.json();
-            if (!res.ok) {
-                toast(result.error || t("new.toast.tdsExtractFailed"), "error");
-                return;
-            }
-            applyTdsResult(result);
-        }
-        catch {
-            toast(t("new.toast.tdsExtractFailed"), "error");
-        }
-        finally {
-            setTdsLoading(false);
         }
     };
     // Handle clone selection
@@ -741,11 +603,17 @@ function NewFilamentContent() {
       <h1 className="text-2xl font-bold mb-6">{t(titleKey)}</h1>
 
       {/* Populate-from toolbar */}
-      {!parentId && (<div className="mb-6 p-3 bg-gray-50 dark:bg-gray-900/50 rounded-lg border border-border dark:border-border">
-          <div className="text-xs text-gray-500 mb-2 font-medium uppercase tracking-wider">{t("new.populateFrom")}</div>
-          <div className="flex flex-wrap gap-2 items-start">
+      {!parentId && (<div className="mb-6 rounded-xl border border-border bg-gray-50 p-4 dark:bg-gray-900/50">
+          <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-semibold text-foreground">{t("new.populateFrom")}</h2>
+              <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">{t("new.quickSetupDescription")}</p>
+            </div>
+            <span className="rounded-full border border-border bg-white px-2.5 py-1 text-xs font-medium text-foreground dark:bg-gray-800">{t("new.inrPrices")}</span>
+          </div>
+          <div className="grid grid-cols-1 items-stretch gap-2 sm:grid-cols-3">
             {/* NFC */}
-            {isElectron && (<div className="flex items-center gap-1.5">
+            {isElectron && (<div className="col-span-full mb-1 flex items-center gap-1.5">
                 <div className={`w-2 h-2 rounded-full ${nfcStatus.tagPresent ? "bg-green-500" : nfcStatus.readerConnected ? "bg-yellow-500" : "bg-gray-500"}`}/>
                 <span className="text-sm text-gray-400">
                   {nfcStatus.tagPresent
@@ -758,20 +626,20 @@ function NewFilamentContent() {
 
             {/* Prusament QR */}
             <div ref={prusamentRef} className="relative">
-              <button type="button" onClick={() => setPrusamentOpen((o) => !o)} className="px-3 py-1.5 text-sm bg-orange-600 text-white rounded hover:bg-orange-700 inline-flex items-center gap-1.5">
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <button type="button" onClick={() => { setCloneOpen(false); setPrusamentOpen((o) => !o); }} aria-expanded={prusamentOpen} aria-controls="prusament-lookup" className="flex h-full w-full items-start gap-2.5 rounded-lg border border-border bg-white p-3 text-left text-sm text-foreground transition-colors hover:border-orange-400 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-orange-500 dark:bg-gray-800">
+                <svg aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3.75 4.875c0-.621.504-1.125 1.125-1.125h4.5c.621 0 1.125.504 1.125 1.125v4.5c0 .621-.504 1.125-1.125 1.125h-4.5A1.125 1.125 0 013.75 9.375v-4.5zM3.75 14.625c0-.621.504-1.125 1.125-1.125h4.5c.621 0 1.125.504 1.125 1.125v4.5c0 .621-.504 1.125-1.125 1.125h-4.5a1.125 1.125 0 01-1.125-1.125v-4.5zM13.5 4.875c0-.621.504-1.125 1.125-1.125h4.5c.621 0 1.125.504 1.125 1.125v4.5c0 .621-.504 1.125-1.125 1.125h-4.5A1.125 1.125 0 0113.5 9.375v-4.5z"/>
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.5 14.625v2.625m3.375-2.625v2.625M16.875 20.25h-3.375v-3.375"/>
                 </svg>
-                {t("new.prusamentQr")}
+                <span><span className="block font-medium">{t("new.prusamentQr")}</span><span className="mt-1 block text-xs text-gray-500 dark:text-gray-400">{t("new.prusamentDescription")}</span></span>
               </button>
-              {prusamentOpen && (<div className="absolute z-50 mt-1 w-80 bg-white dark:bg-gray-800 border border-border dark:border-border rounded-lg shadow-lg p-3">
+              {prusamentOpen && (<div id="prusament-lookup" className="absolute left-0 z-50 mt-2 w-80 max-w-[calc(100vw-4rem)] bg-white dark:bg-gray-800 border border-border dark:border-border rounded-lg shadow-lg p-3">
                   <label className="text-xs text-gray-500 dark:text-gray-400 block mb-1.5">{t("new.prusament.inputLabel")}</label>
                   <div className="flex gap-2">
                     <input type="text" value={prusamentInput} onChange={(e) => setPrusamentInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") {
                 e.preventDefault();
                 handlePrusament();
-            } }} placeholder={t("new.prusament.inputPlaceholder")} className="flex-1 px-2.5 py-1.5 bg-white dark:bg-gray-900 border border-border dark:border-border rounded text-sm text-gray-900 dark:text-gray-100 outline-none placeholder-gray-400 dark:placeholder-gray-500" autoFocus/>
+            } }} placeholder={t("new.prusament.inputPlaceholder")} className="min-w-0 flex-1 px-2.5 py-1.5 bg-white dark:bg-gray-900 border border-border dark:border-border rounded text-sm text-gray-900 dark:text-gray-100 outline-none placeholder-gray-400 dark:placeholder-gray-500" autoFocus/>
                     <button type="button" onClick={handlePrusament} disabled={prusamentLoading || !prusamentInput.trim()} className="px-3 py-1.5 text-sm bg-orange-600 text-white rounded hover:bg-orange-700 disabled:opacity-50">
                       {prusamentLoading ? "..." : t("new.prusament.fetch")}
                     </button>
@@ -779,65 +647,24 @@ function NewFilamentContent() {
                 </div>)}
             </div>
 
-            {/* TDS Import */}
-            <div ref={tdsRef} className="relative">
-              <button type="button" onClick={() => setTdsOpen((o) => !o)} className="px-3 py-1.5 text-sm bg-purple-600 text-white rounded hover:bg-purple-700 inline-flex items-center gap-1.5">
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.455 2.456L21.75 6l-1.036.259a3.375 3.375 0 00-2.455 2.456z"/>
-                </svg>
-                {t("new.importFromTds")}
-              </button>
-              {tdsOpen && (<div className="absolute z-50 mt-1 w-96 bg-white dark:bg-gray-800 border border-border dark:border-border rounded-lg shadow-lg p-3">
-                  <label className="text-xs text-gray-500 dark:text-gray-400 block mb-1.5">{t("new.tds.urlLabel")}</label>
-                  <div className="flex gap-2">
-                    <input type="text" value={tdsUrl} onChange={(e) => setTdsUrl(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") {
-                e.preventDefault();
-                handleTds();
-            } }} placeholder="https://example.com/filament-tds.pdf" className="flex-1 px-2.5 py-1.5 bg-white dark:bg-gray-900 border border-border dark:border-border rounded text-sm text-gray-900 dark:text-gray-100 outline-none placeholder-gray-400 dark:placeholder-gray-500" autoFocus/>
-                    <button type="button" onClick={handleTds} disabled={tdsLoading || !tdsUrl.trim()} className="px-3 py-1.5 text-sm bg-purple-600 text-white rounded hover:bg-purple-700 disabled:opacity-50 whitespace-nowrap">
-                      {tdsLoading ? t("new.tds.extracting") : t("new.tds.extract")}
-                    </button>
-                  </div>
-                  <div className="flex items-center gap-2 mt-2">
-                    <div className="flex-1 border-t border-border dark:border-border"/>
-                    <span className="text-xs text-gray-400 dark:text-gray-600">{t("new.tds.or")}</span>
-                    <div className="flex-1 border-t border-border dark:border-border"/>
-                  </div>
-                  <input ref={tdsFileRef} type="file" accept=".pdf,.html,.htm,.txt" onChange={handleTdsFile} className="hidden"/>
-                  <button type="button" onClick={() => tdsFileRef.current?.click()} disabled={tdsLoading} className="mt-2 w-full px-3 py-1.5 text-sm bg-gray-200 text-gray-700 hover:bg-gray-300 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600 rounded disabled:opacity-50 inline-flex items-center justify-center gap-1.5">
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/>
-                    </svg>
-                    {tdsLoading ? t("new.tds.extracting") : t("new.tds.uploadLocalFile")}
-                  </button>
-                  <p className="text-xs text-gray-500 mt-2">
-                    {t("new.tds.aiDescription")}
-                    {" "}
-                    <Link href="/settings/ai" className="text-foreground hover:text-foreground dark:text-foreground dark:hover:text-blue-300 underline" onClick={guardLink("/settings/ai")}>
-                      {t("new.tds.configureApiKey")}
-                    </Link>
-                  </p>
-                </div>)}
-            </div>
-
             {/* INI file */}
             <input ref={iniFileRef} type="file" accept=".ini" onChange={handleIniFile} className="hidden"/>
-            <button type="button" onClick={() => iniFileRef.current?.click()} className="px-3 py-1.5 text-sm bg-amber-600 text-white rounded hover:bg-amber-700 inline-flex items-center gap-1.5">
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <button type="button" onClick={() => iniFileRef.current?.click()} className="flex h-full w-full items-start gap-2.5 rounded-lg border border-border bg-white p-3 text-left text-sm text-foreground transition-colors hover:border-amber-400 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-500 dark:bg-gray-800">
+              <svg aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
               </svg>
-              {t("new.loadFromIni")}
+              <span><span className="block font-medium">{t("new.loadFromIni")}</span><span className="mt-1 block text-xs text-gray-500 dark:text-gray-400">{t("new.iniDescription")}</span></span>
             </button>
 
             {/* Clone */}
             <div ref={cloneRef} className="relative">
-              <button type="button" onClick={() => setCloneOpen((o) => !o)} className="px-3 py-1.5 text-sm ui-primary text-white rounded hover:opacity-90 inline-flex items-center gap-1.5">
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <button type="button" onClick={() => { setPrusamentOpen(false); setCloneOpen((o) => !o); }} aria-expanded={cloneOpen} aria-controls="clone-filament-picker" className="flex h-full w-full items-start gap-2.5 rounded-lg border border-border bg-white p-3 text-left text-sm text-foreground transition-colors hover:border-gray-400 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary dark:bg-gray-800">
+                <svg aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
                 </svg>
-                {t("new.cloneExisting")}
+                <span><span className="block font-medium">{t("new.cloneExisting")}</span><span className="mt-1 block text-xs text-gray-500 dark:text-gray-400">{t("new.cloneDescription")}</span></span>
               </button>
-              {cloneOpen && (<div className="absolute z-50 mt-1 w-80 bg-white dark:bg-gray-800 border border-border dark:border-border rounded-lg shadow-lg">
+              {cloneOpen && (<div id="clone-filament-picker" className="absolute left-0 z-50 mt-2 w-80 max-w-[calc(100vw-4rem)] sm:left-auto sm:right-0 bg-white dark:bg-gray-800 border border-border dark:border-border rounded-lg shadow-lg">
                   <input className="w-full px-3 py-2 bg-transparent border-b border-border dark:border-border text-sm text-gray-900 dark:text-gray-100 outline-none placeholder-gray-400 dark:placeholder-gray-500" placeholder={t("new.clone.searchPlaceholder")} value={cloneSearch} onChange={(e) => { setCloneSearch(e.target.value); setCloneHighlight(-1); }} onKeyDown={(e) => {
                     if (e.key === "ArrowDown") {
                         e.preventDefault();

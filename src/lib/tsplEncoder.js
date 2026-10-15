@@ -148,6 +148,7 @@ export function dotsToMm(dots, dpi = DPI_203) {
  *   Do not "simplify" this back to a codepage. The hardware says no.
  */
 const TRANSLITERATIONS = new Map([
+    ["₹", "INR"],
     // Units and symbols this app actually produces.
     ["°", "deg"],
     ["³", "3"],

@@ -351,6 +351,7 @@ describe("toAscii — the encoding decision, settled on hardware", () => {
         expect(toAscii("1\u202f234")).toBe("1 234");
     });
     it("maps currency symbols used by the price fields", () => {
+        expect(toAscii("₹1,23,456.78")).toBe("INR1,23,456.78");
         expect(toAscii("€10 £5 ¥900")).toBe("EUR10 GBP5 JPY900");
     });
     it("collapses anything else to a visible placeholder rather than dropping it", () => {

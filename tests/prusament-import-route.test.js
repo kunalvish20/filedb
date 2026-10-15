@@ -114,7 +114,8 @@ describe("POST /api/prusament/import", () => {
             const stored = await Filament.findOne({ name: "Prusament PLA Galaxy Black" });
             expect(stored).toBeTruthy();
             expect(stored.vendor).toBe("Prusa Research");
-            expect(stored.cost).toBe(29.99);
+            // Foreign catalogue prices must never be relabelled as INR costs.
+            expect(stored.cost).toBeNull();
             expect(stored.temperatures.nozzle).toBe(225);
             expect(stored.temperatures.bed).toBe(60);
             expect(stored.tdsUrl).toBe("https://prusament.com/spool/1086170252");
@@ -129,6 +130,7 @@ describe("POST /api/prusament/import", () => {
                 name: "Prusament PLA Galaxy Black",
                 vendor: "Prusa Research",
                 type: "PLA",
+                cost: 2499,
             });
             const res = await POST(postReq({ spool: validSpool(), action: "create" }));
             expect(res.status).toBe(200);
@@ -137,6 +139,7 @@ describe("POST /api/prusament/import", () => {
             expect(body.message).toMatch(/already exists/);
             const rows = await Filament.find({ name: "Prusament PLA Galaxy Black" });
             expect(rows).toHaveLength(1);
+            expect(rows[0].cost).toBe(2499);
             expect(rows[0].spools).toHaveLength(1);
             // #732: the existing-name $push fallback spool carries an instanceId.
             expect(rows[0].spools[0].instanceId).toMatch(/^[0-9a-f]{10}$/);

@@ -271,12 +271,11 @@ export default function PrusamentImportDialog({ onClose, onImported, targetFilam
                   </div>
                   <div className="text-zinc-500">{t("prusament.import.manufactured")}</div>
                   <div>{spool.manufactureDate.split(" ")[0]}</div>
-                  {spool.priceUsd && (<>
-                      <div className="text-zinc-500">{t("prusament.import.price")}</div>
-                      <div>${spool.priceUsd}</div>
-                    </>)}
                 </div>
               </div>
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                {t("prusament.import.inrCostHint")}
+              </p>
 
               {/* Action selector */}
               <div className="space-y-3">

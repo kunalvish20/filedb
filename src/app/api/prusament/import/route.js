@@ -48,7 +48,7 @@ function validatePrusamentSpool(spool) {
         return "spool.manufactureDate must be a string";
     }
     // GH #622: the fields below ride straight into schema-validated paths
-    // (`cost` has min:0, `temperatures.nozzle` max:600, `temperatures.bed`
+    // (`temperatures.nozzle` max:600, `temperatures.bed`
     // max:300, `tdsUrl` has the http(s) validator). Pre-fix they were
     // unchecked, so a bad value threw a ValidationError out of the handler
     // → Next's bare 500 instead of the JSON 400 every sibling route
@@ -331,7 +331,9 @@ export async function POST(request) {
                 vendor: "Prusa Research",
                 type: spool.material,
                 color: spool.colorHex,
-                cost: spool.priceUsd,
+                // Prusament supplies USD/EUR prices, while local costs are INR.
+                // Leave cost unset until the user enters their actual INR cost.
+                cost: null,
                 density,
                 diameter: spool.diameter,
                 temperatures: {
