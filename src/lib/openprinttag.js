@@ -1,0 +1,747 @@
+/**
+ * OpenPrintTag CBOR encoder
+ *
+ * Generates binary payloads that conform to the OpenPrintTag NFC specification.
+ * Reference: https://specs.openprinttag.org/#/nfc_data_format
+ * Source of truth: https://github.com/OpenPrintTag/openprinttag-specification
+ *
+ * The payload consists of two CBOR maps:
+ *   1. Meta map  – contains region offsets (aux_region_offset)
+ *   2. Main map  – an indefinite map with all filament fields
+ *
+ * Key differences from a naive implementation:
+ *   - `number` fields (density, filament_diameter) are CBOR floats, NOT scaled integers.
+ *     The spec says: "number types can be encoded as either unsigned integers (type 0),
+ *     signed integers (type 1), half floats or floats." The reference Python encoder
+ *     uses CompactFloat which prefers half-precision (float16) when lossless.
+ *   - `int` fields (temperatures) are plain CBOR unsigned integers.
+ *   - material_type enum keys come from data/material_type_enum.yaml in the spec repo.
+ */
+// ── CBOR key assignments (from data/main_fields.yaml) ────────────────
+export const OPT_KEY = {
+    // Meta section (data/meta_fields.yaml)
+    MAIN_REGION_OFFSET: 0,
+    MAIN_REGION_SIZE: 1,
+    AUX_REGION_OFFSET: 2,
+    AUX_REGION_SIZE: 3,
+    // Main section – universal
+    MATERIAL_CLASS: 8,
+    MATERIAL_TYPE: 9,
+    MATERIAL_NAME: 10,
+    BRAND_NAME: 11,
+    NOMINAL_NETTO_FULL_WEIGHT: 16,
+    ACTUAL_NETTO_FULL_WEIGHT: 17,
+    EMPTY_CONTAINER_WEIGHT: 18,
+    PRIMARY_COLOR: 19,
+    // GH #477: spec keys 20–24, up to 5 additional color slots for
+    // multi-color filaments (coextruded / gradient). Per the spec, when
+    // primary_color is null, the colors come from these slots. Each is
+    // an RGB or RGBA byte string (we always emit RGB — alpha is a
+    // documented gap; translucency is conveyed via tags 5/6 instead).
+    SECONDARY_COLOR_0: 20,
+    SECONDARY_COLOR_1: 21,
+    SECONDARY_COLOR_2: 22,
+    SECONDARY_COLOR_3: 23,
+    SECONDARY_COLOR_4: 24,
+    TRANSMISSION_DISTANCE: 27,
+    TAGS: 28,
+    DENSITY: 29,
+    // Main section – FFF-specific
+    FILAMENT_DIAMETER: 30,
+    SHORE_HARDNESS_A: 31,
+    SHORE_HARDNESS_D: 32,
+    MIN_PRINT_TEMPERATURE: 34,
+    MAX_PRINT_TEMPERATURE: 35,
+    PREHEAT_TEMPERATURE: 36,
+    MIN_BED_TEMPERATURE: 37,
+    MAX_BED_TEMPERATURE: 38,
+    MIN_CHAMBER_TEMPERATURE: 39,
+    MAX_CHAMBER_TEMPERATURE: 40,
+    CHAMBER_TEMPERATURE: 41,
+    DRYING_TEMPERATURE: 57,
+    DRYING_TIME: 58,
+    // Additional
+    MATERIAL_ABBREVIATION: 52,
+    COUNTRY_OF_ORIGIN: 55,
+    // Auxiliary region keys (data/aux_fields.yaml)
+    AUX_CONSUMED_WEIGHT: 0,
+    // Identity – UUIDs and brand-specific IDs
+    INSTANCE_UUID: 0, // UUIDv5 derived from NFC tag UID (16-byte binary)
+    PACKAGE_UUID: 1, // UUIDv5 package identifier
+    MATERIAL_UUID: 2, // UUIDv5 material identifier
+    BRAND_UUID: 3, // UUIDv5 brand identifier
+    GTIN: 4, // Global Trade Item Number
+    BRAND_SPECIFIC_INSTANCE_ID: 5, // e.g. Prusament "2acc21072a" (string, max 16)
+    BRAND_SPECIFIC_PACKAGE_ID: 6, // (string, max 16)
+    BRAND_SPECIFIC_MATERIAL_ID: 7, // (string, max 16)
+};
+// Material class enum (data/material_class_enum.yaml)
+export const MATERIAL_CLASS = { FFF: 0, SLA: 1 };
+// Material type enum (data/material_type_enum.yaml) – COMPLETE list from spec
+export const MATERIAL_TYPE = {
+    PLA: 0,
+    PETG: 1,
+    TPU: 2,
+    ABS: 3,
+    ASA: 4,
+    PC: 5,
+    PCTG: 6,
+    PP: 7,
+    PA6: 8,
+    PA11: 9,
+    PA12: 10,
+    PA66: 11,
+    CPE: 12,
+    TPE: 13,
+    HIPS: 14,
+    PHA: 15,
+    PET: 16,
+    PEI: 17,
+    PBT: 18,
+    PVB: 19,
+    PVA: 20,
+    PEKK: 21,
+    PEEK: 22,
+    BVOH: 23,
+    TPC: 24,
+    PPS: 25,
+    PPSU: 26,
+    PVC: 27,
+    PEBA: 28,
+    PVDF: 29,
+    PPA: 30,
+    PCL: 31,
+    PES: 32,
+    PMMA: 33,
+    POM: 34,
+    PPE: 35,
+    PS: 36,
+    PSU: 37,
+    TPI: 38,
+    SBS: 39,
+    OBC: 40,
+    EVA: 41,
+};
+// Tags enum (data/tags_enum.yaml) – material property tags
+export const OPT_TAG = {
+    CONTAINS_GLASS_FIBER: 0,
+    CONTAINS_ARAMID_FIBER: 1,
+    TRANSPARENT: 2,
+    TRANSLUCENT: 3,
+    ABRASIVE: 4,
+    FOOD_SAFE: 5,
+    HEAT_RESISTANT: 6,
+    UV_RESISTANT: 7,
+    FLAME_RETARDANT: 8,
+    FLEXIBLE: 9,
+    CONDUCTIVE: 10,
+    MAGNETIC: 11,
+    BIODEGRADABLE: 12,
+    WATER_SOLUBLE: 13,
+    HIGH_IMPACT: 14,
+    LOW_WARP: 15,
+    MATTE: 16,
+    SILK: 17,
+    MARBLE: 18,
+    WOOD_FILL: 19,
+    METAL_FILL: 20,
+    STONE_FILL: 21,
+    SPARKLE: 22,
+    PHOSPHORESCENT: 23,
+    GLOW_IN_THE_DARK: 24,
+    COLOR_CHANGING: 25,
+    FUZZY: 26,
+    GRADIENT: 27,
+    DUAL_COLOR: 28,
+    TRIPLE_COLOR: 29,
+    CONTAINS_CARBON_FIBER: 31,
+    CONTAINS_KEVLAR: 32,
+    HYGROSCOPIC: 33,
+    ANTI_STATIC: 34,
+    ESD_SAFE: 35,
+    CHEMICALLY_RESISTANT: 36,
+    MEDICAL_GRADE: 37,
+    AUTOMOTIVE_GRADE: 38,
+    AEROSPACE_GRADE: 39,
+    RECYCLED: 49,
+    HIGH_SPEED: 71,
+};
+// Reverse lookup: tag number → name
+export const OPT_TAG_TO_NAME = {};
+for (const [name, val] of Object.entries(OPT_TAG)) {
+    OPT_TAG_TO_NAME[val] = name;
+}
+// ── Low-level CBOR helpers ──────────────────────────────────────────
+/**
+ * Clamp a temperature to a non-negative integer before CBOR encoding
+ * (GH #274). `encodeCBORUint` rejects negatives and mis-encodes
+ * fractional values; temperatures can arrive negative/fractional from
+ * imports or manual edits.
+ */
+function clampTemp(value) {
+    return Math.max(0, Math.round(value));
+}
+/**
+ * Clamp a value to an integer within [0, max] before CBOR encoding
+ * (GH #634). Same posture as clampTemp, plus an upper bound for fields
+ * with a hard domain ceiling (Shore hardness 0–100, drying temperature,
+ * drying time) — without it, a stored out-of-range value mis-encodes
+ * (fractional) or wraps in the encoder's `>>>` arithmetic (≥ 2^32).
+ */
+function clampUint(value, max) {
+    return Math.min(max, Math.max(0, Math.round(value)));
+}
+/** Encode a CBOR unsigned integer (major type 0) and push bytes to `buf`. */
+/**
+ * Largest value `encodeCBORUint` serializes correctly. Its 4-byte branch
+ * uses `value >>> 24` etc., so anything above 2^32-1 is truncated to its
+ * low 32 bits — a silently different value on the wire (GH #650).
+ */
+export const MAX_CBOR_UINT = 0xffffffff;
+/**
+ * True when an optTag can be encoded faithfully: a non-negative integer
+ * within the CBOR-uint range the encoder actually supports. Shared with
+ * the Filament schema's optTags setter so the schema and the wire agree
+ * on which tags are kept vs dropped.
+ */
+export function isEncodableOptTag(t) {
+    return typeof t === "number" && Number.isInteger(t) && t >= 0 && t <= MAX_CBOR_UINT;
+}
+export function encodeCBORUint(buf, value) {
+    if (value < 0)
+        throw new RangeError("CBOR unsigned int must be >= 0");
+    if (value < 24) {
+        buf.push(value);
+    }
+    else if (value < 256) {
+        buf.push(0x18, value);
+    }
+    else if (value < 65536) {
+        buf.push(0x19, value >> 8, value & 0xff);
+    }
+    else {
+        buf.push(0x1a, (value >>> 24) & 0xff, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff);
+    }
+}
+/**
+ * Encode a CBOR half-precision float (float16, major type 7, additional 25).
+ *
+ * IEEE 754 half-precision: 1 sign + 5 exponent + 10 mantissa = 16 bits.
+ * Only 2 bytes on the wire (+ 1 byte CBOR header = 3 bytes total).
+ */
+export function encodeCBORFloat16(buf, value) {
+    // Use DataView to extract float32 bits (platform-endian safe)
+    const ab = new ArrayBuffer(4);
+    const dv = new DataView(ab);
+    dv.setFloat32(0, value); // big-endian by default in DataView
+    const bits32 = dv.getUint32(0);
+    const sign = (bits32 >>> 31) & 0x1;
+    const exp32 = (bits32 >>> 23) & 0xff;
+    const frac32 = bits32 & 0x7fffff;
+    let f16bits;
+    if (exp32 === 0xff) {
+        // Inf / NaN
+        f16bits = (sign << 15) | 0x7c00 | (frac32 ? 0x0200 : 0);
+    }
+    else if (exp32 === 0) {
+        // Zero or subnormal f32 → zero in f16
+        f16bits = sign << 15;
+    }
+    else {
+        const newExp = exp32 - 127 + 15;
+        if (newExp >= 31) {
+            // Overflow → Inf
+            f16bits = (sign << 15) | 0x7c00;
+        }
+        else if (newExp <= 0) {
+            // Underflow → subnormal or zero
+            if (newExp < -10) {
+                f16bits = sign << 15;
+            }
+            else {
+                const mant = frac32 | 0x800000;
+                const shift = 14 - newExp; // 1-based exponent for subnormal
+                f16bits = (sign << 15) | (mant >> shift);
+            }
+        }
+        else {
+            f16bits = (sign << 15) | (newExp << 10) | (frac32 >> 13);
+        }
+    }
+    // CBOR: major type 7, additional value 25 = half float
+    buf.push(0xf9, (f16bits >> 8) & 0xff, f16bits & 0xff);
+}
+/**
+ * Encode a CBOR single-precision float (float32, major type 7, additional 26).
+ */
+export function encodeCBORFloat32(buf, value) {
+    const ab = new ArrayBuffer(4);
+    const dv = new DataView(ab);
+    dv.setFloat32(0, value);
+    buf.push(0xfa, dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3));
+}
+/**
+ * Encode a number in the most compact CBOR representation, matching the
+ * reference Python encoder's CompactFloat behaviour:
+ *   1. If the value is an integer, encode as CBOR uint.
+ *   2. If it round-trips through float16 within 0.001, use half float.
+ *   3. If it round-trips through float32 within 0.001, use single float.
+ *   4. Otherwise use float32 (double is overkill for filament data).
+ */
+export function encodeCBORCompactNumber(buf, value) {
+    if (Number.isInteger(value) && value >= 0) {
+        encodeCBORUint(buf, value);
+        return;
+    }
+    // Try float16
+    const f16Buf = [];
+    encodeCBORFloat16(f16Buf, value);
+    // Decode the float16 back to check round-trip
+    const f16Decoded = decodeCBORFloat16((f16Buf[1] << 8) | f16Buf[2]);
+    if (Math.abs(value - f16Decoded) < 0.001) {
+        buf.push(...f16Buf);
+        return;
+    }
+    // Fall back to float32
+    encodeCBORFloat32(buf, value);
+}
+/** Decode a 16-bit half float to a JS number. */
+export function decodeCBORFloat16(bits) {
+    const sign = (bits >>> 15) & 1;
+    const exp = (bits >>> 10) & 0x1f;
+    const frac = bits & 0x3ff;
+    let val;
+    if (exp === 0) {
+        val = frac * Math.pow(2, -24); // subnormal
+    }
+    else if (exp === 31) {
+        val = frac === 0 ? Infinity : NaN;
+    }
+    else {
+        val = (1 + frac / 1024) * Math.pow(2, exp - 15);
+    }
+    return sign ? -val : val;
+}
+/**
+ * Encode a CBOR text string (major type 3) and push bytes to `buf`.
+ * @internal Exported for unit testing in `tests/openprinttag.test.ts`.
+ *   Not part of the public API — production callers should consume
+ *   `generateOpenPrintTagBinary`, which composes this helper.
+ */
+export function encodeCBORText(buf, text) {
+    const utf8 = new TextEncoder().encode(text);
+    const len = utf8.length;
+    if (len < 24) {
+        buf.push(0x60 + len);
+    }
+    else if (len < 256) {
+        buf.push(0x78, len);
+    }
+    else if (len < 65536) {
+        buf.push(0x79, len >> 8, len & 0xff);
+    }
+    else {
+        throw new RangeError("Text string too long for OpenPrintTag");
+    }
+    buf.push(...utf8);
+}
+/** Encode a CBOR byte string (major type 2) and push bytes to `buf`. */
+export function encodeCBORBytes(buf, bytes) {
+    const len = bytes.length;
+    if (len < 24) {
+        buf.push(0x40 + len);
+    }
+    else if (len < 256) {
+        buf.push(0x58, len);
+    }
+    else {
+        throw new RangeError("Byte string too long for OpenPrintTag");
+    }
+    buf.push(...bytes);
+}
+/**
+ * Write a CBOR map key (unsigned int).
+ * @internal Exported for unit testing — consume via `generateOpenPrintTagBinary`.
+ */
+export function encodeCBORKey(buf, key) {
+    encodeCBORUint(buf, key);
+}
+// ── Colour helpers ──────────────────────────────────────────────────
+/**
+ * Parse a hex colour string (#RRGGBB or #RRGGBBAA) into bytes.
+ * Returns null if the string cannot be parsed.
+ */
+export function parseHexColor(hex) {
+    // GH #634: exactly 6 or 8 hex digits — the old `{6,8}` also matched a
+    // 7-char string and silently ignored the dangling 7th character.
+    const m = hex.match(/^#?([0-9a-f]{6}(?:[0-9a-f]{2})?)$/i);
+    if (!m)
+        return null;
+    const h = m[1];
+    const r = parseInt(h.slice(0, 2), 16);
+    const g = parseInt(h.slice(2, 4), 16);
+    const b = parseInt(h.slice(4, 6), 16);
+    // Spec says 3 or 4 bytes; omit alpha if fully opaque or not specified
+    if (h.length === 8) {
+        const a = parseInt(h.slice(6, 8), 16);
+        return [r, g, b, a];
+    }
+    return [r, g, b];
+}
+// ── Material type mapping ───────────────────────────────────────────
+/**
+ * Maps filament type strings (as stored in our DB) to the OpenPrintTag
+ * material_type enum. Handles common aliases and composite names.
+ */
+const MATERIAL_TYPE_MAP = {
+    // Direct matches from the spec enum
+    PLA: MATERIAL_TYPE.PLA,
+    PETG: MATERIAL_TYPE.PETG,
+    TPU: MATERIAL_TYPE.TPU,
+    ABS: MATERIAL_TYPE.ABS,
+    ASA: MATERIAL_TYPE.ASA,
+    PC: MATERIAL_TYPE.PC,
+    PCTG: MATERIAL_TYPE.PCTG,
+    PP: MATERIAL_TYPE.PP,
+    PA6: MATERIAL_TYPE.PA6,
+    PA11: MATERIAL_TYPE.PA11,
+    PA12: MATERIAL_TYPE.PA12,
+    PA66: MATERIAL_TYPE.PA66,
+    CPE: MATERIAL_TYPE.CPE,
+    TPE: MATERIAL_TYPE.TPE,
+    HIPS: MATERIAL_TYPE.HIPS,
+    PHA: MATERIAL_TYPE.PHA,
+    PET: MATERIAL_TYPE.PET,
+    PEI: MATERIAL_TYPE.PEI,
+    PBT: MATERIAL_TYPE.PBT,
+    PVB: MATERIAL_TYPE.PVB,
+    PVA: MATERIAL_TYPE.PVA,
+    PEKK: MATERIAL_TYPE.PEKK,
+    PEEK: MATERIAL_TYPE.PEEK,
+    BVOH: MATERIAL_TYPE.BVOH,
+    TPC: MATERIAL_TYPE.TPC,
+    PPS: MATERIAL_TYPE.PPS,
+    PPSU: MATERIAL_TYPE.PPSU,
+    PVC: MATERIAL_TYPE.PVC,
+    PEBA: MATERIAL_TYPE.PEBA,
+    PVDF: MATERIAL_TYPE.PVDF,
+    PPA: MATERIAL_TYPE.PPA,
+    PCL: MATERIAL_TYPE.PCL,
+    PES: MATERIAL_TYPE.PES,
+    PMMA: MATERIAL_TYPE.PMMA,
+    POM: MATERIAL_TYPE.POM,
+    PPE: MATERIAL_TYPE.PPE,
+    PS: MATERIAL_TYPE.PS,
+    PSU: MATERIAL_TYPE.PSU,
+    TPI: MATERIAL_TYPE.TPI,
+    SBS: MATERIAL_TYPE.SBS,
+    OBC: MATERIAL_TYPE.OBC,
+    EVA: MATERIAL_TYPE.EVA,
+    // Common aliases / composites
+    "PLA+": MATERIAL_TYPE.PLA,
+    "PLA-CF": MATERIAL_TYPE.PLA,
+    "PETG-CF": MATERIAL_TYPE.PETG,
+    "PET-GF": MATERIAL_TYPE.PET,
+    "ABS-CF": MATERIAL_TYPE.ABS,
+    "ASA-CF": MATERIAL_TYPE.ASA,
+    "PC-CF": MATERIAL_TYPE.PC,
+    PA: MATERIAL_TYPE.PA6,
+    NYLON: MATERIAL_TYPE.PA6,
+    "PA-CF": MATERIAL_TYPE.PA6,
+    "NYLON-CF": MATERIAL_TYPE.PA6,
+    FLEX: MATERIAL_TYPE.TPU,
+    IGLIDUR: MATERIAL_TYPE.POM,
+};
+/** Map a filament type string to the OpenPrintTag material_type enum value.
+ *  Returns undefined if no match (field will be omitted per spec: "can be left unspecified").
+ */
+export function resolveMaterialType(type) {
+    const key = type.toUpperCase().replace(/\s+/g, "");
+    return MATERIAL_TYPE_MAP[key];
+}
+/**
+ * Uppercase, whitespace-stripped material abbreviation truncated to 7
+ * chars — the OpenPrintTag spec's cap. @internal for unit testing;
+ * consume via `generateOpenPrintTagBinary`.
+ */
+export function deriveMaterialAbbreviation(type) {
+    return type.toUpperCase().replace(/\s+/g, "").slice(0, 7);
+}
+// ── Main encoder ────────────────────────────────────────────────────
+/**
+ * Generate an OpenPrintTag CBOR binary payload from filament data.
+ *
+ * The output is a `Uint8Array` containing two consecutive CBOR maps:
+ *   1. Meta map: `{2: <aux_region_offset>}` — points past the main map
+ *   2. Main map: indefinite-length map with all filament fields
+ */
+export function generateOpenPrintTagBinary(input) {
+    // Build the main map first so we can measure its size
+    const main = buildMainMap(input);
+    // Meta map: definite map with 1 pair {2: <aux_region_offset>}
+    // We need to calculate the meta size first, which depends on the total size encoding.
+    // Meta = 0xA1 (1 byte) + key 2 (1 byte) + uint(total_size) (1-3 bytes)
+    // For payloads < 24 bytes total: meta = 3 bytes (0xA1, 0x02, <val>)
+    // For payloads < 256 bytes total: meta = 4 bytes (0xA1, 0x02, 0x18, <val>)
+    // For payloads < 65536 bytes total: meta = 5 bytes (0xA1, 0x02, 0x19, hi, lo)
+    // Our main maps are typically ~100-200 bytes, so total < 256 → 4 bytes meta.
+    // But we need to handle the edge case where it could be 3 bytes.
+    // Try with 4-byte meta first (most common case)
+    let metaSize = 4;
+    let totalSize = metaSize + main.length;
+    if (totalSize < 24) {
+        metaSize = 3; // 0xA1 + 0x02 + <val < 24>
+        totalSize = metaSize + main.length;
+    }
+    else if (totalSize >= 256) {
+        metaSize = 5; // 0xA1 + 0x02 + 0x19 + hi + lo
+        totalSize = metaSize + main.length;
+    }
+    const buf = [];
+    buf.push(0xa1); // definite map with 1 pair
+    encodeCBORKey(buf, OPT_KEY.AUX_REGION_OFFSET);
+    encodeCBORUint(buf, totalSize);
+    // Main map (already built)
+    buf.push(...main);
+    // Auxiliary region (writable section after main)
+    // Always write at least an empty map (0xA0) so the aux_region_offset
+    // points to valid CBOR. The Prusa app reads the aux region and will
+    // error if the offset points to invalid data (e.g. 0xFE terminator).
+    if (input.consumedWeight != null && input.consumedWeight > 0) {
+        const aux = buildAuxMap(input);
+        buf.push(...aux);
+    }
+    else {
+        buf.push(0xa0); // empty definite map
+    }
+    return new Uint8Array(buf);
+}
+/** Build the auxiliary region CBOR map (consumed_weight, etc.). */
+function buildAuxMap(input) {
+    const buf = [];
+    buf.push(0xbf); // indefinite map start
+    if (input.consumedWeight != null && input.consumedWeight > 0) {
+        encodeCBORKey(buf, OPT_KEY.AUX_CONSUMED_WEIGHT);
+        encodeCBORCompactNumber(buf, input.consumedWeight);
+    }
+    buf.push(0xff); // indefinite map end
+    return buf;
+}
+/** Build the indefinite-length CBOR main map. */
+function buildMainMap(input) {
+    const buf = [];
+    buf.push(0xbf); // indefinite map start
+    // material_class = FFF (0)
+    encodeCBORKey(buf, OPT_KEY.MATERIAL_CLASS);
+    encodeCBORUint(buf, MATERIAL_CLASS.FFF);
+    // material_type – only include if we have a mapping
+    const materialTypeVal = resolveMaterialType(input.materialType);
+    if (materialTypeVal !== undefined) {
+        encodeCBORKey(buf, OPT_KEY.MATERIAL_TYPE);
+        encodeCBORUint(buf, materialTypeVal);
+    }
+    // material_name (max 31 chars)
+    encodeCBORKey(buf, OPT_KEY.MATERIAL_NAME);
+    encodeCBORText(buf, input.materialName.slice(0, 31));
+    // brand_name (max 31 chars)
+    encodeCBORKey(buf, OPT_KEY.BRAND_NAME);
+    encodeCBORText(buf, input.brandName.slice(0, 31));
+    // nominal_netto_full_weight (grams, integer – type: number but grams are always whole)
+    if (input.weightGrams != null && input.weightGrams > 0) {
+        encodeCBORKey(buf, OPT_KEY.NOMINAL_NETTO_FULL_WEIGHT);
+        encodeCBORCompactNumber(buf, input.weightGrams);
+    }
+    // actual_netto_full_weight (key 17) — actual remaining filament weight.
+    // Only written when actually known. We deliberately do NOT default it to the
+    // nominal weight: per the OpenPrintTag spec an absent key 17 already resolves
+    // to nominal on read, and fabricating a nominal "actual" for a filament with
+    // no current roll (all spools retired / weight unknown) would assert a full
+    // roll the user doesn't have (Codex P2 on PR #707).
+    if (input.actualWeightGrams != null && input.actualWeightGrams > 0) {
+        encodeCBORKey(buf, OPT_KEY.ACTUAL_NETTO_FULL_WEIGHT);
+        encodeCBORCompactNumber(buf, input.actualWeightGrams);
+    }
+    // empty_container_weight (grams)
+    if (input.emptySpoolWeight != null && input.emptySpoolWeight > 0) {
+        encodeCBORKey(buf, OPT_KEY.EMPTY_CONTAINER_WEIGHT);
+        encodeCBORCompactNumber(buf, input.emptySpoolWeight);
+    }
+    // primary_color (RGBA byte string)
+    if (input.color) {
+        const rgba = parseHexColor(input.color);
+        if (rgba) {
+            encodeCBORKey(buf, OPT_KEY.PRIMARY_COLOR);
+            encodeCBORBytes(buf, rgba);
+        }
+    }
+    // GH #477: secondary_color_0..4 (spec keys 20–24). Each is a separate
+    // CBOR key→byte-string pair, in slot order — the spec doesn't define
+    // a list type for them. Cap at 5 to match the spec ceiling; entries
+    // that can't be parsed are skipped silently (defensive — the schema
+    // validates hex shape before this point so this should never fire).
+    if (input.secondaryColors && input.secondaryColors.length > 0) {
+        const SECONDARY_KEYS = [
+            OPT_KEY.SECONDARY_COLOR_0,
+            OPT_KEY.SECONDARY_COLOR_1,
+            OPT_KEY.SECONDARY_COLOR_2,
+            OPT_KEY.SECONDARY_COLOR_3,
+            OPT_KEY.SECONDARY_COLOR_4,
+        ];
+        const capped = input.secondaryColors.slice(0, SECONDARY_KEYS.length);
+        for (let i = 0; i < capped.length; i++) {
+            const rgba = parseHexColor(capped[i]);
+            if (rgba) {
+                encodeCBORKey(buf, SECONDARY_KEYS[i]);
+                encodeCBORBytes(buf, rgba);
+            }
+        }
+    }
+    // density – type: number, unit: g/cm³ – encode as compact float (e.g. 1.24)
+    if (input.density != null && input.density > 0) {
+        encodeCBORKey(buf, OPT_KEY.DENSITY);
+        encodeCBORCompactNumber(buf, input.density);
+    }
+    // filament_diameter – type: number, unit: mm – encode as compact float (e.g. 1.75)
+    const diameter = input.diameter ?? 1.75;
+    if (diameter !== 1.75) {
+        // Spec says: "If not present, 1.75 mm is assumed." So omit if default.
+        encodeCBORKey(buf, OPT_KEY.FILAMENT_DIAMETER);
+        encodeCBORCompactNumber(buf, diameter);
+    }
+    // shore_hardness_a (Shore A, integer 0-100)
+    // GH #634: round + cap to the 0–100 Shore scale — a fractional or
+    // out-of-range stored value must not mis-encode or throw.
+    if (input.shoreHardnessA != null && input.shoreHardnessA > 0) {
+        encodeCBORKey(buf, OPT_KEY.SHORE_HARDNESS_A);
+        encodeCBORUint(buf, clampUint(input.shoreHardnessA, 100));
+    }
+    // shore_hardness_d (Shore D, integer 0-100)
+    if (input.shoreHardnessD != null && input.shoreHardnessD > 0) {
+        encodeCBORKey(buf, OPT_KEY.SHORE_HARDNESS_D);
+        encodeCBORUint(buf, clampUint(input.shoreHardnessD, 100));
+    }
+    // Temperatures – all type: int, unit: °C.
+    // GH #274: encodeCBORUint throws RangeError on any value < 0, and a
+    // non-integer would encode a bad byte. Temperatures can arrive
+    // negative or fractional from a bad import, AI-extracted garbage, or a
+    // manual edit — clamp every value through clampTemp() (max(0, round))
+    // before it reaches the encoder so a bad input can't crash the whole
+    // NFC-write path.
+    if (input.nozzleTemp != null) {
+        // GH #952.4: the EVERYDAY nozzle temp must ALWAYS land in MAX_PRINT — the
+        // decoder reads it back from MAX as the primary nozzleTemp (openprinttag-
+        // decode.ts). GH #634 derived MIN from the first-layer temp and Math.max-ordered
+        // the pair, which SWAPPED them when firstLayer > nozzle+20: the everyday temp
+        // fell into MIN and the decoder read the inflated first-layer value as everyday.
+        // Fix: pin MAX to the everyday temp and clamp MIN so it never exceeds it (min ≤
+        // max still holds — the #634 invariant). A first-layer temp above the everyday
+        // temp can't extend a pinned MAX, so its excess isn't stored — but the everyday
+        // temp (the primary) now round-trips correctly, and first-layer was already
+        // dropped on decode (OPT has no first-layer field). Tags written BEFORE this
+        // fix keep the old swapped reading; there is no OPT version field to tell them
+        // apart, so this only corrects newly-written tags.
+        const nozzleMax = clampTemp(input.nozzleTemp);
+        const derivedMin = clampTemp((input.nozzleTempFirstLayer ?? nozzleMax) - 20);
+        const minTemp = Math.min(derivedMin, nozzleMax);
+        const maxTemp = nozzleMax;
+        const preheatTemp = clampTemp(minTemp - 20);
+        encodeCBORKey(buf, OPT_KEY.MIN_PRINT_TEMPERATURE);
+        encodeCBORUint(buf, minTemp);
+        encodeCBORKey(buf, OPT_KEY.MAX_PRINT_TEMPERATURE);
+        encodeCBORUint(buf, maxTemp);
+        encodeCBORKey(buf, OPT_KEY.PREHEAT_TEMPERATURE);
+        encodeCBORUint(buf, preheatTemp);
+    }
+    if (input.bedTemp != null) {
+        // GH #952.4: same fix as the nozzle above — the EVERYDAY bed temp must always
+        // land in MAX_BED (the decoder reads bedTemp from MAX). The prior Math.max
+        // ordering swapped everyday↔first-layer on the COMMON first-layer-hotter bed
+        // profile (e.g. bed 85 / first-layer 90), decoding the everyday bed as 90.
+        // Pin MAX to the everyday temp; MIN is the range floor (min of everyday and the
+        // first-layer temp, or everyday-10 when no first-layer is given).
+        const everydayBed = clampTemp(input.bedTemp);
+        const firstLayerBed = clampTemp(input.bedTempFirstLayer ?? everydayBed - 10);
+        encodeCBORKey(buf, OPT_KEY.MIN_BED_TEMPERATURE);
+        encodeCBORUint(buf, Math.min(firstLayerBed, everydayBed));
+        encodeCBORKey(buf, OPT_KEY.MAX_BED_TEMPERATURE);
+        encodeCBORUint(buf, everydayBed);
+    }
+    if (input.chamberTemp != null && input.chamberTemp > 0) {
+        encodeCBORKey(buf, OPT_KEY.CHAMBER_TEMPERATURE);
+        encodeCBORUint(buf, clampTemp(input.chamberTemp));
+    }
+    // material_abbreviation (max 7 chars)
+    encodeCBORKey(buf, OPT_KEY.MATERIAL_ABBREVIATION);
+    encodeCBORText(buf, deriveMaterialAbbreviation(input.materialType));
+    // country_of_origin (ISO 3166-1 alpha-2). GH #952: emit ONLY when the caller
+    // supplies one — no production caller does (the Filament model has no country
+    // field), so the old `?? "US"` default stamped a fabricated "US" onto every
+    // tag/re-write. Omit the key when unset (like material_type's unspecified case).
+    if (input.countryOfOrigin) {
+        encodeCBORKey(buf, OPT_KEY.COUNTRY_OF_ORIGIN);
+        encodeCBORText(buf, input.countryOfOrigin.slice(0, 2));
+    }
+    // transmission_distance – HueForge TD value (type: number)
+    if (input.transmissionDistance != null && input.transmissionDistance > 0) {
+        encodeCBORKey(buf, OPT_KEY.TRANSMISSION_DISTANCE);
+        encodeCBORCompactNumber(buf, input.transmissionDistance);
+    }
+    // tags – enum_array of material property tags
+    // Merge boolean convenience flags with explicit optTags array (deduplicated).
+    // GH #634: SKIP invalid entries rather than throwing or rounding — a
+    // stored negative tag used to make encodeCBORUint throw RangeError
+    // (500-ing the .bin export and failing NFC writes), and rounding a
+    // fractional tag would silently change its meaning to a different tag id.
+    // The upper bound matches encodeCBORUint's 4-byte branch, which uses
+    // `>>> 24` arithmetic and silently truncates values above 2^32-1 to
+    // their low 32 bits — a different tag id on the wire (Codex P2 on #650).
+    const tagSet = new Set((input.optTags ?? []).filter(isEncodableOptTag));
+    if (input.abrasive)
+        tagSet.add(OPT_TAG.ABRASIVE);
+    if (input.soluble)
+        tagSet.add(OPT_TAG.WATER_SOLUBLE);
+    if (tagSet.size > 0) {
+        const tagValues = [...tagSet].sort((a, b) => a - b);
+        encodeCBORKey(buf, OPT_KEY.TAGS);
+        // Encode as CBOR array (major type 4)
+        // Encode CBOR definite array header (major type 4)
+        if (tagValues.length < 24) {
+            buf.push(0x80 | tagValues.length);
+        }
+        else if (tagValues.length < 256) {
+            buf.push(0x98, tagValues.length);
+        }
+        else {
+            buf.push(0x99, tagValues.length >> 8, tagValues.length & 0xff);
+        }
+        for (const tag of tagValues) {
+            encodeCBORUint(buf, tag);
+        }
+    }
+    // drying_temperature (°C, int)
+    // GH #634: round + cap (schema max is 300 °C) so fractional or
+    // out-of-range stored values can't mis-encode.
+    if (input.dryingTemperature != null && input.dryingTemperature > 0) {
+        encodeCBORKey(buf, OPT_KEY.DRYING_TEMPERATURE);
+        encodeCBORUint(buf, clampUint(input.dryingTemperature, 300));
+    }
+    // drying_time (minutes, int)
+    // GH #634: cap at 10080 minutes (7 days, matching the schema max) —
+    // values ≥ 2^32 would otherwise wrap in encodeCBORUint's `>>>` math.
+    if (input.dryingTime != null && input.dryingTime > 0) {
+        encodeCBORKey(buf, OPT_KEY.DRYING_TIME);
+        encodeCBORUint(buf, clampUint(input.dryingTime, 10080));
+    }
+    // brand_specific_instance_id – unique spool/instance identifier (string, max 16 chars).
+    // GH #952: OMIT it when it's too long rather than TRUNCATING — a truncated id
+    // reads back as a DIFFERENT id and breaks scan-back matching (matchFilament
+    // finds no spool, the detail-page own-tag check misfires). Auto-generated
+    // 10-hex ids always fit; only long custom/Prusament ids trip this. spoolUid is
+    // ASCII-validated (validateSpoolInstanceId), so char length == byte length.
+    if (input.spoolUid && input.spoolUid.length <= 16) {
+        encodeCBORKey(buf, OPT_KEY.BRAND_SPECIFIC_INSTANCE_ID);
+        encodeCBORText(buf, input.spoolUid);
+    }
+    buf.push(0xff); // indefinite map end
+    return buf;
+}

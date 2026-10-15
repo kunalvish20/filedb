@@ -1,0 +1,1552 @@
+import { NextResponse } from "next/server";
+import dbConnect from "@/lib/mongodb";
+import Filament from "@/models/Filament";
+import Nozzle from "@/models/Nozzle";
+import Printer from "@/models/Printer";
+import BedType from "@/models/BedType";
+import { resolveFilament, hasVariants } from "@/lib/resolveFilament";
+import { runExclusive, filamentLockKey } from "@/lib/filamentMutex";
+import { gateFirstVariantAdoption, promotionRequired409Body, } from "@/lib/createVariantGated";
+import { clearOrphanedParentThreshold } from "@/lib/promoteParent";
+import { errorResponse, errorResponseFromCaught, handleDuplicateKeyError, isDuplicateKeyError, assertActiveRefs } from "@/lib/apiErrorHandler";
+import { assertSameOriginRequest, assertSafeUpdateBody, stripServerOwnedFields, } from "@/lib/requestGuard";
+import { mergeSlicerSettings, MAX_SETTING_VALUE_LENGTH, validateSettingsBag, validateDottedSettingsPaths, normalizeSettingsToWire, bodyHasRawMultilineSettings, } from "@/lib/slicerSettings";
+import { stripLegacyMachineCondition } from "@/lib/stripLegacyNozzleCondition";
+import { resolveSyncBackColor, isMachineDerivedPerNozzleCondition } from "@/lib/prusaSlicerBundle";
+import { splitInheritedImportSet } from "@/lib/importFilaments";
+import { escapeRegex } from "@/lib/matchFilament";
+import { stripTemplateFieldsForWrite } from "@/lib/templateStrip";
+import { assignSpoolToSlot } from "@/lib/spoolSlots";
+import { isInvertedNozzleRange, effectiveNozzleRangeForUpdate, inheritNozzleRangeFromParent, } from "@/lib/temperatureRange";
+/**
+ * GH #261: clear every spool of a filament out of all printer AMS slots.
+ * Deleting a filament removes its spools, but `Printer.amsSlots[].spoolId`
+ * still references them — leaving printers showing a phantom spool that
+ * can never be cleared from the (now-gone) spool side. The spool DELETE
+ * handler already does this per-spool; the filament DELETE must too.
+ */
+async function clearFilamentSpoolsFromSlots(spools) {
+    for (const spool of spools ?? []) {
+        if (spool?._id) {
+            await assignSpoolToSlot(Printer, String(spool._id), null);
+        }
+    }
+}
+/**
+ * GET /api/filaments/{id}
+ *
+ * Returns a single filament with populated references. By default, if the
+ * filament is a variant (has parentId) its inheritable fields are resolved
+ * from its parent so the response is a complete view suitable for display.
+ *
+ * Pass `?raw=true` to skip inheritance resolution and receive the variant's
+ * own values. Fields the variant does not override come back as `null`
+ * (or empty). This is what the edit page needs — prefilling the form with
+ * resolved values and then saving would copy the parent's fields onto the
+ * variant and silently sever the inheritance link (GH #106).
+ *
+ * When `?raw=true` is passed on a parent, the response shape is unchanged
+ * (parents don't inherit from anything).
+ */
+export async function GET(request, { params }) {
+    try {
+        await dbConnect();
+        const { id } = await params;
+        const raw = request.nextUrl.searchParams.get("raw") === "true";
+        const filament = await Filament.findOne({ _id: id, _deletedAt: null })
+            .populate("compatibleNozzles")
+            .populate("calibrations.nozzle")
+            .populate("calibrations.printer")
+            .populate("calibrations.bedType")
+            .lean();
+        if (!filament) {
+            return errorResponse("Not found", 404);
+        }
+        // Two parent-fetch shapes:
+        //
+        //   raw=true  → variant edit form. Skip resolveFilament (the form must
+        //               see only the variant's own overrides — GH #106) and
+        //               attach a slim parent-summary projected to the inheritable
+        //               display values FilamentForm consumes for hint placeholders.
+        //               Dropping settings/presets/populated nozzles/sync metadata
+        //               (__v, syncId, instanceId) cuts ~2KB/request and stops
+        //               leaking sync internals to the renderer (GH #162).
+        //
+        //   raw=false → variant detail page. Run resolveFilament on the populated
+        //               parent so inherited fields render correctly, then attach
+        //               only `{ _id, name }` for the "Up to <parent>" link.
+        let resolved = filament;
+        let parentSummary = null;
+        if (filament.parentId) {
+            if (raw) {
+                // `inherits` rides the projection for GH #1066: the form adopts a
+                // legacy settings-bag `inherits` shadow into its editable field only
+                // when neither the variant nor the parent supplies a top-level value
+                // (the export masks the shadow whenever the resolved value is truthy).
+                parentSummary = (await Filament.findOne({ _id: filament.parentId, _deletedAt: null })
+                    .select("_id name vendor type color secondaryColors cost density diameter inherits")
+                    .lean());
+            }
+            else {
+                const parentDoc = (await Filament.findOne({ _id: filament.parentId, _deletedAt: null })
+                    .populate("compatibleNozzles")
+                    .populate("calibrations.nozzle")
+                    .populate("calibrations.printer")
+                    .populate("calibrations.bedType")
+                    .lean());
+                if (parentDoc) {
+                    resolved = resolveFilament(filament, parentDoc);
+                    parentSummary = { _id: parentDoc._id, name: parentDoc.name };
+                }
+            }
+        }
+        // If this is a parent, include its variants.
+        // optTags is selected so the color-variants list on the parent's
+        // detail page can render finish-derived swatch textures + chips
+        // (matte/silk/sparkle/glow/translucent/transparent) without a second
+        // fetch per variant — see `src/lib/filamentFinish.ts`.
+        //
+        // We project the *effective* optTags, not the variant's own array.
+        // resolveFilament inherits optTags (and the other array fields) from
+        // the parent when the variant's array is empty, so a variant whose
+        // own optTags is `[]` should still render with the parent's finish
+        // in the parent's color-variants list. Without this merge, the chip
+        // is missing here even though clicking through to the variant's
+        // detail page shows it (that path goes through resolveFilament).
+        // Codex round-1 P2 on PR #353.
+        const rawVariants = await Filament.find({ parentId: id, _deletedAt: null })
+            // GH #477: secondaryColors so the parent's color-variants chips can
+            // render multi-color swatches without a follow-up fetch per variant.
+            .select("name color secondaryColors cost optTags")
+            .sort({ name: 1 })
+            .lean();
+        // GH #477 (Codex P2 on PR #482 r2): apply the same array-fallback
+        // resolution to `secondaryColors` that we apply to `optTags` —
+        // otherwise a variant that inherits its parent's multi-color slots
+        // (empty own array) renders single-color on the parent's variant
+        // chips while the same variant resolves correctly everywhere else.
+        // Mirrors resolveFilament's secondaryColors block + the list
+        // aggregation's $project ternary.
+        const parentOptTags = (filament.optTags ?? []);
+        const parentSecondaryColors = (filament.secondaryColors ?? []);
+        const variants = rawVariants.map((v) => ({
+            ...v,
+            optTags: v.optTags && v.optTags.length > 0 ? v.optTags : parentOptTags,
+            secondaryColors: v.secondaryColors && v.secondaryColors.length > 0
+                ? v.secondaryColors
+                : parentSecondaryColors,
+        }));
+        // GH #607 (Codex P2 r4): whether THIS row carries its own OpenPrintTag
+        // link, computed from the RAW doc before resolveFilament shallow-merges
+        // the parent's `settings`. A variant inherits the parent's
+        // `openprinttag_slug` in the resolved view, which would otherwise show a
+        // dead "Check for updates" button (the check/sync routes read the raw
+        // child row, which has no slug). The UI gates the button on this flag.
+        const rawSlug = filament.settings?.openprinttag_slug;
+        const _hasOwnOptLink = typeof rawSlug === "string" && rawSlug !== "";
+        if (parentSummary) {
+            return NextResponse.json({
+                ...resolved,
+                _variants: variants,
+                _parent: parentSummary,
+                _hasOwnOptLink,
+            });
+        }
+        return NextResponse.json({ ...resolved, _variants: variants, _hasOwnOptLink });
+    }
+    catch (err) {
+        return errorResponseFromCaught(err, "Failed to fetch filament");
+    }
+}
+export async function PUT(request, { params }) {
+    const guard = assertSameOriginRequest(request);
+    if (guard)
+        return guard;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let body;
+    try {
+        body = await request.json();
+    }
+    catch {
+        return errorResponse("Invalid JSON in request body", 400);
+    }
+    try {
+        await dbConnect();
+        const { id } = await params;
+        // GH #605 (codex round 4, F2): `promoteParent` is a control flag for the
+        // re-parent adoption gate below, never a schema field — capture it, then
+        // strip it so it can't ride into the update (same posture as the POST
+        // handler's flag).
+        const promoteParent = body?.promoteParent === true;
+        delete body.promoteParent;
+        // GH #222 / #260 / #619 / #605 / #1072: one generalized pass dropping
+        // every SERVER-OWNED field — exact keys AND dotted subpaths. This body
+        // feeds findOneAndUpdate, where a dotted key (`spools.0.usageHistory`,
+        // `spools.0.instanceId`, `openprinttagSnapshot.color`,
+        // `promotionInFlight.token`, …) is a live update path the old exact-key
+        // deletes missed — the pre-#1072 dotted sweep covered only the
+        // promotion-marker pair, so the GH #260 "hard guarantee" that spool
+        // writes go through validateSpoolBody was bypassable via
+        // `spools.0.<field>`. The shared field list + per-field rationale live
+        // in SERVER_OWNED_FILAMENT_FIELDS (src/lib/requestGuard.ts) so this
+        // strip and the POST handler's can't drift; a future server-owned field
+        // added there is swept here by construction.
+        stripServerOwnedFields(body);
+        // Server-side response-only fields that clients may echo back (e.g. the
+        // edit page fetches with ?raw=true and receives _parent / _variants /
+        // _inherited). Strip so they don't become persisted document fields.
+        delete body._parent;
+        delete body._variants;
+        delete body._inherited;
+        delete body._strippedTemplateFields;
+        // Codex P2 on PR #577: the renderer only ever sends a plain field object.
+        // A Mongo update OPERATOR ($set / $inc / $rename / …) in the body would be
+        // forwarded verbatim to findOneAndUpdate and slip past every field-level
+        // guard here — the cross-field range check, the parentId re-parent
+        // validation, and the mass-assignment strips above all key off top-level
+        // fields. Reject operator-style bodies outright; it closes that whole
+        // bypass class and is a latent NoSQL-operator-injection fix.
+        if (Object.keys(body).some((k) => k.startsWith("$"))) {
+            return errorResponse("Update operators (e.g. $set) are not allowed in the request body", 400);
+        }
+        // GH #1026: the SECOND injection class the operator check above does not
+        // cover. `body` is forwarded verbatim to findOneAndUpdate below, and a
+        // `__proto__`-prefixed DOTTED key (e.g. `{"__proto__.x": 1}`) is neither a
+        // `$`-operator nor an exact key the strip block matches — it reaches
+        // Mongoose's update casting and pollutes `Object.prototype`
+        // (GHSA-664h-wqgq-64gw; confirmed reproducible on mongoose 9.5.0 through
+        // this exact call, which also 500s). Patched upstream in >= 9.7.2, which
+        // package.json now pins as its floor; this guard keeps a downgraded
+        // lockfile or an upstream regression from silently reopening it.
+        const unsafePath = assertSafeUpdateBody(body);
+        if (unsafePath)
+            return unsafePath;
+        // GH #1072 (item 2): enforce the GH #266 settings-bag caps on the generic
+        // PUT — `settings` is Schema.Types.Mixed, so `runValidators: true` below
+        // is a no-op for it and an unbounded bag would persist and bloat every
+        // subsequent read (list aggregation, detail page, slicer exports,
+        // snapshot, hybrid-sync copies). Both write shapes are covered: the
+        // whole-object form and the dotted `settings.<key>` form (a live
+        // Mongoose update path). Dotted paths MERGE into the stored bag rather
+        // than replacing it, so their key count is bounded against the stored
+        // bag's keys — fetched only when a dotted settings key is present (the
+        // common path pays nothing).
+        // GH #1070 (Codex P2 r7/r11 on PR #1086): wire-normalize raw multi-line
+        // settings strings BEFORE the caps — covers both the whole-object and
+        // dotted `settings.<key>` shapes. The stored bag feeds the echo test
+        // (an incoming value byte-equal to the stored one is the form's
+        // deliberate legacy-wrap echo and heals; anything else is fresh content
+        // whose boundary quotes survive) — fetched only when a raw multi-line
+        // settings string is actually present, so the common path pays nothing.
+        const storedForWire = bodyHasRawMultilineSettings(body)
+            ? ((await Filament.findOne({ _id: id, _deletedAt: null })
+                .select("settings")
+                .lean())?.settings ?? null)
+            : null;
+        normalizeSettingsToWire(body, storedForWire);
+        const bagError = validateSettingsBag(body.settings);
+        if (bagError)
+            return errorResponse(bagError, 400);
+        // Codex P1 round 2 (#1089): this pre-lock pass is a fast-fail courtesy
+        // only — the AUTHORITATIVE dotted-count check re-runs against a fresh
+        // stored-bag read INSIDE the runExclusive critical section below,
+        // because two concurrent PUTs adding distinct settings.<key> paths near
+        // the cap could both observe the same stored key set here and both
+        // pass, with the lock serializing only the (unvalidated) writes.
+        const hasDottedSettings = Object.keys(body).some((k) => k.startsWith("settings."));
+        if (hasDottedSettings) {
+            const storedBag = await Filament.findOne({ _id: id, _deletedAt: null })
+                .select("settings")
+                .lean();
+            const dottedError = validateDottedSettingsPaths(body, Object.keys(storedBag?.settings ?? {}));
+            if (dottedError)
+                return errorResponse(dottedError, 400);
+        }
+        // Codex P1 round 2 (#1089): the legacy top-level `totalWeight` (a
+        // pre-spools inventory field the dashboard's GH #777 branch still sums)
+        // reached findOneAndUpdate unvalidated — the schema's `min: 0` accepts
+        // Infinity (`JSON.parse("1e309")`), which overflows aggregates into
+        // JSON null. Mirror the POST paths' validateSpoolBody contract:
+        // finite non-negative number, or null to clear.
+        if ("totalWeight" in body &&
+            body.totalWeight !== null &&
+            (typeof body.totalWeight !== "number" ||
+                !Number.isFinite(body.totalWeight) ||
+                body.totalWeight < 0)) {
+            return errorResponse("totalWeight must be a non-negative number or null", 400);
+        }
+        // Validate parentId if provided
+        if (body.parentId) {
+            const parent = await Filament.findOne({ _id: body.parentId, _deletedAt: null }).lean();
+            if (!parent) {
+                return errorResponse("Parent filament not found", 400);
+            }
+            // Prevent circular references
+            if (parent.parentId) {
+                return errorResponse("Cannot set a variant as parent (no nested inheritance)", 400);
+            }
+            // Prevent self-reference
+            if (body.parentId === id) {
+                return errorResponse("Cannot be your own parent", 400);
+            }
+            // Prevent converting a parent to a variant while it has children
+            const variantCount = await Filament.countDocuments({ parentId: id, _deletedAt: null });
+            if (variantCount > 0) {
+                return errorResponse("Cannot set parent on a filament that has variants — remove variants first", 400);
+            }
+        }
+        // GH #519: same cross-collection ref existence check the POST handler
+        // runs (Nozzle / Printer / BedType from compatibleNozzles +
+        // calibrations[]). Without this, a PUT could attach phantom refs the
+        // GET handler's .populate() then silently drops, leaving the slicer
+        // / compare UI looking at calibrations that point at nothing.
+        {
+            const nozzleRefs = new Set();
+            const printerRefs = new Set();
+            const bedRefs = new Set();
+            if (Array.isArray(body.compatibleNozzles)) {
+                for (const refId of body.compatibleNozzles) {
+                    if (typeof refId === "string")
+                        nozzleRefs.add(refId);
+                }
+            }
+            if (Array.isArray(body.calibrations)) {
+                for (const cal of body.calibrations) {
+                    if (typeof cal?.nozzle === "string")
+                        nozzleRefs.add(cal.nozzle);
+                    if (typeof cal?.printer === "string")
+                        printerRefs.add(cal.printer);
+                    if (typeof cal?.bedType === "string")
+                        bedRefs.add(cal.bedType);
+                }
+            }
+            const nozzleGuard = await assertActiveRefs(Nozzle, Array.from(nozzleRefs), "referenced nozzles");
+            if (nozzleGuard)
+                return nozzleGuard;
+            const printerGuard = await assertActiveRefs(Printer, Array.from(printerRefs), "referenced printers");
+            if (printerGuard)
+                return printerGuard;
+            const bedGuard = await assertActiveRefs(BedType, Array.from(bedRefs), "referenced bed types");
+            if (bedGuard)
+                return bedGuard;
+        }
+        // #574: reject an inverted nozzle temperature range (min > max) on edit
+        // too. runValidators enforces the per-field 0–600 bounds but not the
+        // cross-field min ≤ max relationship.
+        //
+        // Codex P2 on PR #577: validate the range that will ACTUALLY be persisted.
+        // The update can carry the endpoints as a full `temperatures` object
+        // (replaces the subdoc), as dotted paths (`temperatures.nozzleRangeMin`),
+        // or wrapped in `$set` — and a dotted/partial update merges into the
+        // stored subdoc, so a lone min can combine with a stored max into an
+        // inverted range a body-only check would miss. Always fetch the stored
+        // endpoints (one indexed lookup on an edit) and validate the effective
+        // result; `effectiveNozzleRangeForUpdate` understands all the shapes.
+        const stored = await Filament.findOne({ _id: id, _deletedAt: null })
+            .select("temperatures.nozzleRangeMin temperatures.nozzleRangeMax parentId")
+            .lean();
+        const rangeUpdate = effectiveNozzleRangeForUpdate(body, stored?.temperatures);
+        // Codex P2 r3/r4 on #577: a variant inherits missing endpoints from its
+        // parent (resolveFilament: own ?? parent), so a lone min can invert
+        // against an inherited parent max. Two ways the effective range changes
+        // on edit: a range field is touched, OR the variant is re-parented (which
+        // swaps in a new parent's endpoints). Only validate when one of those
+        // happens — re-validating an unrelated edit could 400 on pre-existing
+        // data the user isn't touching.
+        const effectiveParentId = body.parentId !== undefined ? body.parentId : stored?.parentId;
+        const reparenting = body.parentId !== undefined &&
+            String(body.parentId ?? "") !== String(stored?.parentId ?? "");
+        if (rangeUpdate !== null || reparenting) {
+            // On a pure re-parent, seed the variant's own range from the stored
+            // endpoints (the request carries none) so an existing override is
+            // checked against the NEW parent (Codex P2 r4).
+            const own = rangeUpdate ?? {
+                nozzleRangeMin: stored?.temperatures?.nozzleRangeMin ?? null,
+                nozzleRangeMax: stored?.temperatures?.nozzleRangeMax ?? null,
+            };
+            let effRange = own;
+            if (effectiveParentId) {
+                const parent = await Filament.findOne({ _id: effectiveParentId, _deletedAt: null })
+                    .select("temperatures.nozzleRangeMin temperatures.nozzleRangeMax")
+                    .lean();
+                effRange = inheritNozzleRangeFromParent(own, parent?.temperatures);
+            }
+            if (isInvertedNozzleRange(effRange)) {
+                return errorResponse("Nozzle range minimum temperature must be less than or equal to the maximum", 400);
+            }
+            // Codex P2 r5 on #577: editing a PARENT's range can retroactively
+            // invert an inheriting variant's effective range — e.g. lowering this
+            // parent's max to 200 while a child overrides only its own min to 300
+            // leaves the child resolving to 300/200. The edited doc is a root
+            // parent when it has variants (no nested inheritance), so its new own
+            // range (`own`/`effRange`) is what children inherit. Reject the parent
+            // edit if it would invert any inheriting child. Only runs when a range
+            // field actually changed (rangeUpdate !== null).
+            if (rangeUpdate !== null) {
+                const children = await Filament.find({ parentId: id, _deletedAt: null })
+                    .select("temperatures.nozzleRangeMin temperatures.nozzleRangeMax")
+                    .lean();
+                for (const child of children) {
+                    const childEffective = inheritNozzleRangeFromParent({
+                        nozzleRangeMin: child.temperatures?.nozzleRangeMin ?? null,
+                        nozzleRangeMax: child.temperatures?.nozzleRangeMax ?? null,
+                    }, effRange);
+                    if (isInvertedNozzleRange(childEffective)) {
+                        return errorResponse("This nozzle range would create an inverted range on an inheriting variant — adjust the variant's override first", 400);
+                    }
+                }
+            }
+        }
+        // GH #605 (codex round 4, F2): a PUT that INTRODUCES a parentId (none →
+        // some, or a re-parent to a DIFFERENT parent) can mint that parent's
+        // first live variant — the same restructuring event the POST create path
+        // gates — so it must round-trip the same confirmation: 409
+        // `parent_promotion_required` until the caller repeats the request with
+        // `promoteParent: true`, which promotes the carrying parent first. The
+        // gate runs LAST, after every other guard above PLUS the round-6 schema
+        // dry-run inside this block, so an otherwise-invalid request gets its
+        // 400 before any promotion side effect.
+        //
+        // Lock ordering: the gate (and a confirmed promotion) runs under the
+        // PARENT's key inside gateFirstVariantAdoption; the write section below
+        // runs under the TARGET's key. The two are strictly SEQUENTIAL — never
+        // held together — because two opposing re-parent PUTs (A→B and B→A)
+        // acquiring {parent, target} pairs in opposite orders would deadlock.
+        // Residual window: between the parent-lock release and the target-lock
+        // write, a concurrent writer could hand the parent new carrying state
+        // (its own color PUT, an atlas import). The result is a template that
+        // still carries legacy state — exactly the pre-#605 shape the
+        // enforce-forward posture already tolerates and "Convert to template"
+        // recovers, so the window degrades gracefully instead of corrupting.
+        // Round 11 F2: a soft-DELETE of the TARGET in that same gap is shrunk
+        // from both ends — the gate re-checks the target's liveness inside the
+        // parent lock immediately before promoting (`targetId` below), and the
+        // write section re-checks it again under the target lock. The
+        // microsecond window left between them deliberately stays open: losing
+        // it yields a valid, user-confirmed, COMPLETED promotion with no
+        // adoption (the owner decision: never demote/compensate), and closing
+        // it would need the two-key hold ruled out above.
+        // `stored` gating: a PUT addressed to a missing/trashed target 404s at
+        // the write — without the target check, a confirmed request could
+        // promote the parent and THEN 404, an irreversible side effect on an
+        // error response. (`stored` is the pre-lock snapshot; the write's own
+        // `_deletedAt: null` filter still owns the final answer.)
+        // Round 7 P2: when the adoption below mints the first variant of a
+        // threshold-ONLY parent (nothing gates, so no 409/promotion), the
+        // parent's lowStockThreshold becomes dead config — the gate reports it
+        // and THIS route clears it, but only AFTER the write section succeeds
+        // (parent state change last: an error response, a 404, or the F7 cycle
+        // rollback below must leave the parent untouched).
+        let clearParentThresholdAfterWrite = false;
+        // Round 11 F2: true once the adoption gate cleared for this request —
+        // gates the write section's target-liveness re-check below (only the
+        // adoption path can have promoted a parent in between).
+        let adoptionGateCleared = false;
+        if (stored && body.parentId && reparenting) {
+            // Codex round 6, F1: dry-run-validate the target AS IT WOULD BE AFTER
+            // this PUT before the gate can promote the parent. The write below
+            // runs `runValidators` — but only AFTER a confirmed adoption has
+            // already restructured the parent, so a schema-invalid body (cost: -5,
+            // a bad color hex) would surface its 400 with the promotion side
+            // effect already irreversible. Same defect class (and same cure) as
+            // the create path's `new Filament(body).validate()` inside
+            // createVariantGated: fail the doomed request while the parent is
+            // completely untouched. The PUT's update is a plain field object
+            // ($-operators rejected above), i.e. a top-level $set — `doc.set(body)`
+            // on a hydrated, never-saved copy of the stored doc reproduces exactly
+            // the document state findOneAndUpdate would persist; a ValidationError
+            // propagates to the catch below and maps to the same 400 shape the
+            // write-time validators produce (errorResponseFromCaught).
+            const dryRunTarget = await Filament.findOne({ _id: id, _deletedAt: null });
+            if (!dryRunTarget) {
+                // Vanished since the `stored` snapshot — same 404 the write would
+                // return, taken here so a confirmed request can't promote first.
+                return errorResponse("Not found", 404);
+            }
+            dryRunTarget.set(body);
+            await dryRunTarget.validate();
+            // Round 9 F2: fail a doomed RENAME before the gate can promote the
+            // parent. The dry-run above runs document validators, but the unique
+            // name constraint is a partial INDEX (unique among non-deleted docs —
+            // src/models/Filament.ts), not a validator — so a confirmed
+            // reparent+rename to a taken name would pass the dry-run, promote the
+            // parent, and THEN E11000 at the write: an error response after the
+            // irreversible restructuring. The POST create path has pre-checked the
+            // requested name since round 1 (createVariantGated's beforePromote);
+            // this is the same check for the adoption path. Query shape matches
+            // that pre-check (non-deleted, exact name equality — the index's own
+            // semantics) plus an exclusion of the target itself, so re-sending the
+            // target's OWN current name (the edit form echoes `name` on every
+            // save) never false-positives. The 409 is byte-identical to what the
+            // write-time E11000 produces via handleDuplicateKeyError, so the
+            // client contract is unchanged — the collision just surfaces before
+            // any promotion side effect. Residual TOCTOU window between this check
+            // and the write still falls back to that same E11000 handler.
+            const effectiveName = typeof body.name === "string" ? body.name : dryRunTarget.name;
+            if (await Filament.exists({
+                name: effectiveName,
+                _deletedAt: null,
+                _id: { $ne: id },
+            })) {
+                return errorResponse(`A filament with that name already exists: "${effectiveName}"`, 409);
+            }
+            const adoption = await gateFirstVariantAdoption(Filament, body.parentId, {
+                promoteParent,
+                // Reserve the name this document will carry after the PUT (a rename
+                // can ride the same request) so the promotion copy can't squat on it.
+                adoptedName: typeof body.name === "string" ? body.name : undefined,
+                // Round 11 F2a: the round-4 target-existence precondition
+                // (dryRunTarget above) runs PRE-lock, so a soft-DELETE of this
+                // target could land before a confirmed promotion restructures the
+                // parent — a completed promotion with no adoption. Passing the
+                // target id makes the gate re-check its liveness INSIDE the
+                // parent's lock at the last responsible moment, immediately before
+                // performParentPromotion.
+                targetId: id,
+            });
+            if (adoption.outcome === "parent_not_found") {
+                // Validated above but vanished (soft-deleted) before the gate —
+                // same 400 the pre-lock check would have given.
+                return errorResponse("Parent filament not found", 400);
+            }
+            if (adoption.outcome === "parent_is_variant") {
+                // Validated above as a root, but a concurrent PUT re-parented it
+                // before the gate's in-lock re-fetch (round 8 F1) — same no-nesting
+                // 400 the pre-lock check produces.
+                return errorResponse("Cannot set a variant as parent (no nested inheritance)", 400);
+            }
+            if (adoption.outcome === "target_not_found") {
+                // Round 11 F2a: this PUT's own target was soft-deleted after the
+                // pre-lock checks — caught in-lock BEFORE the promotion, so the
+                // parent is untouched. Same 404 the write below would produce.
+                return errorResponse("Not found", 404);
+            }
+            if (adoption.outcome === "promotion_required") {
+                return NextResponse.json(promotionRequired409Body(adoption), { status: 409 });
+            }
+            clearParentThresholdAfterWrite = adoption.clearOrphanedThreshold;
+            adoptionGateCleared = true;
+        }
+        // GH #605: a filament with ≥1 live variant is a TEMPLATE and must not
+        // carry its own INVENTORY or per-variant color identity. STRIP (don't
+        // reject) a non-null write of any of the four per-variant fields —
+        // `totalWeight` (inventory), and since codex round 4 (F3) also `color`,
+        // `colorName`, and `lowStockThreshold`: a form loaded PRE-promotion and
+        // saved POST-promotion echoes the promoted-away values back verbatim and
+        // would re-materialize them on the template (and a 400 would brick
+        // parent edits entirely, since the edit form echoes every field). An
+        // explicit null passes through: clearing a legacy parent's leftover
+        // value is legitimate cleanup, and blocking it would freeze exactly the
+        // state we're trying to migrate away from. For a LEGACY carrying parent
+        // (pre-#605, still holding a color) the form resubmits the STORED value
+        // verbatim — stripping means "not applied", and since the resubmitted
+        // value equals the stored one, behavior is unchanged (the stored color
+        // stays; the response still reports the strip). The response carries
+        // `_strippedTemplateFields` (response-only, underscore-prefixed like
+        // _parent/_variants) so a client can surface a warning.
+        //
+        // `spoolWeight` / `netFilamentWeight` are deliberately NOT stripped:
+        // they are SPEC — the product line's tare and nominal net weight — and
+        // stay editable on templates, where every variant inherits them
+        // (resolveFilament's INHERITABLE_FIELDS). That is what makes GH #1048's
+        // recommended workaround possible: set the net weight on the parent so
+        // the whole family inherits the remaining-percentage denominator.
+        //
+        // Review P1-c: the strip DECISION and the persisting write share one
+        // per-id critical section (runExclusive — the same key the promotion
+        // paths lock). Decided-then-written across a gap, a totalWeight PUT
+        // racing a first-variant promotion could pass the hasVariants check
+        // while the parent was still a standalone and then persist AFTER the
+        // promotion cleared the parent — re-materializing inventory on a fresh
+        // template. Serialized, either the PUT lands first (and the promotion's
+        // fresh snapshot moves the new value onto the promoted variant) or the
+        // promotion lands first (and this re-check strips the write).
+        // The per-variant fields a template must not (re-)acquire — inventory
+        // plus color identity (codex round 4, F3) — live in the shared
+        // TEMPLATE_STRIP_FIELDS (src/lib/templateStrip.ts), used verbatim by the
+        // slicer sync-back routes and both INI bulk importers; atlas imports drop
+        // the same set with their own per-field notes (import-atlas/route.ts) —
+        // keep that mirror in lockstep with the shared list.
+        let strippedTemplateFields = [];
+        // Codex P1 round 2 (#1089): set inside the lock when the in-lock dotted
+        // re-validation trips; mapped to a 400 after the critical section.
+        let inLockDottedError = null;
+        const filament = await runExclusive(filamentLockKey(id), async () => {
+            // Round 11 F2b: on the adoption path, re-check the target is still
+            // alive under ITS lock before the adoption write. The parent lock
+            // (gate + promotion) was released above, so a soft-DELETE serialized
+            // on this key can win the gap between the two locks; when it did, the
+            // findOneAndUpdate below would refuse anyway (`_deletedAt: null`) —
+            // this explicit precheck pins the posture at the last responsible
+            // moment. DELIBERATE (owner decision): the promotion, if it ran,
+            // STANDS — a user-confirmed, completed promotion is a valid end state,
+            // not corruption (demoting it back would be a destructive migration),
+            // and closing the remaining microsecond window entirely would require
+            // holding the parent and target locks together — a two-key lock order
+            // the AB/BA deadlock note above rules out.
+            if (adoptionGateCleared) {
+                const targetAlive = await Filament.exists({ _id: id, _deletedAt: null });
+                if (!targetAlive)
+                    return null;
+            }
+            // Codex P1 round 2 (#1089): AUTHORITATIVE dotted-settings cap check —
+            // re-read the stored bag under the SAME lock as the write, so two
+            // concurrent PUTs adding distinct keys near the cap serialize through
+            // one validate-then-write section and the second observes the first's
+            // growth. (All same-id settings writers share this lock key.)
+            if (hasDottedSettings) {
+                const lockedBag = await Filament.findOne({ _id: id, _deletedAt: null })
+                    .select("settings")
+                    .lean();
+                inLockDottedError = validateDottedSettingsPaths(body, Object.keys(lockedBag?.settings ?? {}));
+                if (inLockDottedError)
+                    return null;
+            }
+            strippedTemplateFields = await stripTemplateFieldsForWrite(Filament, id, body);
+            return await Filament.findOneAndUpdate({ _id: id, _deletedAt: null }, body, { returnDocument: "after", runValidators: true }).lean();
+        });
+        if (inLockDottedError) {
+            return errorResponse(inLockDottedError, 400);
+        }
+        if (!filament) {
+            return errorResponse("Not found", 404);
+        }
+        // GH #1004 F7: the parentId validation above is check-then-act — two
+        // concurrent re-parent PUTs (A→B and B→A) can each pass validation
+        // against pre-write state and both persist, creating a mutual A⇄B cycle
+        // (or an A→B while C→A nests inheritance) that every single-level read
+        // path (resolveFilament) assumes cannot exist. Re-assert the invariant
+        // against POST-write state and, on violation, roll this doc back to a safe
+        // root + 409 so the caller retries.
+        //
+        // Codex P2 (r3) on PR #1012: run whenever a NON-NULL parentId is written —
+        // NOT only when `reparenting` (a pre-write-snapshot diff) is true. The edit
+        // form echoes `parentId` on every save, so a stale re-save writes back an
+        // unchanged parentId; if a race turned that parent into a variant in the
+        // meantime, a `reparenting`-gated check would skip it and let a nested chain
+        // persist. Gating on the written value re-validates every parented write.
+        // Un-parenting (parentId null) can't create a cycle, so it's still skipped.
+        if (body.parentId) {
+            const [newParent, childCount] = await Promise.all([
+                Filament.findOne({ _id: body.parentId, _deletedAt: null }).select("parentId").lean(),
+                Filament.countDocuments({ parentId: id, _deletedAt: null }),
+            ]);
+            const parentIsVariant = !newParent || newParent.parentId != null;
+            const gainedChildren = childCount > 0;
+            if (parentIsVariant || gainedChildren) {
+                // Codex P2 (×2) on PR #1012: roll back to a SAFE state — a root
+                // (`parentId: null`) — NOT the old parent. Two reasons:
+                //   1. A concurrent PUT may have turned the OLD parent into a variant
+                //      while this filament was momentarily "away" (its variant-count
+                //      guard read zero), so restoring the old parent could recreate the
+                //      very nested inheritance we're rejecting. A root is always a valid
+                //      single-level state (no cycle, no nesting) whatever else changed.
+                //   2. Scope the write to the parent THIS request wrote
+                //      (`parentId: body.parentId`) + a live row, so a *newer* valid
+                //      re-parent (or delete) that landed between our findOneAndUpdate
+                //      and here isn't clobbered — matchedCount 0, and we still 409.
+                // Under any interleaving of two opposing re-parents, at least one side
+                // detects the conflict and nulls out, so no cycle/nesting ever
+                // persists; the loser retries against the (now root) filament.
+                await Filament.updateOne({ _id: id, parentId: body.parentId, _deletedAt: null }, { $set: { parentId: null } });
+                return errorResponse("Re-parenting conflicts with a concurrent change (it would create nested inheritance or a parent cycle). The filament was left without a parent; re-check and retry.", 409);
+            }
+        }
+        // Round 7 P2: the adoption write landed (and the cycle re-assert above
+        // didn't roll it back), so the threshold-only parent's first variant now
+        // exists — clear the parent's dead threshold as the last step.
+        if (clearParentThresholdAfterWrite) {
+            await clearOrphanedParentThreshold(Filament, body.parentId);
+        }
+        return NextResponse.json(strippedTemplateFields.length > 0
+            ? { ...filament, _strippedTemplateFields: strippedTemplateFields }
+            : filament);
+    }
+    catch (err) {
+        // Surface MongoDB duplicate-key errors (renaming a filament to a
+        // name that already exists) as a specific 409 rather than the
+        // generic 500 "Failed to update filament" toast. The POST handler
+        // does this already; the PUT was missing it, so users saw a vague
+        // error toast on the most common rename-collision case.
+        const dupResponse = handleDuplicateKeyError(err, "filament");
+        if (dupResponse)
+            return dupResponse;
+        return errorResponseFromCaught(err, "Failed to update filament");
+    }
+}
+/**
+ * POST /api/filaments/:nameOrId
+ *
+ * Sync a filament preset back from PrusaSlicer. The param can be a
+ * URL-encoded preset name (e.g. "The%20K8%20PC") or a MongoDB ObjectId.
+ *
+ * Body: { name: string, config: Record<string, string> }
+ *
+ * Finds the filament by name (falling back to _id), then merges the
+ * incoming config keys into the filament's `settings` bag.
+ */
+export async function POST(request, { params }) {
+    const guard = assertSameOriginRequest(request);
+    if (guard)
+        return guard;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let body;
+    try {
+        body = await request.json();
+    }
+    catch {
+        return errorResponse("Invalid JSON in request body", 400);
+    }
+    try {
+        await dbConnect();
+        const { id } = await params;
+        const config = body.config || {};
+        if (!config || Object.keys(config).length === 0) {
+            return errorResponse("No config provided", 400);
+        }
+        // #867: resolve the target filament. The fork's normal sync addresses by the
+        // mutable preset NAME, so for a NAME url we match the STABLE config
+        // `filamentdb_id` FIRST (round-tripped through the export) — resilient to a
+        // renamed preset, which otherwise hits the create-on-404 path and silently
+        // spawns an orphan that swallows every later edit. The id falls back
+        // gracefully when absent/stale (it's DB-instance-specific).
+        //
+        // An ObjectId URL (POST /api/filaments/{ObjectId}) is EXPLICIT addressing —
+        // the URL id is authoritative and a carried filamentdb_id must NOT override
+        // it, or a copied/stale id in the config would redirect the write to a
+        // different row (Codex P2).
+        //
+        // `params.id` is ALREADY URL-decoded — re-decoding throws URIError on a
+        // name with a literal `%` ("ABS 100%") and 500s the sync (#671).
+        const decodedName = id;
+        const urlIsObjectId = /^[a-f0-9]{24}$/i.test(id);
+        const sentId = typeof config.filamentdb_id === "string" ? config.filamentdb_id.trim() : "";
+        let filament = urlIsObjectId
+            ? await Filament.findOne({ _id: id, _deletedAt: null })
+            : null;
+        // True ONLY when the URL ObjectId itself resolved the record (the authoritative
+        // form). NOT the same as urlIsObjectId: a 24-hex URL whose _id misses falls
+        // through to name/config-id matching below, and renaming THERE (a name-addressed
+        // semantic) would be wrong (Codex P2). This is the precise gate for the rename.
+        const matchedByUrlObjectId = !!filament;
+        let matchedBy = filament ? "id" : null;
+        // True only for a config-filamentdb_id match on a NAME-addressed sync — the
+        // sole case where a name divergence is meaningful (the URL holds a real name).
+        let matchedByConfigId = false;
+        // Fall through whenever the ObjectId lookup matched NOTHING — either the URL
+        // is a real name, OR it's an ObjectId-SHAPED string that is no filament's id
+        // (e.g. a preset legitimately named with 24 hex chars); both must still
+        // resolve by filamentdb_id → name (Codex P2). A *found* ObjectId stays
+        // authoritative (the block above already set `filament`).
+        if (!filament) {
+            if (/^[a-f0-9]{24}$/i.test(sentId)) {
+                filament = await Filament.findOne({ _id: sentId, _deletedAt: null });
+                if (filament) {
+                    matchedBy = "id";
+                    matchedByConfigId = true;
+                }
+            }
+            if (!filament) {
+                filament = await Filament.findOne({ name: decodedName, _deletedAt: null });
+                if (filament)
+                    matchedBy = "name";
+            }
+            // GH #950: a #872 per-nozzle preset is named "<base> <Ø type [HF]>". When
+            // its filamentdb_id is stale/absent (DB-instance-specific) AND the full
+            // suffixed name misses, retry the BASE name (decodedName minus the hint)
+            // so the sync updates the base filament instead of 404 → the fork spawning
+            // a "<base> <hint>" orphan that swallows every later edit.
+            if (!filament) {
+                const hint = typeof config.filamentdb_nozzle === "string" ? config.filamentdb_nozzle.trim() : "";
+                if (hint && decodedName.endsWith(` ${hint}`)) {
+                    const baseName = decodedName.slice(0, -(hint.length + 1)).trim();
+                    if (baseName) {
+                        filament = await Filament.findOne({ name: baseName, _deletedAt: null });
+                        if (filament)
+                            matchedBy = "name";
+                    }
+                }
+            }
+        }
+        if (!filament) {
+            return errorResponse(`Filament not found: ${decodedName}`, 404);
+        }
+        // #872: a multi-nozzle filament exports as N flat presets named
+        // "<base> <Ø type [HF]>", all carrying the base filamentdb_id plus a
+        // filamentdb_nozzle hint (e.g. "0.4 Diamondback", "0.4 Brass HF"). Recognize a
+        // per-nozzle preset so (a) its suffixed name isn't read as a rename mismatch
+        // below, and (b) its calibration routes to the matching per-nozzle entry even
+        // without an explicit ?nozzle_diameter= query param (parsed from the hint).
+        const perNozzleHint = typeof config.filamentdb_nozzle === "string" ? config.filamentdb_nozzle.trim() : "";
+        // Recognized for BOTH addressing modes: a name-addressed sync whose URL name is
+        // exactly "<base> <hint>", AND an id-addressed sync (the ObjectId URL) that
+        // carries the hint — the fork's re-stamped per-nozzle preset (Codex P2).
+        const isPerNozzlePreset = perNozzleHint !== "" &&
+            (matchedByUrlObjectId || decodedName === `${filament.name} ${perNozzleHint}`);
+        const hintHighFlow = / HF$/i.test(perNozzleHint);
+        const hintCore = perNozzleHint.replace(/ HF$/i, "").trim();
+        const hintSpace = hintCore.indexOf(" ");
+        const hintDiameter = hintSpace > 0 ? parseFloat(hintCore.slice(0, hintSpace)) : NaN;
+        const hintType = hintSpace > 0 ? hintCore.slice(hintSpace + 1).trim() : "";
+        // #872: the calibration target diameter — the explicit ?nozzle_diameter= query
+        // when present, else the per-nozzle hint's diameter. `routeToCalibration` gates
+        // whether the preset's baked NOZZLE-SPECIFIC keys (max-vol / temps / fan) land
+        // on the matching calibration entry instead of the filament-wide top level
+        // (Codex P1 — otherwise one nozzle's value overwrites the shared default).
+        const nozzleDiameterParam = request.nextUrl.searchParams.get("nozzle_diameter");
+        const nozzleDiameter = nozzleDiameterParam
+            ? parseFloat(nozzleDiameterParam)
+            : isPerNozzlePreset
+                ? hintDiameter
+                : NaN;
+        const routeToCalibration = isPerNozzlePreset && !isNaN(nozzleDiameter) && nozzleDiameter > 0;
+        // #867 / Codex P1: the config filamentdb_id resolves to a filament whose
+        // stored name differs from the preset name in the URL. This is EITHER a
+        // renamed preset (id is right) OR a copied/cloned id (a Save-As that kept the
+        // source preset's id, so the id points at the WRONG filament) — and the two
+        // are indistinguishable server-side. So DO NOT mutate: a copied id would
+        // otherwise silently overwrite the source filament with the clone's settings.
+        // Return 409 with the conflict so the fork can prompt; to update the resolved
+        // filament anyway, re-sync addressing it by id (POST /api/filaments/{_id}),
+        // which is the authoritative ObjectId form. (matchedByConfigId is only set on
+        // a name-addressed config-id match, so ObjectId-URL syncs never reach here.)
+        // #872: a recognized per-nozzle preset's suffixed name is EXPECTED, not a
+        // rename — don't treat it as a mismatch.
+        if (matchedByConfigId && filament.name !== decodedName && !isPerNozzlePreset) {
+            return NextResponse.json({
+                error: "name_id_mismatch",
+                message: `filamentdb_id resolves to "${filament.name}", but the preset is named "${decodedName}". Not updated — confirm before the id wins (re-sync by id to apply).`,
+                matchedBy: "id",
+                filamentId: String(filament._id),
+                matchedName: filament.name,
+                sentName: decodedName,
+            }, { status: 409 });
+        }
+        // Reverse-map PrusaSlicer INI keys → structured DB fields
+        const update = {};
+        const temps = {};
+        // Core fields
+        if (config.filament_type)
+            update.type = config.filament_type;
+        if (config.filament_vendor)
+            update.vendor = config.filament_vendor;
+        // GH #883: a coextruded filament exports secondaryColors[0] as its single
+        // colour key; suppress writing that echo back onto the null primary so the
+        // round-trip doesn't corrupt the spec-pure coextruded shape. GH #913: for a
+        // variant that inherits its parent's coextruded colors, resolve the parent's
+        // secondaryColors so the inherited-coextruded case is detected too.
+        if (config.filament_colour) {
+            const colorParent = filament.parentId
+                ? await Filament.findById(filament.parentId, { secondaryColors: 1 }).lean()
+                : null;
+            const resolvedColor = resolveSyncBackColor(filament, config.filament_colour, colorParent);
+            if (resolvedColor !== undefined) {
+                update.color = resolvedColor;
+                // GH #885: colorName + color are kept paired everywhere else (the
+                // edit-form typeahead sets both together), but the slicer sends only a
+                // hex. When the synced hex actually changes the colour, clear the stale
+                // human-readable name so it can't keep describing the old colour (in the
+                // name chip + CSV/XLSX exports). Cleared rather than reverse-looked-up
+                // because an arbitrary slicer hex won't reliably map to a named colour.
+                // Gated on resolvedColor !== undefined above so the coextruded-echo
+                // suppression path (which leaves color untouched) doesn't clear it.
+                // Codex P2 (#918): compare case-insensitively — the schema accepts
+                // mixed-case hex, so a `#ff0000` → `#FF0000` sync isn't a real colour
+                // change and must NOT drop the name.
+                if (typeof filament.color !== "string" ||
+                    resolvedColor.toLowerCase() !== filament.color.toLowerCase()) {
+                    update.colorName = null;
+                }
+            }
+        }
+        if (config.filament_diameter) {
+            const v = parseFloat(config.filament_diameter);
+            if (!isNaN(v))
+                update.diameter = v;
+        }
+        if (config.filament_density) {
+            const v = parseFloat(config.filament_density);
+            if (!isNaN(v))
+                update.density = v;
+        }
+        if (config.filament_cost) {
+            const v = parseFloat(config.filament_cost);
+            if (!isNaN(v))
+                update.cost = v;
+        }
+        if (config.filament_spool_weight) {
+            const v = parseFloat(config.filament_spool_weight);
+            if (!isNaN(v))
+                update.spoolWeight = v;
+        }
+        // #872: when routing to a per-nozzle calibration entry, these baked
+        // nozzle-specific values must NOT also overwrite the filament-wide top level —
+        // they are added to the calibration `calFields` below instead (with a top-level
+        // fallback if no calibration target resolves, so nothing is lost).
+        if (config.filament_max_volumetric_speed && !routeToCalibration) {
+            const v = parseFloat(config.filament_max_volumetric_speed);
+            if (!isNaN(v))
+                update.maxVolumetricSpeed = v;
+        }
+        // Temperatures
+        if (!routeToCalibration) {
+            if (config.temperature) {
+                const v = parseInt(config.temperature);
+                if (!isNaN(v))
+                    temps.nozzle = v;
+            }
+            if (config.first_layer_temperature) {
+                const v = parseInt(config.first_layer_temperature);
+                if (!isNaN(v))
+                    temps.nozzleFirstLayer = v;
+            }
+            if (config.bed_temperature) {
+                const v = parseInt(config.bed_temperature);
+                if (!isNaN(v))
+                    temps.bed = v;
+            }
+            if (config.first_layer_bed_temperature) {
+                const v = parseInt(config.first_layer_bed_temperature);
+                if (!isNaN(v))
+                    temps.bedFirstLayer = v;
+            }
+        }
+        // Shrinkage
+        if (config.filament_shrinkage_compensation_xy) {
+            const v = parseFloat(config.filament_shrinkage_compensation_xy);
+            if (!isNaN(v))
+                update.shrinkageXY = v;
+        }
+        if (config.filament_shrinkage_compensation_z) {
+            const v = parseFloat(config.filament_shrinkage_compensation_z);
+            if (!isNaN(v))
+                update.shrinkageZ = v;
+        }
+        // GH #1066: `inherits` is a settings-bag SHADOW of the top-level field
+        // (INI_TOP_LEVEL_SETTING_KEYS — the bulk INI import lifts it and purges
+        // the stored shadow). This sync used to bag it verbatim, so the fork's
+        // whole-preset echo re-created a shadow that the export's settings seed
+        // kept emitting even after the form cleared the top-level value — a
+        // stale `inherits = <preset> @PRINTER` that could not be removed in-app.
+        // Lift it like the bulk import: "nil"/"" → null (parseIni's nilOrVal
+        // convention). `inherits` is in INHERITABLE_FIELDS, so the variant split
+        // below treats it like every other structured field. The GH #266 bounded-
+        // write cap still applies (review P3): pre-lift the value rode the bag
+        // merge, which 400s on oversize — a structured write must not become the
+        // one uncapped path on the deliberately unauthenticated local/LAN API.
+        if (Object.prototype.hasOwnProperty.call(config, "inherits")) {
+            const v = config.inherits;
+            const lifted = v == null || v === "" || v === "nil" ? null : String(v);
+            if (lifted !== null && lifted.length > MAX_SETTING_VALUE_LENGTH) {
+                return errorResponse(`inherits value exceeds the ${MAX_SETTING_VALUE_LENGTH}-character limit`, 400);
+            }
+            update.inherits = lifted;
+        }
+        // GH #950: filament_soluble / filament_abrasive are NOT written as structured
+        // fields (the schema has no such columns — a Mongoose strict write dropped
+        // them). They now ride the settings bag (removed from STRUCTURED_KEYS below),
+        // which the slicer exports' settings seed and the OPT encoder read.
+        // #859: write ONLY the temperature keys PrusaSlicer actually sent, as
+        // dotted paths — never a $set of the whole `temperatures` object. #645 added
+        // `runValidators` to the sync write below; Mongoose update-validators check
+        // every path in the $set, so the previous `{ ...existing, ...temps }` merge
+        // dragged the filament's STORED temps into the validated payload. A single
+        // legacy out-of-range value (e.g. a nozzle temp > 600 saved before the
+        // validators existed) then failed validation and 400'd the ENTIRE sync —
+        // silently dropping EM + maxVolumetricSpeed too ("no longer syncs back").
+        // Dotted paths leave untouched siblings unchanged AND unvalidated, while a
+        // genuinely-bad INCOMING value is still rejected (preserves #645's intent).
+        for (const [key, value] of Object.entries(temps)) {
+            update[`temperatures.${key}`] = value;
+        }
+        // GH #265 / Codex P1: per-nozzle calibration sync must respect
+        // variant inheritance — but only when the variant actually inherits.
+        // resolveFilament uses the variant's OWN `calibrations` /
+        // `compatibleNozzles` whenever those arrays are non-empty, and falls
+        // back to the parent only when they're empty. So:
+        //   - a variant that OVERRIDES calibrations owns them itself → the
+        //     sync must write to the variant (writing to the parent would
+        //     silently land the change on a document the variant ignores);
+        //   - a variant that INHERITS (empty own array) → the sync writes to
+        //     the parent, so resolveFilament keeps surfacing it and we don't
+        //     sever inheritance by appending a lone entry to the variant.
+        // The compatible-nozzle list used for the nozzle match follows the
+        // same own-if-set-else-parent rule. Every other field in this sync
+        // always writes to the filament itself.
+        const calParent = filament.parentId
+            ? await Filament.findOne({ _id: filament.parentId, _deletedAt: null })
+            : null;
+        const ownCalibrations = filament.calibrations ?? [];
+        const ownCompatNozzles = filament.compatibleNozzles ?? [];
+        // The document whose `calibrations` array is effective for this
+        // filament — and whose `compatibleNozzles` scope the nozzle match.
+        const calTarget = ownCalibrations.length > 0 || !calParent ? filament : calParent;
+        const compatTarget = ownCompatNozzles.length > 0 || !calParent ? filament : calParent;
+        // GH #265 (Codex P1) / GH #618: the matched calibration entry is
+        // recorded here and applied with an atomic per-entry write after the
+        // main update — never a read-modify-write of the whole `calibrations`
+        // array, which would lose a concurrent sync's entry for a different
+        // nozzle. #265 fixed the parent-targeted case (an inheriting variant
+        // syncing its parent); #618 extends the same construction to the
+        // own-calibrations case, which used to fold a whole-array $set into
+        // the main update.
+        let calibrationWrite = null;
+        // Update per-nozzle calibration data when a nozzle is resolvable.
+        // PrusaSlicer passes ?nozzle_diameter=0.4&high_flow=0|1 so the API
+        // knows which calibration entry to update with EM, PA, retraction, etc.
+        // The high_flow flag disambiguates e.g. 0.4mm standard vs 0.4mm HF.
+        // (`nozzleDiameter` is computed up-front — it also gates `routeToCalibration`.)
+        if (!isNaN(nozzleDiameter) && nozzleDiameter > 0) {
+            const calFields = {};
+            if (config.extrusion_multiplier) {
+                const v = parseFloat(config.extrusion_multiplier);
+                if (!isNaN(v))
+                    calFields.extrusionMultiplier = v;
+            }
+            if (config.pressure_advance_value || config.pressure_advance) {
+                const raw = config.pressure_advance_value || config.pressure_advance;
+                const v = parseFloat(raw);
+                if (!isNaN(v))
+                    calFields.pressureAdvance = v;
+            }
+            if (config.filament_retract_length) {
+                const v = config.filament_retract_length === "nil" ? null : parseFloat(config.filament_retract_length);
+                calFields.retractLength = v !== null && !isNaN(v) ? v : null;
+            }
+            if (config.filament_retract_speed) {
+                const v = config.filament_retract_speed === "nil" ? null : parseFloat(config.filament_retract_speed);
+                calFields.retractSpeed = v !== null && !isNaN(v) ? v : null;
+            }
+            if (config.filament_retract_lift) {
+                const v = config.filament_retract_lift === "nil" ? null : parseFloat(config.filament_retract_lift);
+                calFields.retractLift = v !== null && !isNaN(v) ? v : null;
+            }
+            // #872: for a per-nozzle preset, the baked nozzle-specific temps / max-vol /
+            // fan belong on THIS calibration entry (they were skipped at the top level
+            // above). The same numeric parse the top-level path used.
+            if (routeToCalibration) {
+                const numFromConfig = (raw) => {
+                    if (!raw)
+                        return undefined;
+                    const v = parseFloat(raw);
+                    return isNaN(v) ? undefined : v;
+                };
+                const calMap = {
+                    filament_max_volumetric_speed: "maxVolumetricSpeed",
+                    temperature: "nozzleTemp",
+                    first_layer_temperature: "nozzleTempFirstLayer",
+                    bed_temperature: "bedTemp",
+                    first_layer_bed_temperature: "bedTempFirstLayer",
+                    min_fan_speed: "fanMinSpeed",
+                    max_fan_speed: "fanMaxSpeed",
+                    bridge_fan_speed: "fanBridgeSpeed",
+                };
+                for (const [cfgKey, calKey] of Object.entries(calMap)) {
+                    const v = numFromConfig(config[cfgKey]);
+                    if (v !== undefined)
+                        calFields[calKey] = v;
+                }
+            }
+            if (Object.keys(calFields).length > 0) {
+                // Find the nozzle by diameter (and optionally high_flow) among
+                // the effective compatible nozzles (`compatTarget` — the
+                // variant's own list when set, else the parent's; see the #265
+                // note above). The high_flow param disambiguates e.g. 0.4mm
+                // Diamondback vs 0.4mm HF.
+                const compatIds = (compatTarget.compatibleNozzles || []).map((n) => String(n));
+                if (compatIds.length > 0) {
+                    const highFlowParam = request.nextUrl.searchParams.get("high_flow");
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const nozzleQuery = {
+                        _id: { $in: compatIds },
+                        diameter: nozzleDiameter,
+                        _deletedAt: null,
+                    };
+                    // Only filter by highFlow when the param is explicitly provided, else
+                    // fall back to the per-nozzle hint's HF flag (#872). A non-HF hint
+                    // matches `{ $ne: true }` (false OR unset) so a legacy nozzle without
+                    // the field still resolves; an HF hint requires true.
+                    if (highFlowParam !== null) {
+                        nozzleQuery.highFlow = highFlowParam === "1";
+                    }
+                    else if (isPerNozzlePreset) {
+                        nozzleQuery.highFlow = hintHighFlow ? true : { $ne: true };
+                    }
+                    // #872: disambiguate same-diameter nozzles (e.g. Brass vs Diamondback) by
+                    // the type carried in the per-nozzle preset's filamentdb_nozzle hint.
+                    // Case-INSENSITIVE (anchored regex) so it agrees with the /calibration
+                    // read path's type match — a lowercased/user-edited preset-name hint
+                    // (e.g. "0.4 diamondback") must resolve the same nozzle on both sides.
+                    if (isPerNozzlePreset && hintType) {
+                        nozzleQuery.type = { $regex: `^${escapeRegex(hintType)}$`, $options: "i" };
+                    }
+                    const matchingNozzle = await Nozzle.findOne(nozzleQuery).lean();
+                    if (matchingNozzle) {
+                        // GH #265: the entry lands on whichever document owns this
+                        // filament's effective calibrations (`calTarget` — the
+                        // filament itself for a standalone or an overriding variant,
+                        // the parent for an inheriting variant). GH #618: BOTH cases
+                        // defer to the atomic per-entry write below — the own-document
+                        // case used to spread `[...calTarget.calibrations]` into the
+                        // main $set, a read-modify-write that dropped a concurrent
+                        // sync's entry for a different nozzle.
+                        calibrationWrite = {
+                            nozzleId: String(matchingNozzle._id),
+                            fields: calFields,
+                        };
+                    }
+                }
+                // #859 follow-up: when the filament has no matching COMPATIBLE nozzle
+                // (commonly because `compatibleNozzles` is empty on a filament imported
+                // / synced from spilofila), fall back to the GLOBAL nozzle catalog and
+                // attach the calibration to the UNIQUE nozzle at this diameter (+
+                // high_flow). Mirrors the Bambu/OrcaSlicer sync routes; only when
+                // EXACTLY ONE catalog nozzle matches, so we never guess. Without this,
+                // PrusaSlicer's EM / pressure-advance edits were silently dropped for any
+                // filament with no compatible nozzles set.
+                if (!calibrationWrite) {
+                    const highFlowParam = request.nextUrl.searchParams.get("high_flow");
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const globalQuery = {
+                        diameter: nozzleDiameter,
+                        _deletedAt: null,
+                    };
+                    if (highFlowParam !== null) {
+                        globalQuery.highFlow = highFlowParam === "1";
+                    }
+                    else if (isPerNozzlePreset) {
+                        globalQuery.highFlow = hintHighFlow ? true : { $ne: true };
+                    }
+                    // #872: the per-nozzle hint's type narrows same-diameter catalog
+                    // nozzles, so "0.4 Diamondback" resolves even when both a Brass and a
+                    // Diamondback 0.4 exist (the bare-diameter query would punt as >1).
+                    // Case-insensitive (anchored regex), symmetric with the read path.
+                    if (isPerNozzlePreset && hintType) {
+                        globalQuery.type = { $regex: `^${escapeRegex(hintType)}$`, $options: "i" };
+                    }
+                    const globalMatches = await Nozzle.find(globalQuery).limit(2).lean();
+                    if (globalMatches.length === 1) {
+                        calibrationWrite = {
+                            nozzleId: String(globalMatches[0]._id),
+                            fields: calFields,
+                        };
+                    }
+                }
+                // #872: a per-nozzle preset's baked nozzle-specific values were skipped at
+                // the top level (routeToCalibration) on the assumption they'd land on a
+                // calibration entry. If NO nozzle resolved, don't lose them — write the
+                // top-level-homed ones (max-vol + temps) back to the filament-wide fields.
+                // Fan has no top-level home; it stays in the settings bag (the STRUCTURED_KEYS
+                // fan exclusion below is gated on a resolved calibrationWrite).
+                if (routeToCalibration && !calibrationWrite) {
+                    if (calFields.maxVolumetricSpeed != null)
+                        update.maxVolumetricSpeed = calFields.maxVolumetricSpeed;
+                    if (calFields.nozzleTemp != null)
+                        update["temperatures.nozzle"] = calFields.nozzleTemp;
+                    if (calFields.nozzleTempFirstLayer != null)
+                        update["temperatures.nozzleFirstLayer"] = calFields.nozzleTempFirstLayer;
+                    if (calFields.bedTemp != null)
+                        update["temperatures.bed"] = calFields.bedTemp;
+                    if (calFields.bedTempFirstLayer != null)
+                        update["temperatures.bedFirstLayer"] = calFields.bedTempFirstLayer;
+                }
+            }
+        }
+        // Everything else goes into the settings bag. GH #266: bounded
+        // merge — caps the key count and per-value size so a sync write
+        // can't bloat the embedded `settings` field unboundedly.
+        const STRUCTURED_KEYS = new Set([
+            "filament_type", "filament_vendor", "filament_colour", "filament_diameter",
+            "filament_density", "filament_cost", "filament_spool_weight",
+            "filament_max_volumetric_speed", "temperature", "first_layer_temperature",
+            "bed_temperature", "first_layer_bed_temperature",
+            "filament_shrinkage_compensation_xy", "filament_shrinkage_compensation_z",
+            // GH #950: filament_soluble / filament_abrasive are NOT structured — the
+            // Filament schema has no such fields, so a sync that pulled them out here
+            // (and wrote a stripped-by-Mongoose update.soluble) persisted them
+            // NOWHERE. Let them ride the settings bag, which is where the exports'
+            // settings seed and the OPT encoder already read them from.
+            "filament_settings_id",
+            // #867: a routing hint, not filament data — consumed for id-first matching
+            // above and re-emitted from the row's _id on export, so never stored in
+            // the settings bag (avoids a stale duplicate of the canonical _id).
+            "filamentdb_id",
+            // #872: routing hint for a multi-nozzle preset (the "<Ø> <type> [HF]" the
+            // export baked into the preset name) — consumed below to route the
+            // calibration to the right nozzle, never stored.
+            "filamentdb_nozzle",
+            // GH #1066: lifted to the top-level field above (mirrors the bulk INI
+            // import's INI_TOP_LEVEL_SETTING_KEYS posture) — a bag copy would
+            // shadow a later form-cleared top-level value on export.
+            "inherits",
+        ]);
+        // #872: a per-nozzle preset's nozzle-specific keys (fan, AND the EM /
+        // pressure-advance / retraction that `calFields` always pulls in) must NOT
+        // land in the filament-wide settings bag — otherwise one nozzle's value
+        // (e.g. the 0.6 preset's EM/retraction) becomes the shared default for the
+        // base filament and every other preset. Gated on `routeToCalibration` alone
+        // (NOT calibrationWrite): when a nozzle resolved they ride the calibration
+        // entry; when it did NOT, these keys have no top-level home (unlike max-vol /
+        // temps, which the fallback above writes back) so they are simply dropped
+        // rather than allowed to pollute the shared bag (Codex P2 round 3).
+        if (routeToCalibration) {
+            STRUCTURED_KEYS.add("min_fan_speed");
+            STRUCTURED_KEYS.add("max_fan_speed");
+            STRUCTURED_KEYS.add("bridge_fan_speed");
+            STRUCTURED_KEYS.add("extrusion_multiplier");
+            STRUCTURED_KEYS.add("pressure_advance");
+            STRUCTURED_KEYS.add("pressure_advance_value");
+            STRUCTURED_KEYS.add("filament_retract_length");
+            STRUCTURED_KEYS.add("filament_retract_speed");
+            STRUCTURED_KEYS.add("filament_retract_lift");
+        }
+        const merge = mergeSlicerSettings(filament.settings || {}, config, STRUCTURED_KEYS);
+        if (merge.error) {
+            return errorResponse(merge.error, 400);
+        }
+        // GH #1021 (Codex P1 r10): a PRE-upgrade fork preset still carries the
+        // machine-derived nozzle condition the old export stamped; persisting it
+        // would resurrect the hidden-preset bug after the one-shot DB cleanup.
+        // Strip it (→ "") when it provenance-matches this filament's effective
+        // ticks; a non-matching pure nozzle condition is a user pin and persists.
+        // Gated on the SYNC actually sending the key (Codex P1 r11):
+        // merge.settings is seeded from the STORED bag, and a partial sync that
+        // omits the key must not re-judge — and blank — a post-cleanup pin that
+        // legitimately lives there.
+        if (Object.prototype.hasOwnProperty.call(config, "compatible_printers_condition")) {
+            await stripLegacyMachineCondition(merge.settings, filament);
+            // GH #1040: a recognized per-nozzle preset's condition is machine-written
+            // by construction — the export bakes it from the hinted nozzle and the
+            // fork echoes every key back on sync (build_sync_body serializes the
+            // whole preset). Persisting it would freeze ONE sibling's condition into
+            // the SHARED settings bag, and the export gate then stamps it on every
+            // fan-out section (for the HF-tailed shape that hides the standard
+            // preset outright; for the plain shape on a mixed-diameter fan-out it
+            // pins the wrong diameter onto the other sibling — a latent pre-#1040
+            // bug on tick-less filaments, since stripLegacyMachineCondition bails
+            // without ticks provenance). Shape-matched via the same module that
+            // emits it, so the two can't drift; a user-authored condition — even one
+            // referencing these variables — doesn't match and persists.
+            if (isPerNozzlePreset &&
+                Number.isFinite(hintDiameter) &&
+                isMachineDerivedPerNozzleCondition(merge.settings["compatible_printers_condition"], hintDiameter)) {
+                merge.settings["compatible_printers_condition"] = "";
+            }
+        }
+        // GH #1066: purge a pre-lift `inherits` shadow still stored in the bag
+        // (written by older sync code before "inherits" joined STRUCTURED_KEYS
+        // above). merge.settings is seeded from the STORED bag, so without this
+        // the shadow survives every sync and the export seed keeps emitting it.
+        // Mirrors the bulk import's staleSettingsShadowUnset — the canonical
+        // value lives (only) on the top-level field. When a partial sync omitted
+        // the key AND the EFFECTIVE top-level value is empty, adopt the shadow's
+        // value top-level first so the purge is a pure storage normalization:
+        // the export emitted the shadow in exactly that case, and dropping it
+        // without the adopt would change the exported preset's parent. The gate
+        // must be the RESOLVED value, not the variant's own field (review P2):
+        // exports run resolveFilament, so a parent-supplied `inherits` masked
+        // the shadow — adopting there would PIN the stale shadow as a variant
+        // override and sever GH #106 live inheritance. A ""/"nil" shadow is
+        // purged without adopting (it exported as empty/nil — nothing to keep).
+        if (typeof merge.settings.inherits === "string" &&
+            merge.settings.inherits !== "" &&
+            merge.settings.inherits !== "nil" &&
+            !("inherits" in update) &&
+            !filament.inherits &&
+            !calParent?.inherits) {
+            update.inherits = merge.settings.inherits;
+        }
+        delete merge.settings.inherits;
+        update.settings = merge.settings;
+        // #867 Phase 2 companion: on the AUTHORITATIVE ObjectId path, honor a renamed
+        // preset by applying the sent body name to the record. This is what makes the
+        // fork's "Update anyway" reconcile actually STICK — otherwise the record keeps
+        // its old name and every later name-addressed sync hits name_id_mismatch again.
+        // The NAME-addressed path deliberately never renames (the name is its addressing
+        // key, and a body.name there is ignored); only an explicit, user-confirmed
+        // id-addressed sync may rename the record.
+        // #872: a per-nozzle preset's name is the DERIVED "<base> <Ø type>" suffix, never
+        // a user rename — so when the sync carries a filamentdb_nozzle hint, suppress the
+        // rename. Otherwise an id-addressed per-nozzle sync would overwrite the base
+        // filament's name with the suffixed preset name.
+        if (matchedByUrlObjectId && typeof body.name === "string" && perNozzleHint === "") {
+            const sentName = body.name.trim();
+            if (sentName && sentName !== filament.name) {
+                // Refuse if another ACTIVE filament already owns that name. The unique-on-
+                // non-deleted index would E11000 on the write anyway; the pre-check turns it
+                // into a friendly, actionable 409 (a TOCTOU race still falls back to the
+                // E11000 handler below).
+                const clash = await Filament.findOne({
+                    name: sentName,
+                    _deletedAt: null,
+                    _id: { $ne: filament._id },
+                });
+                if (clash) {
+                    return NextResponse.json({
+                        error: "name_taken",
+                        message: `Cannot rename to "${sentName}" — another filament already has that name.`,
+                        conflictId: String(clash._id),
+                    }, { status: 409 });
+                }
+                update.name = sentName;
+                filament.name = sentName; // keep the 200 response's matchedName accurate
+            }
+        }
+        // #872 (Codex P2): the per-nozzle calibration writes below are atomic
+        // $set/$push updateOne calls that do NOT run schema validators, so a baked
+        // out-of-range value (e.g. temperature=900, max_fan_speed=150) would persist
+        // unchecked — unlike the validated top-level path. Validate the calibration
+        // sub-document UP-FRONT against the schema so an invalid value rejects the
+        // WHOLE sync with 400 and nothing is written (atomic, symmetric with below).
+        if (calibrationWrite) {
+            const probe = new Filament({
+                name: filament.name,
+                vendor: filament.vendor,
+                type: filament.type,
+                calibrations: [
+                    { nozzle: calibrationWrite.nozzleId, printer: null, ...calibrationWrite.fields },
+                ],
+            });
+            try {
+                await probe.validate(["calibrations"]);
+            }
+            catch (calValidationErr) {
+                return errorResponseFromCaught(calValidationErr, "PrusaSlicer config contained invalid values");
+            }
+        }
+        // GH #951: a variant's PrusaSlicer export flattens its inherited values
+        // through resolveFilament, so the fork echoes the parent's
+        // density/cost/temps/spoolWeight/diameter/… back on every sync. Blindly
+        // $set-ing them onto the variant pins each as a local override and severs
+        // GH #106 live inheritance — a later parent edit stops propagating. Before
+        // this, only `color` had echo suppression (resolveSyncBackColor). Reuse the
+        // CSV importer's battle-tested split (GH #628 / #649): drop each inheritable
+        // field whose incoming value equals the parent's (keep inheriting), and
+        // $unset a stale local override so inheritance resumes. Variant-
+        // only + non-inheritable keys (color, colorName, name, settings, soluble,
+        // …) pass through untouched. `calParent` is the already-fetched parent doc;
+        // when it's null (standalone/parent, or a soft-deleted/missing parent —
+        // nothing to inherit) the update is written verbatim.
+        // GH #971: because the fork ALWAYS sends resolveFilament-flattened values
+        // (per the docblock above), a parent-EQUAL incoming value is indistinguishable
+        // from a true inherit on this path exactly as on the CSV/INI bundle paths — so
+        // splitInheritedImportSet's presence-based clear (which now also drops a
+        // parent-equal pin, not just a divergent one) is the correct shared default
+        // here too, not a bundle-only concern.
+        const mongoUpdate = { $set: update };
+        if (filament.parentId && calParent) {
+            const split = splitInheritedImportSet(update, filament.toObject(), calParent.toObject());
+            mongoUpdate.$set = split.set;
+            if (split.unset.length > 0) {
+                mongoUpdate.$unset = Object.fromEntries(split.unset.map((k) => [k, ""]));
+            }
+        }
+        // GH #618: `runValidators` so the numeric range validators (#337)
+        // actually fire on a PrusaSlicer sync — without it a config like
+        // `filament_cost = -3` parses clean and persists a negative cost the
+        // regular PUT would have rejected. `context: "query"` matches the
+        // Bambu sync route (Codex P2 on #387); the shared helper maps a
+        // ValidationError to a JSON 400 rather than a generic 500.
+        //
+        // GH #605 (codex P2, slicer-sync sweep): a TEMPLATE (≥1 live variant)
+        // must not re-acquire per-variant color/inventory — but the preset
+        // echoes `filament_colour` back on every sync, so a template target
+        // would re-materialize `color` here (the exact form-echo failure mode
+        // the PUT strips). Apply the SAME strip (shared helper; non-null only,
+        // explicit nulls pass), decided + written inside the per-id mutex the
+        // promotion paths lock, so a concurrent first-variant promotion can't
+        // land between the check and this write (PUT review P1-c). `color` is
+        // not inheritable, so the split above passed it into `$set` verbatim —
+        // stripping the $set body covers both the split and verbatim shapes.
+        let strippedTemplateFields = [];
+        try {
+            await runExclusive(filamentLockKey(filament._id), async () => {
+                const setBody = mongoUpdate.$set;
+                strippedTemplateFields = await stripTemplateFieldsForWrite(Filament, filament._id, setBody);
+                // The GH #885 `colorName: null` clear is DERIVED from the color
+                // write (slicers send only a hex) — when the color write is
+                // stripped, its derivation goes with it, or a template holding a
+                // legacy color/colorName pair would keep the color but lose the
+                // name. A template with no legacy color has nothing to clear, so
+                // dropping the null is lossless there too. (This is narrower than
+                // the explicit-null pass-through: that covers CLIENT nulls, and
+                // this null is one the route itself synthesized from the stripped
+                // color.)
+                if (strippedTemplateFields.includes("color") && setBody.colorName === null) {
+                    delete setBody.colorName;
+                }
+                await Filament.findByIdAndUpdate(filament._id, mongoUpdate, { runValidators: true, context: "query" });
+            });
+        }
+        catch (validationErr) {
+            // #867 Phase 2: a rename that lost a TOCTOU race against a concurrent rename
+            // to the same name slips past the pre-check and surfaces here as a duplicate-
+            // key error — report it as the SAME name_taken 409 as the pre-check, not a
+            // generic 400, so the client sees one consistent contract.
+            if (update.name != null && isDuplicateKeyError(validationErr)) {
+                // Look up the winner so the race fallback returns the SAME shape as the
+                // pre-check (incl. conflictId); the rename didn't apply.
+                const clash = await Filament.findOne({ name: update.name, _deletedAt: null });
+                return NextResponse.json({
+                    error: "name_taken",
+                    message: `Cannot rename to "${String(update.name)}" — another filament already has that name.`,
+                    ...(clash ? { conflictId: String(clash._id) } : {}),
+                }, { status: 409 });
+            }
+            return errorResponseFromCaught(validationErr, "PrusaSlicer config contained invalid values");
+        }
+        // GH #265 (Codex P1) / GH #618: persist the calibration change on its
+        // owning document (`calTarget` — the filament itself or, for an
+        // inheriting variant, its parent) with an ATOMIC per-entry write —
+        // never a read-modify-write of the whole `calibrations` array, so two
+        // syncs hitting the same document concurrently (two variants syncing
+        // one parent, or two nozzle contexts syncing one filament) can't drop
+        // each other's entries.
+        if (calibrationWrite) {
+            const { nozzleId, fields } = calibrationWrite;
+            const setEntry = {};
+            for (const [k, v] of Object.entries(fields)) {
+                setEntry[`calibrations.$.${k}`] = v;
+            }
+            const elemMatch = { calibrations: { $elemMatch: { nozzle: nozzleId, printer: null } } };
+            // 1) Update the matching calibration sub-document in place.
+            const res = await Filament.updateOne({ _id: calTarget._id, ...elemMatch }, { $set: setEntry });
+            if (res.matchedCount === 0) {
+                // 2) No entry yet — append one CONDITIONALLY. The filter
+                // requires the array to STILL lack a matching element. This is
+                // not a check-then-act race: MongoDB applies an updateOne to a
+                // single document atomically and serialises concurrent updates
+                // to the same _id, so of two racing requests the first $pushes
+                // and the second re-evaluates this filter against the first's
+                // committed write, no longer matches, returns matchedCount 0,
+                // and falls through to the in-place $set in step 3. At most one
+                // (nozzle, printer:null) entry is ever created (Codex P1).
+                const inserted = await Filament.updateOne({ _id: calTarget._id, calibrations: { $not: { $elemMatch: { nozzle: nozzleId, printer: null } } } }, { $push: { calibrations: { nozzle: nozzleId, printer: null, ...fields } } });
+                if (inserted.matchedCount === 0) {
+                    // 3) A concurrent request inserted the entry first — apply our
+                    // fields to it in place so this sync isn't silently lost.
+                    await Filament.updateOne({ _id: calTarget._id, ...elemMatch }, { $set: setEntry });
+                }
+            }
+        }
+        return NextResponse.json({
+            message: `Synced ${Object.keys(config).length} settings for "${decodedName}"`,
+            filamentId: filament._id,
+            // #867: how the filament was resolved + the canonical name, so the fork can
+            // re-stamp the id into the preset when it matched by name (stale/absent id
+            // recovery). A 200 always means the update WAS applied — a name/id mismatch
+            // returns 409 above without mutating, so it never reaches here.
+            matchedBy,
+            matchedName: filament.name,
+            // GH #605: per-variant fields the template guard refused to apply —
+            // same reporting key the PUT uses, so clients can surface one warning.
+            ...(strippedTemplateFields.length > 0
+                ? { _strippedTemplateFields: strippedTemplateFields }
+                : {}),
+        });
+    }
+    catch (err) {
+        return errorResponseFromCaught(err, "Failed to sync filament");
+    }
+}
+export async function DELETE(request, { params }) {
+    const guard = assertSameOriginRequest(request);
+    if (guard)
+        return guard;
+    try {
+        await dbConnect();
+        const { id } = await params;
+        // ?permanent=true deletes the document for real. Used by the trash UI
+        // for "Permanently delete" — the regular flow soft-deletes so users can
+        // recover from a misclick.
+        const permanent = request.nextUrl.searchParams.get("permanent") === "true";
+        if (permanent) {
+            // Permanent delete is only allowed once a filament is already in the
+            // trash, so an accidental DELETE?permanent=true on an active filament
+            // doesn't bypass the soft-delete safety net.
+            const trashed = await Filament.findOne({
+                _id: id,
+                _deletedAt: { $ne: null },
+                _purged: { $ne: true },
+            })
+                .select("_id spools")
+                .lean();
+            if (!trashed) {
+                return errorResponse("Permanent delete requires the filament to be in the trash. Soft-delete it first.", 400);
+            }
+            // Variant guard still applies — permanently deleting a parent would
+            // orphan its variants. GH #884: this query counts ALL non-purged variants
+            // (active OR trashed), NOT only trashed ones — there is deliberately no
+            // `_deletedAt` clause. A parent in trash normally can't have active
+            // variants (the soft-delete path refuses, via hasVariants), but counting
+            // them anyway also blocks the should-not-happen case of an active variant
+            // under a trashed parent. The broader query is the safe choice; do NOT
+            // narrow it to trashed-only to "match intent" — that would let a purge
+            // orphan an active variant. Already-purged tombstones don't count.
+            const variantCount = await Filament.countDocuments({
+                parentId: id,
+                _purged: { $ne: true },
+            });
+            if (variantCount > 0) {
+                return errorResponse("Cannot permanently delete a filament that still has variants. Permanently delete (or re-parent) those first.", 400);
+            }
+            // GH #261/#333: drop this filament's spools from every printer AMS
+            // slot BEFORE the purge write. `_purged` is a one-way tombstone — if
+            // slot cleanup ran afterwards and failed, the precondition above
+            // (`_purged: { $ne: true }`) would reject every retry, leaving the
+            // dangling slot refs uncleanable forever. Clearing first keeps the
+            // operation retryable: a failure here leaves the filament in the
+            // trash, exactly the state the retry expects.
+            await clearFilamentSpoolsFromSlots(trashed.spools);
+            // Don't physically `deleteOne` here. The hybrid sync engine pairs
+            // docs across peers by syncId and treats "missing on one side" as a
+            // fresh insert from the other side — so a hard delete on one peer
+            // would get resurrected from the trash on the next sync cycle (codex
+            // PR #213 #discussion). Instead, set the `_purged` tombstone flag;
+            // the sync engine propagates it to the peer, both sides hide the row
+            // from every UI surface, and the row stays gone for good.
+            await Filament.updateOne({ _id: id }, { $set: { _purged: true, _deletedAt: new Date() } });
+            return NextResponse.json({ message: "Permanently deleted" });
+        }
+        // Soft delete — the default path.
+        //
+        // Round 8 F3: the hasVariants refusal AND the soft-delete write run as
+        // ONE section under the per-filament mutex — the same key the
+        // first-variant creation/adoption gates hold (createVariantGated /
+        // gateFirstVariantAdoption lock the PARENT's id, which is this id when
+        // a parent is being trashed). Unserialized, this check-then-act could
+        // interleave with a first-variant POST: the check passes while the
+        // parent is still childless, the gate's promotion then mints a live
+        // variant (and a promotion copy), and the trailing updateOne trashes
+        // the parent — a TRASHED doc with LIVE variants, breaking the exact
+        // invariant the import resurrect exemptions and the restore guards rely
+        // on ("a trashed doc cannot have live variants"). In-lock, both orders
+        // end lawful: delete-first trashes a childless doc and the gate's
+        // in-lock re-fetch answers parent_not_found (the POST 400s);
+        // create-first makes this hasVariants re-check refuse. Single key, no
+        // nested locks — hasVariants, the findOne, and assignSpoolToSlot (via
+        // clearFilamentSpoolsFromSlots) are plain DB calls.
+        return await runExclusive(filamentLockKey(id), async () => {
+            if (await hasVariants(Filament, id)) {
+                return errorResponse("Cannot delete a filament that has color variants. Delete the variants first.", 400);
+            }
+            const filament = await Filament.findOne({ _id: id, _deletedAt: null })
+                .select("_id spools")
+                .lean();
+            if (!filament) {
+                return errorResponse("Not found", 404);
+            }
+            // GH #261/#333: drop this filament's spools from every printer AMS slot
+            // BEFORE the soft-delete write. If slot cleanup fails the filament is
+            // still active and the whole DELETE is retryable; clearing afterwards
+            // would 404 the retry (`_deletedAt: null` no longer matches) and leave
+            // dangling slot refs behind.
+            await clearFilamentSpoolsFromSlots(filament.spools);
+            await Filament.updateOne({ _id: id, _deletedAt: null }, { _deletedAt: new Date() });
+            return NextResponse.json({ message: "Deleted" });
+        });
+    }
+    catch (err) {
+        return errorResponseFromCaught(err, "Failed to delete filament");
+    }
+}

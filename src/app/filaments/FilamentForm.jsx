@@ -1,0 +1,2217 @@
+"use client";
+import { Fragment, useState, useEffect, useMemo, useRef } from "react";
+import { useCurrency } from "@/hooks/useCurrency";
+import { useTranslation } from "@/i18n/TranslationProvider";
+import CollapsibleSection, { expandAndScrollToSection } from "@/components/CollapsibleSection";
+import FormTabs from "@/components/FormTabs";
+import FilamentSwatch from "@/components/FilamentSwatch";
+import { snapToStep } from "@/lib/snapToStep";
+import { nozzleTypeLabel } from "@/lib/nozzleTypes";
+import { filterColorSuggestions, lookupCssNamedColor, isBlankColorHex, isIncompleteColorHex, BLANK_COLOR_HEX, } from "@/lib/cssNamedColors";
+import { deriveArrangement, arrangementToOptTag, stripArrangementTags, seedFormColorHex, normalizeColorHexInput, submittedColorValue, } from "@/lib/filamentColors";
+import { isInvertedNozzleRange } from "@/lib/temperatureRange";
+import { unwrapIniString, wrapIniString } from "@/lib/parseIni";
+/**
+ * Generate a stable unique id for a client-side list row. Using crypto.randomUUID
+ * when available (secure contexts only) with a math-random fallback for legacy
+ * environments. Rows need this because using the array index as a React key
+ * causes input focus / cursor state to jump when a mid-list row is deleted.
+ */
+function makeUid() {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+        return crypto.randomUUID();
+    }
+    return `uid_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+const DEFAULT_FILAMENT_TYPES = [
+    "PLA", "PETG", "PCTG", "ABS", "ASA", "PA", "PC", "TPU", "FLEX",
+    "POM", "PP", "HIPS", "PVA", "PET-GF", "PPA", "IGLIDUR",
+];
+function getSettingVal(data, key) {
+    if (!data?.settings)
+        return "";
+    const settings = data.settings;
+    const val = settings[key];
+    if (!val || val === "nil")
+        return "";
+    return val;
+}
+function extractPressureAdvance(data) {
+    if (!data?.settings)
+        return "";
+    const settings = data.settings;
+    const gcode = settings.start_filament_gcode;
+    if (!gcode)
+        return "";
+    // Match M572 S<value> — take the first occurrence
+    const match = gcode.match(/M572\s+S([\d.]+)/);
+    return match ? match[1] : "";
+}
+export default function FilamentForm({ initialData, onSubmit, onDirtyChange, isParent = false }) {
+    const { symbol: currencySymbol } = useCurrency();
+    const { t } = useTranslation();
+    const [nozzles, setNozzles] = useState([]);
+    const [nozzlesLoading, setNozzlesLoading] = useState(true);
+    const [printers, setPrinters] = useState([]);
+    const [printersLoading, setPrintersLoading] = useState(true);
+    const [bedTypes, setBedTypes] = useState([]);
+    const [bedTypesLoading, setBedTypesLoading] = useState(true);
+    const [selectedPrinter, setSelectedPrinter] = useState("default");
+    const [selectedBedType, setSelectedBedType] = useState("any");
+    const [parentOptions, setParentOptions] = useState([]);
+    const [parentsLoading, setParentsLoading] = useState(true);
+    const [parentSearch, setParentSearch] = useState("");
+    const [parentDropdownOpen, setParentDropdownOpen] = useState(false);
+    const parentRef = useRef(null);
+    const getInitialNozzleIds = () => {
+        if (!initialData?.compatibleNozzles)
+            return [];
+        return initialData.compatibleNozzles.map((n) => typeof n === "string" ? n : n._id);
+    };
+    const [form, setForm] = useState({
+        name: initialData?.name || "",
+        vendor: initialData?.vendor || "",
+        type: initialData?.type || "PLA",
+        // GH #605: a stored null (explicitly cleared color) seeds "" so editing
+        // doesn't silently resurrect the gray sentinel; absent → "#808080".
+        color: seedFormColorHex(initialData?.color),
+        secondaryColors: initialData?.secondaryColors ?? [],
+        colorName: initialData?.colorName || "",
+        cost: initialData?.cost?.toString() || "",
+        // density + diameter are CBOR half-floats on an OpenPrintTag, so an
+        // NFC/TDS prefill can hand us e.g. 1.2392578125 / 2.849609375. Snap to
+        // the inputs' step="0.01" grid so the value the user sees is one the
+        // field can actually hold — otherwise native step validation blocks
+        // save on every NFC-read filament (#570). Snapping an already-clean
+        // stored value (1.24, 2.85, 1.75) is a no-op.
+        density: initialData?.density != null
+            ? snapToStep(initialData.density, 0.01).toString()
+            : "",
+        // Variants leave diameter blank when inheriting from the parent — falling
+        // back to "1.75" here would paint a value into the input that the user
+        // never typed, and saving would persist 1.75 as an explicit override
+        // (even if the parent's diameter is e.g. 2.85). The submit-side fallback
+        // in handleSubmit keeps 1.75 as the default for standalone filaments.
+        diameter: initialData?.diameter != null
+            ? snapToStep(initialData.diameter, 0.01).toString()
+            : initialData?.parentId
+                ? ""
+                : "1.75",
+        temperatures: {
+            nozzle: initialData?.temperatures?.nozzle?.toString() || "",
+            nozzleFirstLayer: initialData?.temperatures?.nozzleFirstLayer?.toString() || "",
+            nozzleRangeMin: initialData?.temperatures?.nozzleRangeMin?.toString() || "",
+            nozzleRangeMax: initialData?.temperatures?.nozzleRangeMax?.toString() || "",
+            bed: initialData?.temperatures?.bed?.toString() || "",
+            bedFirstLayer: initialData?.temperatures?.bedFirstLayer?.toString() || "",
+            standby: initialData?.temperatures?.standby?.toString() || "",
+            chamber: getSettingVal(initialData, "chamber_temperature"),
+        },
+        bedTypeTemps: (initialData?.bedTypeTemps || []).map((bt) => ({
+            _uid: makeUid(),
+            bedType: bt.bedType || "",
+            temperature: bt.temperature?.toString() || "",
+            firstLayerTemperature: bt.firstLayerTemperature?.toString() || "",
+        })),
+        maxVolumetricSpeed: initialData?.maxVolumetricSpeed?.toString() || "",
+        minPrintSpeed: initialData?.minPrintSpeed?.toString() || "",
+        maxPrintSpeed: initialData?.maxPrintSpeed?.toString() || "",
+        extrusionMultiplier: getSettingVal(initialData, "extrusion_multiplier"),
+        shrinkageXY: initialData?.shrinkageXY?.toString() || getSettingVal(initialData, "filament_shrinkage_compensation_xy"),
+        shrinkageZ: initialData?.shrinkageZ?.toString() || getSettingVal(initialData, "filament_shrinkage_compensation_z"),
+        shoreHardnessA: initialData?.shoreHardnessA?.toString() || "",
+        shoreHardnessD: initialData?.shoreHardnessD?.toString() || "",
+        glassTempTransition: initialData?.glassTempTransition?.toString() || "",
+        heatDeflectionTemp: initialData?.heatDeflectionTemp?.toString() || "",
+        abrasive: getSettingVal(initialData, "filament_abrasive") === "1",
+        soluble: getSettingVal(initialData, "filament_soluble") === "1",
+        optTags: initialData?.optTags || [],
+        fanMinSpeed: getSettingVal(initialData, "min_fan_speed"),
+        fanMaxSpeed: getSettingVal(initialData, "max_fan_speed"),
+        fanBridgeSpeed: getSettingVal(initialData, "bridge_fan_speed"),
+        fanDisableFirstLayers: getSettingVal(initialData, "disable_fan_first_layers"),
+        overhangFanSpeed: getSettingVal(initialData, "overhang_fan_speed"),
+        auxFanSpeed: getSettingVal(initialData, "additional_cooling_fan_speed"),
+        fanBelowLayerTime: getSettingVal(initialData, "fan_below_layer_time"),
+        slowDownMinSpeed: getSettingVal(initialData, "slow_down_min_speed"),
+        activateAirFiltration: getSettingVal(initialData, "activate_air_filtration") === "1",
+        retractLength: getSettingVal(initialData, "filament_retract_length"),
+        retractSpeed: getSettingVal(initialData, "filament_retract_speed") === "nil" ? "" : getSettingVal(initialData, "filament_retract_speed"),
+        retractLift: getSettingVal(initialData, "filament_retract_lift"),
+        retractMinTravel: getSettingVal(initialData, "filament_retraction_minimum_travel"),
+        pressureAdvance: extractPressureAdvance(initialData),
+        zOffset: getSettingVal(initialData, "z_offset"),
+        filamentLoadingSpeed: getSettingVal(initialData, "filament_loading_speed"),
+        filamentUnloadingSpeed: getSettingVal(initialData, "filament_unloading_speed"),
+        filamentLoadTime: getSettingVal(initialData, "filament_load_time"),
+        filamentUnloadTime: getSettingVal(initialData, "filament_unload_time"),
+        rammingParameters: getSettingVal(initialData, "filament_ramming_parameters"),
+        wipe: getSettingVal(initialData, "filament_wipe") === "1",
+        spoolWeight: initialData?.spoolWeight?.toString() || "",
+        netFilamentWeight: initialData?.netFilamentWeight?.toString() || "",
+        lowStockThreshold: initialData?.lowStockThreshold?.toString() || "",
+        totalWeight: initialData?.totalWeight?.toString() || "",
+        spoolType: initialData?.spoolType || "",
+        dryingTemperature: initialData?.dryingTemperature?.toString() || "",
+        dryingTime: initialData?.dryingTime?.toString() || "",
+        transmissionDistance: initialData?.transmissionDistance?.toString() || "",
+        // GH #1070: unwrap + UNESCAPE via the shared INI value codec — a
+        // fork-synced multi-line gcode is stored as `"...\n..."` (literal
+        // backslash-n escapes), so the textarea shows real newlines instead of
+        // `\n` sequences; the submit handler re-escapes via wrapIniString, so
+        // the round-trip is byte-identical on the wire.
+        startGcode: unwrapIniString(getSettingVal(initialData, "start_filament_gcode")),
+        endGcode: unwrapIniString(getSettingVal(initialData, "end_filament_gcode")),
+        notes: unwrapIniString(getSettingVal(initialData, "filament_notes")),
+        tdsUrl: initialData?.tdsUrl || "",
+        compatibleNozzles: getInitialNozzleIds(),
+        // GH #1066 (review P1): adopt a legacy settings-bag `inherits` shadow
+        // into the editable field when no top-level value masks it — the submit
+        // handler purges the shadow on every save, and without the adopt an
+        // unrelated save would silently drop the exported preset's parent (the
+        // export seed emitted the shadow exactly when the resolved top-level
+        // value was empty). A parent-supplied value masks the shadow the same
+        // way (exports resolve variants), so it blocks the adopt too.
+        inherits: initialData?.inherits ||
+            (initialData?._parent?.inherits
+                ? ""
+                : getSettingVal(initialData, "inherits")),
+        // GH #1066: surface the PrusaSlicer printer-restriction pair from the
+        // settings bag. A preset duplicated in the slicer from another printer's
+        // profile carries its source's `compatible_printers_condition` (e.g.
+        // `printer_model=~/(COREONE|...)/`), which silently hides the synced
+        // preset on every other printer — and, pre-#1066, nothing in the app
+        // showed or cleared it.
+        compatPrinters: getSettingVal(initialData, "compatible_printers"),
+        compatPrintersCondition: getSettingVal(initialData, "compatible_printers_condition"),
+        parentId: initialData?.parentId?._id || initialData?.parentId || "",
+    });
+    const [saving, setSaving] = useState(false);
+    const savedRef = useRef(false);
+    // GH #286: dirty state is derived below, once `calibrations` and
+    // `presets` are declared — see the `dirty` block after those.
+    // Which tab of the form is visible. All panels stay mounted (hidden via the
+    // `hidden` attribute) so native required-field validation still fires on
+    // tabs the user isn't looking at — see FormTabs + the onInvalidCapture
+    // handler on the <form>, which switches to the offending tab.
+    const [activeTab, setActiveTab] = useState("basics");
+    // Guards onInvalidCapture so only the FIRST invalid field per submit drives
+    // the tab switch + focus (see the handler on the <form>). Without it the
+    // last invalid field steals focus from the first.
+    const invalidHandledRef = useRef(false);
+    const [tdsSuggestions, setTdsSuggestions] = useState([]);
+    const [filamentTypes, setFilamentTypes] = useState(DEFAULT_FILAMENT_TYPES);
+    const [typeDropdownOpen, setTypeDropdownOpen] = useState(false);
+    const [typeHighlight, setTypeHighlight] = useState(-1);
+    const [parentHighlight, setParentHighlight] = useState(-1);
+    const typeRef = useRef(null);
+    const [vendorOptions, setVendorOptions] = useState([]);
+    const [vendorDropdownOpen, setVendorDropdownOpen] = useState(false);
+    const [vendorHighlight, setVendorHighlight] = useState(-1);
+    const vendorRef = useRef(null);
+    // colorName typeahead — suggestions come from the user's own
+    // (colorName, color) pairs first ("Prusa Orange" remembers the hex
+    // you saved last time), then the 148 CSS named colors as a fallback
+    // for generic names. Selecting a suggestion sets BOTH the colorName
+    // and the hex `color` field, so the user gets a working swatch
+    // without leaving the keyboard.
+    const [colorNameSuggestions, setColorNameSuggestions] = useState([]);
+    const [colorNameDropdownOpen, setColorNameDropdownOpen] = useState(false);
+    const [colorNameHighlight, setColorNameHighlight] = useState(-1);
+    // GH #794 (Codex P2): does the user OWN the current hex? True once they edit
+    // it via the picker / text field — including deliberately choosing the gray
+    // #808080, which the sentinel check would otherwise treat as "blank". While
+    // false (a fresh form, or a hex that was itself auto-filled from a name), a
+    // color-name commit may fill/replace the hex; once true, a name is just a
+    // label and never overwrites it. Initialized from the loaded filament: a
+    // stored REAL color is owned; a stored sentinel/blank is unchosen so a name
+    // can still gap-fill it.
+    const [colorHexUserSet, setColorHexUserSet] = useState(() => !isBlankColorHex(initialData?.color));
+    const colorNameRef = useRef(null);
+    // GH #605: hidden <input type="color"> behind the cleared-color placeholder
+    // button — clicking the hatch re-opens the native picker in one step.
+    const colorPickerRef = useRef(null);
+    const nozzleRangeMaxRef = useRef(null);
+    const [fetchErrors, setFetchErrors] = useState([]);
+    // #574: a nozzle range with min > max is physically nonsense but each end
+    // only has its own 0–600 bound, so the browser accepted the inverted pair.
+    // Drive a cross-field native validity message off the max input so submit
+    // is blocked and the existing onInvalidCapture handler scrolls to the
+    // Temperatures section. Reactive so it clears the moment the user fixes it.
+    useEffect(() => {
+        const el = nozzleRangeMaxRef.current;
+        if (!el)
+            return;
+        const min = parseFloat(form.temperatures.nozzleRangeMin);
+        const max = parseFloat(form.temperatures.nozzleRangeMax);
+        el.setCustomValidity(isInvertedNozzleRange({ nozzleRangeMin: min, nozzleRangeMax: max })
+            ? t("form.error.nozzleRangeInverted")
+            : "");
+    }, [form.temperatures.nozzleRangeMin, form.temperatures.nozzleRangeMax, t]);
+    const addFetchError = (label) => setFetchErrors((prev) => (prev.includes(label) ? prev : [...prev, label]));
+    // Fetch distinct filament types from DB and merge with defaults
+    useEffect(() => {
+        const ac = new AbortController();
+        fetch("/api/filaments/types", { signal: ac.signal })
+            .then((r) => {
+            if (!r.ok)
+                throw new Error();
+            return r.json();
+        })
+            .then((dbTypes) => {
+            const merged = Array.from(new Set([...DEFAULT_FILAMENT_TYPES, ...dbTypes])).sort();
+            setFilamentTypes(merged);
+        })
+            .catch(() => { if (!ac.signal.aborted)
+            addFetchError("filament types"); });
+        return () => ac.abort();
+    }, []);
+    // Fetch distinct vendors from DB
+    useEffect(() => {
+        const ac = new AbortController();
+        fetch("/api/filaments/vendors", { signal: ac.signal })
+            .then((r) => {
+            if (!r.ok)
+                throw new Error();
+            return r.json();
+        })
+            .then((v) => setVendorOptions(v))
+            .catch(() => { if (!ac.signal.aborted)
+            addFetchError("vendors"); });
+        return () => ac.abort();
+    }, []);
+    // Fetch the user's previously-saved (colorName, color) pairs so the
+    // colorName typeahead can suggest "Prusa Orange → #FA6E1C" etc.
+    // Falls back to CSS named colors when the DB has no match for what
+    // the user is typing.
+    useEffect(() => {
+        const ac = new AbortController();
+        fetch("/api/filaments/colors", { signal: ac.signal })
+            .then((r) => {
+            if (!r.ok)
+                throw new Error();
+            return r.json();
+        })
+            .then((pairs) => {
+            setColorNameSuggestions(pairs.map((p) => ({ name: p.name, hex: p.hex, source: "db" })));
+        })
+            .catch(() => { if (!ac.signal.aborted)
+            addFetchError("color suggestions"); });
+        return () => ac.abort();
+    }, []);
+    // Fetch potential parent filaments
+    useEffect(() => {
+        const ac = new AbortController();
+        const exclude = initialData?._id || "";
+        fetch(`/api/filaments/parents${exclude ? `?exclude=${exclude}` : ""}`, { signal: ac.signal })
+            .then((r) => {
+            if (!r.ok)
+                throw new Error();
+            return r.json();
+        })
+            .then(setParentOptions)
+            .catch(() => { if (!ac.signal.aborted)
+            addFetchError("parent filaments"); })
+            .finally(() => { if (!ac.signal.aborted)
+            setParentsLoading(false); });
+        return () => ac.abort();
+    }, [initialData?._id]);
+    // Close dropdowns on outside click
+    useEffect(() => {
+        function handleClick(e) {
+            if (typeRef.current && !typeRef.current.contains(e.target)) {
+                setTypeDropdownOpen(false);
+            }
+            if (vendorRef.current && !vendorRef.current.contains(e.target)) {
+                setVendorDropdownOpen(false);
+            }
+            if (parentRef.current && !parentRef.current.contains(e.target)) {
+                setParentDropdownOpen(false);
+            }
+            if (colorNameRef.current && !colorNameRef.current.contains(e.target)) {
+                setColorNameDropdownOpen(false);
+            }
+        }
+        document.addEventListener("mousedown", handleClick);
+        return () => document.removeEventListener("mousedown", handleClick);
+    }, []);
+    // Fetch TDS suggestions from other filaments with same vendor
+    useEffect(() => {
+        if (!form.vendor)
+            return;
+        const ac = new AbortController();
+        fetch(`/api/filaments?vendor=${encodeURIComponent(form.vendor)}`, { signal: ac.signal })
+            .then((r) => r.json())
+            .then((data) => {
+            const suggestions = data
+                .filter((f) => f.tdsUrl && f.name !== form.name)
+                .map((f) => ({ name: f.name, tdsUrl: f.tdsUrl }));
+            setTdsSuggestions(suggestions);
+        })
+            .catch((err) => { if (!ac.signal.aborted)
+            console.error(err); });
+        return () => ac.abort();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [form.vendor]);
+    const calKey = (printerId, nozzleId, bedTypeId = null) => `${printerId || "default"}:${nozzleId}:${bedTypeId || "any"}`;
+    const emptyCalibrationEntry = {
+        extrusionMultiplier: "",
+        maxVolumetricSpeed: "",
+        pressureAdvance: "",
+        retractLength: "",
+        retractSpeed: "",
+        retractLift: "",
+        nozzleTemp: "",
+        nozzleTempFirstLayer: "",
+        bedTemp: "",
+        bedTempFirstLayer: "",
+        chamberTemp: "",
+        fanMinSpeed: "",
+        fanMaxSpeed: "",
+        fanBridgeSpeed: "",
+    };
+    const getInitialCalibrations = () => {
+        const cals = {};
+        if (!initialData?.calibrations)
+            return cals;
+        for (const cal of initialData.calibrations) {
+            const nozzleId = typeof cal.nozzle === "string" ? cal.nozzle : cal.nozzle?._id;
+            if (!nozzleId)
+                continue;
+            const printerId = cal.printer
+                ? (typeof cal.printer === "string" ? cal.printer : cal.printer._id)
+                : null;
+            const bedTypeId = cal.bedType
+                ? (typeof cal.bedType === "string" ? cal.bedType : cal.bedType._id)
+                : null;
+            cals[calKey(printerId, nozzleId, bedTypeId)] = {
+                extrusionMultiplier: cal.extrusionMultiplier?.toString() || "",
+                maxVolumetricSpeed: cal.maxVolumetricSpeed?.toString() || "",
+                pressureAdvance: cal.pressureAdvance?.toString() || "",
+                retractLength: cal.retractLength?.toString() || "",
+                retractSpeed: cal.retractSpeed?.toString() || "",
+                retractLift: cal.retractLift?.toString() || "",
+                nozzleTemp: cal.nozzleTemp?.toString() || "",
+                nozzleTempFirstLayer: cal.nozzleTempFirstLayer?.toString() || "",
+                bedTemp: cal.bedTemp?.toString() || "",
+                bedTempFirstLayer: cal.bedTempFirstLayer?.toString() || "",
+                chamberTemp: cal.chamberTemp?.toString() || "",
+                fanMinSpeed: cal.fanMinSpeed?.toString() || "",
+                fanMaxSpeed: cal.fanMaxSpeed?.toString() || "",
+                fanBridgeSpeed: cal.fanBridgeSpeed?.toString() || "",
+            };
+        }
+        return cals;
+    };
+    const [calibrations, setCalibrations] = useState(getInitialCalibrations);
+    const getInitialPresets = () => {
+        if (!initialData?.presets)
+            return [];
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return initialData.presets.map((p) => ({
+            _uid: makeUid(),
+            label: p.label || "",
+            extrusionMultiplier: p.extrusionMultiplier?.toString() || "",
+            nozzle: p.temperatures?.nozzle?.toString() || "",
+            nozzleFirstLayer: p.temperatures?.nozzleFirstLayer?.toString() || "",
+            bed: p.temperatures?.bed?.toString() || "",
+            bedFirstLayer: p.temperatures?.bedFirstLayer?.toString() || "",
+        }));
+    };
+    const [presets, setPresets] = useState(getInitialPresets);
+    // GH #286: derive dirtiness from a snapshot of *all* editable state —
+    // form fields, calibrations, and presets. The previous effect watched
+    // only `form`, so a calibration- or preset-only edit navigated away
+    // with no unsaved-changes warning — silent loss of exactly the tedious
+    // data this app exists to capture — and it one-way latched `dirty` to
+    // true, so reverting an edit still warned. Deriving the value during
+    // render makes it both two-way and complete. `baselineRef` is
+    // re-pointed after a successful save so the saved state becomes the
+    // new clean baseline.
+    const dirtySnapshot = useMemo(() => JSON.stringify({ form, calibrations, presets }), [form, calibrations, presets]);
+    // Printer tabs in the Calibrations section should only offer printers
+    // that physically own at least one of this filament's compatible
+    // nozzles. A nozzle lives on exactly one printer at a time (GH #232,
+    // enforced by `findNozzleConflicts`), so selecting the Bambu 0.4mm
+    // nozzle as compatible should not invite a Core One calibration row
+    // — Core One literally doesn't have that nozzle installed and any
+    // calibration captured against (Core One, Bambu 0.4mm) is meaningless.
+    // Built from the `NozzleOption.printers` reverse-mapping already
+    // populated by `/api/nozzles?withPrinters` so this stays in sync with
+    // printer-form edits without an extra fetch.
+    const relevantPrinters = useMemo(() => {
+        if (form.compatibleNozzles.length === 0)
+            return [];
+        const relevantIds = new Set();
+        for (const nozzleId of form.compatibleNozzles) {
+            const nozzle = nozzles.find((n) => n._id === nozzleId);
+            if (!nozzle?.printers)
+                continue;
+            for (const p of nozzle.printers)
+                relevantIds.add(p._id);
+        }
+        return printers.filter((p) => relevantIds.has(p._id));
+    }, [printers, nozzles, form.compatibleNozzles]);
+    // #872: an abrasive filament needs a hardened nozzle, so the compatible-nozzle
+    // picker hard-filters to hardened ones when abrasive. The abrasive marker can
+    // come from EITHER the form boolean (settings.filament_abrasive) OR optTags tag 4
+    // (e.g. OpenPrintTag/Atlas data) — mirror the Material Tags checkbox's effective
+    // state (form.optTags.includes(4) || form.abrasive) so the gate isn't silently
+    // bypassed when only the tag is set (Codex P2). Already-selected nozzles stay
+    // visible (even if soft) so the user can still deselect them — they're flagged;
+    // only NEW soft nozzles are hidden.
+    const isAbrasive = form.abrasive || form.optTags.includes(4);
+    const visibleNozzles = useMemo(() => {
+        if (!isAbrasive)
+            return nozzles;
+        return nozzles.filter((n) => n.hardened || form.compatibleNozzles.includes(n._id));
+    }, [nozzles, isAbrasive, form.compatibleNozzles]);
+    const hiddenSoftNozzleCount = isAbrasive ? nozzles.length - visibleNozzles.length : 0;
+    // Derive the effective selection rather than syncing it via an effect.
+    // When the user removes a compatible nozzle that was the only reason
+    // a printer tab existed, `selectedPrinter` may still hold that id —
+    // the tab is gone but the state lingers. Falling back to "default"
+    // here keeps rendering and the calibration-key lookup consistent
+    // without paying the extra-render cost of a setState-in-effect.
+    // Project rule `react-hooks/set-state-in-effect` (see CLAUDE.md)
+    // forbids the alternative.
+    const effectiveSelectedPrinter = selectedPrinter === "default" ||
+        relevantPrinters.some((p) => p._id === selectedPrinter)
+        ? selectedPrinter
+        : "default";
+    // The clean baseline. Seeded once with the initial snapshot via the
+    // lazy useState initializer; re-pointed after a successful save.
+    const [dirtyBaseline, setDirtyBaseline] = useState(dirtySnapshot);
+    const dirty = dirtySnapshot !== dirtyBaseline;
+    // Warn on unsaved changes when navigating away (browser-level).
+    useEffect(() => {
+        const handler = (e) => {
+            if (dirty && !savedRef.current) {
+                e.preventDefault();
+            }
+        };
+        window.addEventListener("beforeunload", handler);
+        return () => window.removeEventListener("beforeunload", handler);
+    }, [dirty]);
+    // Notify the parent (useUnsavedChanges) of dirty-state changes.
+    useEffect(() => {
+        onDirtyChange?.(dirty);
+    }, [dirty, onDirtyChange]);
+    const addPreset = () => {
+        setPresets((prev) => [
+            ...prev,
+            { _uid: makeUid(), label: "", extrusionMultiplier: "", nozzle: "", nozzleFirstLayer: "", bed: "", bedFirstLayer: "" },
+        ]);
+    };
+    const removePreset = (index) => {
+        setPresets((prev) => prev.filter((_, i) => i !== index));
+    };
+    const updatePreset = (index, field, value) => {
+        setPresets((prev) => prev.map((p, i) => (i === index ? { ...p, [field]: value } : p)));
+    };
+    const updateCalibration = (key, field, value) => {
+        setCalibrations((prev) => ({
+            ...prev,
+            [key]: {
+                ...(prev[key] || emptyCalibrationEntry),
+                [field]: value,
+            },
+        }));
+    };
+    useEffect(() => {
+        const ac = new AbortController();
+        fetch("/api/nozzles", { signal: ac.signal })
+            .then((r) => {
+            if (!r.ok)
+                throw new Error();
+            return r.json();
+        })
+            .then(setNozzles)
+            .catch(() => { if (!ac.signal.aborted)
+            addFetchError("nozzles"); })
+            .finally(() => { if (!ac.signal.aborted)
+            setNozzlesLoading(false); });
+        return () => ac.abort();
+    }, []);
+    useEffect(() => {
+        const ac = new AbortController();
+        fetch("/api/printers", { signal: ac.signal })
+            .then((r) => {
+            if (!r.ok)
+                throw new Error();
+            return r.json();
+        })
+            .then(setPrinters)
+            .catch(() => { if (!ac.signal.aborted)
+            addFetchError("printers"); })
+            .finally(() => { if (!ac.signal.aborted)
+            setPrintersLoading(false); });
+        return () => ac.abort();
+    }, []);
+    useEffect(() => {
+        const ac = new AbortController();
+        fetch("/api/bed-types", { signal: ac.signal })
+            .then((r) => {
+            if (!r.ok)
+                throw new Error();
+            return r.json();
+        })
+            .then(setBedTypes)
+            .catch(() => { if (!ac.signal.aborted)
+            addFetchError("bed types"); })
+            .finally(() => { if (!ac.signal.aborted)
+            setBedTypesLoading(false); });
+        return () => ac.abort();
+    }, []);
+    const toggleNozzle = (id) => {
+        setForm((prev) => ({
+            ...prev,
+            compatibleNozzles: prev.compatibleNozzles.includes(id)
+                ? prev.compatibleNozzles.filter((n) => n !== id)
+                : [...prev.compatibleNozzles, id],
+        }));
+    };
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        setSaving(true);
+        const parseNum = (val) => {
+            if (!val)
+                return null;
+            const num = parseFloat(val);
+            return isNaN(num) ? null : num;
+        };
+        // Merge form fields back into settings — explicit empty string clears the value
+        const settings = { ...(initialData?.settings || {}) };
+        settings.extrusion_multiplier = form.extrusionMultiplier || undefined;
+        settings.filament_shrinkage_compensation_xy = form.shrinkageXY || undefined;
+        settings.filament_shrinkage_compensation_z = form.shrinkageZ || undefined;
+        settings.filament_abrasive = form.abrasive ? "1" : "0";
+        settings.filament_soluble = form.soluble ? "1" : "0";
+        settings.chamber_temperature = form.temperatures.chamber || undefined;
+        settings.min_fan_speed = form.fanMinSpeed || undefined;
+        settings.max_fan_speed = form.fanMaxSpeed || undefined;
+        settings.bridge_fan_speed = form.fanBridgeSpeed || undefined;
+        settings.disable_fan_first_layers = form.fanDisableFirstLayers || undefined;
+        settings.filament_retract_length = form.retractLength || undefined;
+        settings.filament_retract_speed = form.retractSpeed || undefined;
+        settings.filament_retract_lift = form.retractLift || undefined;
+        settings.filament_retraction_minimum_travel = form.retractMinTravel || undefined;
+        settings.overhang_fan_speed = form.overhangFanSpeed || undefined;
+        settings.additional_cooling_fan_speed = form.auxFanSpeed || undefined;
+        settings.fan_below_layer_time = form.fanBelowLayerTime || undefined;
+        settings.slow_down_min_speed = form.slowDownMinSpeed || undefined;
+        settings.activate_air_filtration = form.activateAirFiltration ? "1" : "0";
+        settings.z_offset = form.zOffset || undefined;
+        settings.filament_loading_speed = form.filamentLoadingSpeed || undefined;
+        settings.filament_unloading_speed = form.filamentUnloadingSpeed || undefined;
+        settings.filament_load_time = form.filamentLoadTime || undefined;
+        settings.filament_unload_time = form.filamentUnloadTime || undefined;
+        settings.filament_ramming_parameters = form.rammingParameters || undefined;
+        settings.filament_wipe = form.wipe ? "1" : "0";
+        // GH #1070: escape + wrap via the shared INI value codec — a raw newline
+        // or quote from the textarea must not reach the settings bag unescaped
+        // (it used to split the exported `key = value` line and corrupt the
+        // whole PrusaSlicer bundle, and a re-import parsed the continuation
+        // lines as INI keys/sections).
+        //
+        // Codex P1 round 4 on PR #1086: an UNCHANGED field writes back the
+        // ORIGINAL stored wire bytes, never a re-encode. The bag legally holds
+        // UNQUOTED wire values with literal `\n` escapes (a long-supported
+        // shape — see tests/prusaSlicerBundle.test.ts's unquoted gcode
+        // fixtures); unwrapIniString leaves those verbatim for display, so
+        // re-encoding them on save would escape each backslash (`\n` → `\\n`)
+        // and hand PrusaSlicer literal backslash-n text instead of line breaks.
+        // Only a field the user actually EDITED goes through wrapIniString —
+        // WYSIWYG: the stored content is exactly the textarea's text.
+        const wireOrEdited = (storedKey, content) => {
+            if (!content)
+                return undefined;
+            const stored = getSettingVal(initialData, storedKey);
+            return stored && unwrapIniString(stored) === content
+                ? stored
+                : wrapIniString(content);
+        };
+        settings.end_filament_gcode = wireOrEdited("end_filament_gcode", form.endGcode);
+        settings.filament_notes = wireOrEdited("filament_notes", form.notes);
+        // GH #1066: the PrusaSlicer printer-restriction pair. Written only when
+        // EDITED — getSettingVal folds a stored `nil` (null) into "" for display,
+        // so an unconditional write would destroy the nil inheritance marker on
+        // every unrelated save. A cleared field writes an explicit "" ("no
+        // restriction" — PrusaSlicer shows the preset for every printer).
+        if (form.compatPrinters !== getSettingVal(initialData, "compatible_printers")) {
+            settings.compatible_printers = form.compatPrinters || "";
+        }
+        if (form.compatPrintersCondition !==
+            getSettingVal(initialData, "compatible_printers_condition")) {
+            settings.compatible_printers_condition = form.compatPrintersCondition || "";
+        }
+        // GH #1066: the top-level `inherits` field (form.inherits, sent below) is
+        // canonical — kill a legacy settings-bag shadow so CLEARING the field
+        // actually sticks: the export seeds from the bag and only overrides
+        // `inherits` when the top-level value is truthy, so a surviving shadow
+        // resurfaced the moment the field was cleared.
+        delete settings.inherits;
+        // Handle start G-code: user-typed text wins; else inject PA-only line; else
+        // drop the override entirely so a variant inherits from its parent (GH #113).
+        // Without the trailing `else`, an inherited (or pre-existing) gcode that
+        // contained no `M572` line could never be cleared from the form.
+        if (form.startGcode) {
+            settings.start_filament_gcode = wireOrEdited("start_filament_gcode", form.startGcode);
+        }
+        else if (form.pressureAdvance) {
+            settings.start_filament_gcode = wrapIniString(`M572 S${form.pressureAdvance}`);
+        }
+        else {
+            settings.start_filament_gcode = undefined;
+        }
+        try {
+            // GH #477: when the user has opted into the "Coextruded"
+            // arrangement (auto-toggled via tag 29 in optTags), the
+            // OpenPrintTag spec says primary color SHOULD be null for
+            // coextruded — "Does not have a primary color, number of colors
+            // can be derived from the defined secondary colors." Submit null
+            // so resolveFilament + every read site honour that semantic. For
+            // gradient and solid arrangements the primary stays as set.
+            //
+            // Codex P2 round 1 on PR #533: BOTH the dual_color tag (28) AND
+            // the triple_color tag (29) represent coextruded — pre-fix this
+            // only checked 29, so a dual-color save (the common 2-secondary
+            // shape) kept the primary on the doc and rendered with an extra
+            // unwanted stripe. submittedColorValue uses deriveArrangement to
+            // stay aligned with every other render site.
+            //
+            // GH #605: a cleared / incomplete hex ("" or "#12") also submits
+            // null — the API and schema accept it; pre-fix the UI could never
+            // produce a null color outside the coextruded arrangement.
+            const submittedColor = submittedColorValue(form.color, form.optTags);
+            await onSubmit({
+                name: form.name,
+                vendor: form.vendor,
+                type: form.type,
+                color: submittedColor,
+                secondaryColors: form.secondaryColors,
+                colorName: form.colorName || null,
+                cost: parseNum(form.cost),
+                density: parseNum(form.density),
+                // Variants should inherit diameter from the parent when left blank;
+                // only apply the 1.75 fallback for standalone filaments (GH #106).
+                diameter: parseNum(form.diameter) ?? (form.parentId ? null : 1.75),
+                temperatures: {
+                    nozzle: parseNum(form.temperatures.nozzle),
+                    nozzleFirstLayer: parseNum(form.temperatures.nozzleFirstLayer),
+                    nozzleRangeMin: parseNum(form.temperatures.nozzleRangeMin),
+                    nozzleRangeMax: parseNum(form.temperatures.nozzleRangeMax),
+                    bed: parseNum(form.temperatures.bed),
+                    bedFirstLayer: parseNum(form.temperatures.bedFirstLayer),
+                    standby: parseNum(form.temperatures.standby),
+                },
+                bedTypeTemps: form.bedTypeTemps
+                    .filter((bt) => bt.bedType.trim() !== "")
+                    .map((bt) => ({
+                    bedType: bt.bedType.trim(),
+                    temperature: parseNum(bt.temperature),
+                    firstLayerTemperature: parseNum(bt.firstLayerTemperature),
+                })),
+                maxVolumetricSpeed: parseNum(form.maxVolumetricSpeed),
+                minPrintSpeed: parseNum(form.minPrintSpeed),
+                maxPrintSpeed: parseNum(form.maxPrintSpeed),
+                compatibleNozzles: form.compatibleNozzles,
+                calibrations: Object.entries(calibrations)
+                    .filter(([, cal]) => Object.values(cal).some((v) => v !== ""))
+                    .filter(([key]) => {
+                    const [printerId, nozzleId] = key.split(":");
+                    // Drop calibrations whose nozzle is no longer compatible.
+                    if (!form.compatibleNozzles.includes(nozzleId))
+                        return false;
+                    // Drop printer-specific calibrations whose printer no longer
+                    // owns this nozzle. The Calibrations UI hides those tabs (see
+                    // `relevantPrinters` above), so the user has no way to view
+                    // or clear them through the form — without this prune-on-save
+                    // the entries would persist in the DB indefinitely as
+                    // orphans. Codex round-1 P2 on PR #358. The "default" scope
+                    // (printerId === "default") is always kept — it's the
+                    // baseline that applies regardless of which printer has
+                    // the nozzle at the moment.
+                    //
+                    // FAIL-OPEN when ownership data isn't available (codex
+                    // round-2 P1 on PR #358). The catalog is fetched async via
+                    // `/api/nozzles`; if the user saves while it's still
+                    // loading — or if the fetch failed — `nozzles` is empty,
+                    // the lookup returns `undefined`, and a strict predicate
+                    // would silently delete every valid per-printer
+                    // calibration. Treat absence of ownership data as
+                    // "uncertain" and keep the entry; only drop when we have
+                    // positive evidence (catalog loaded, nozzle found,
+                    // printers populated, and the printer is not in the
+                    // installed list).
+                    if (printerId === "default")
+                        return true;
+                    const nozzle = nozzles.find((n) => n._id === nozzleId);
+                    if (!nozzle || !nozzle.printers)
+                        return true;
+                    return nozzle.printers.some((p) => p._id === printerId);
+                })
+                    .map(([key, cal]) => {
+                    const [printerId, nozzleId, bedTypeId] = key.split(":");
+                    return {
+                        printer: printerId === "default" ? null : printerId,
+                        nozzle: nozzleId,
+                        bedType: bedTypeId === "any" ? null : bedTypeId,
+                        extrusionMultiplier: parseNum(cal.extrusionMultiplier),
+                        maxVolumetricSpeed: parseNum(cal.maxVolumetricSpeed),
+                        pressureAdvance: parseNum(cal.pressureAdvance),
+                        retractLength: parseNum(cal.retractLength),
+                        retractSpeed: parseNum(cal.retractSpeed),
+                        retractLift: parseNum(cal.retractLift),
+                        nozzleTemp: parseNum(cal.nozzleTemp),
+                        nozzleTempFirstLayer: parseNum(cal.nozzleTempFirstLayer),
+                        bedTemp: parseNum(cal.bedTemp),
+                        bedTempFirstLayer: parseNum(cal.bedTempFirstLayer),
+                        chamberTemp: parseNum(cal.chamberTemp),
+                        fanMinSpeed: parseNum(cal.fanMinSpeed),
+                        fanMaxSpeed: parseNum(cal.fanMaxSpeed),
+                        fanBridgeSpeed: parseNum(cal.fanBridgeSpeed),
+                    };
+                }),
+                spoolWeight: parseNum(form.spoolWeight),
+                netFilamentWeight: parseNum(form.netFilamentWeight),
+                totalWeight: parseNum(form.totalWeight),
+                lowStockThreshold: parseNum(form.lowStockThreshold),
+                spoolType: form.spoolType || null,
+                presets: presets
+                    .filter((p) => p.label.trim() !== "")
+                    .map((p) => ({
+                    label: p.label.trim(),
+                    extrusionMultiplier: parseNum(p.extrusionMultiplier),
+                    temperatures: {
+                        nozzle: parseNum(p.nozzle),
+                        nozzleFirstLayer: parseNum(p.nozzleFirstLayer),
+                        bed: parseNum(p.bed),
+                        bedFirstLayer: parseNum(p.bedFirstLayer),
+                    },
+                })),
+                dryingTemperature: parseNum(form.dryingTemperature),
+                dryingTime: parseNum(form.dryingTime),
+                transmissionDistance: parseNum(form.transmissionDistance),
+                glassTempTransition: parseNum(form.glassTempTransition),
+                heatDeflectionTemp: parseNum(form.heatDeflectionTemp),
+                shrinkageXY: parseNum(form.shrinkageXY),
+                shrinkageZ: parseNum(form.shrinkageZ),
+                shoreHardnessA: parseNum(form.shoreHardnessA),
+                shoreHardnessD: parseNum(form.shoreHardnessD),
+                optTags: form.optTags,
+                tdsUrl: form.tdsUrl || null,
+                inherits: form.inherits || null,
+                parentId: form.parentId || null,
+                settings,
+            });
+            savedRef.current = true;
+            // GH #286: re-baseline so the just-saved state counts as clean.
+            setDirtyBaseline(JSON.stringify({ form, calibrations, presets }));
+        }
+        finally {
+            setSaving(false);
+        }
+    };
+    const inputClass = "w-full px-3 py-2 border border-border dark:border-border rounded text-sm bg-transparent text-gray-900 dark:text-gray-100";
+    // GH #711: a <select> needs an explicit dark background so its native option
+    // popup follows dark mode — a transparent bg makes the popup render
+    // light-on-white. Text inputs keep bg-transparent (they have no popup).
+    const selectClass = inputClass.replace("bg-transparent", "bg-white dark:bg-gray-900");
+    const labelClass = "block text-sm font-medium mb-1 text-gray-900 dark:text-gray-100";
+    // Single source of truth for the submit button label so the duplicate at
+    // the top of the form can't drift from the bottom one.
+    //
+    // Edit mode is identified by the presence of `_id` on initialData — only
+    // /filaments/{id}/edit fetches a real doc with that field; the populate-from
+    // flows on /filaments/new (clone, NFC, Prusament, INI, TDS, parent) all
+    // synthesise an initialData object without an _id. Branching on the bare
+    // truthiness of initialData (the prior behaviour) made every populate-from
+    // flow show "Update Filament" on what is in fact a create — confusing on a
+    // destructive-feeling action like Clone (GH #164).
+    const isEdit = Boolean(initialData?._id);
+    const submitLabel = saving
+        ? t("form.saving")
+        : isEdit
+            ? t("form.updateFilament")
+            : t("form.createFilament");
+    const parentDoc = (initialData?._parent && typeof initialData._parent === "object"
+        ? initialData._parent
+        : undefined);
+    const parentPh = (path) => {
+        if (!parentDoc)
+            return undefined;
+        let value = parentDoc;
+        for (const seg of path.split(".")) {
+            if (value && typeof value === "object" && seg in value) {
+                value = value[seg];
+            }
+            else {
+                return undefined;
+            }
+        }
+        if (value === null || value === undefined || value === "")
+            return undefined;
+        return String(value);
+    };
+    // Tabs group the form's sections so only one group shows at a time. The
+    // panels below (each carrying `data-tab` with the matching id) stay mounted
+    // in the form — see FormTabs for why that keeps native validation working
+    // across tabs.
+    const tabs = useMemo(() => [
+        { id: "basics", label: t("form.tab.basics") },
+        { id: "printing", label: t("form.tab.printing") },
+        { id: "advanced", label: t("form.tab.advanced") },
+        { id: "calibration", label: t("form.tab.calibration") },
+        { id: "slicer", label: t("form.tab.slicer") },
+    ], [t]);
+    return (<div>
+    <form onSubmit={handleSubmit} 
+    // GH #228 + tabs: when HTML5 validation rejects a field the user can't
+    // see, bring it into view. The field may be (a) on a tab that isn't
+    // active — every panel stays mounted so the browser still validates it
+    // — and/or (b) inside a collapsed CollapsibleSection. So switch to the
+    // panel's tab (via its `data-tab`), then open the enclosing section and
+    // scroll to it. Capture phase because the `invalid` event doesn't
+    // bubble — capture lets the form root see it regardless.
+    onInvalidCapture={(e) => {
+            // A submit can fail validation on several fields at once; the browser
+            // fires `invalid` for each in DOM order. Only the FIRST drives the tab
+            // switch + focus, so focus lands on the first offending field rather
+            // than being stolen by the last. The flag resets on a macrotask —
+            // microtasks can interleave between the browser's per-field `invalid`
+            // dispatches, so a microtask reset would re-arm mid-burst.
+            if (invalidHandledRef.current)
+                return;
+            invalidHandledRef.current = true;
+            setTimeout(() => {
+                invalidHandledRef.current = false;
+            }, 0);
+            const target = e.target;
+            if (!target)
+                return;
+            const panel = target.closest("[data-tab]");
+            const tab = panel?.dataset.tab;
+            if (tab && tab !== activeTab)
+                setActiveTab(tab);
+            const section = target.closest("section[id]");
+            if (section && section.id) {
+                expandAndScrollToSection(section.id);
+            }
+            else {
+                // Bare field (e.g. name, vendor, tdsUrl): the browser tried to focus
+                // it while its panel was still hidden. After the tab switch commits,
+                // scroll it into view and refocus it.
+                requestAnimationFrame(() => {
+                    requestAnimationFrame(() => {
+                        target.scrollIntoView({ behavior: "smooth", block: "center" });
+                        target.focus?.();
+                    });
+                });
+            }
+        }} className="space-y-4">
+      {fetchErrors.length > 0 && (<div className="px-3 py-2 bg-yellow-50 dark:bg-yellow-900/30 border border-yellow-200 dark:border-yellow-800 rounded text-sm text-yellow-700 dark:text-yellow-300">
+          {t("form.fetchError", { items: fetchErrors.join(", ") })}
+        </div>)}
+      {/* Top submit button — mirrors the bottom one so users editing a long
+         * filament don't have to scroll back down to save (GH #127). */}
+      <div className="flex justify-end">
+        <button type="submit" disabled={saving} className="px-6 py-2 ui-primary text-white rounded hover:opacity-90 disabled:opacity-50">
+          {submitLabel}
+        </button>
+      </div>
+      {form.parentId && initialData?._parent && (
+        // Variant banner — without this users edit a clone, see the parent's
+        // values pre-filled (as they used to before GH #106 was fixed), and
+        // don't realise that clicking Save copies every field onto the
+        // child. Now the edit form fetches ?raw=true and shows only the
+        // variant's own overrides; inherited fields render blank. This
+        // banner spells that out so the empty inputs don't look buggy.
+        <div className="px-3 py-2 bg-muted dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded text-sm text-blue-800 dark:text-foreground">
+          {t("form.variantHint", {
+                parent: initialData._parent.name ?? "parent",
+            })}
+        </div>)}
+
+      <FormTabs tabs={tabs} active={activeTab} onChange={setActiveTab} ariaLabel={t("form.tabs.aria")}/>
+
+      {/* ── BASICS ─────────────────────────────────────────────────── */}
+      <div role="tabpanel" id="tabpanel-basics" aria-labelledby="tab-basics" data-tab="basics" hidden={activeTab !== "basics"} className="space-y-4">
+      <div>
+        <label className={labelClass} htmlFor="filament-name">{t("form.name")} *</label>
+        <input id="filament-name" className={inputClass} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} required/>
+      </div>
+
+      <div ref={parentRef} className="relative">
+        <label className={labelClass}>
+          {t("form.parentFilament")}
+          <span className="text-gray-400 font-normal ml-1">({t("form.parentFilamentHint")})</span>
+        </label>
+        {form.parentId ? (<div className="flex items-center gap-2 px-3 py-2 border border-blue-400 bg-muted dark:bg-blue-950 rounded text-sm">
+            {(() => {
+                const p = parentOptions.find((o) => o._id === form.parentId);
+                return p ? (<>
+                  <FilamentSwatch color={p.color} isParent={p.hasVariants === true} size={16}/>
+                  <span className="flex-1">{p.name}</span>
+                  <span className="text-gray-500 text-xs">{p.vendor} &middot; {p.type}</span>
+                </>) : (<span className="text-gray-500">{t("form.loading")}</span>);
+            })()}
+            <button type="button" onClick={() => setForm({ ...form, parentId: "" })} className="text-red-500 hover:text-red-700 text-xs ml-2">
+              {t("form.remove")}
+            </button>
+          </div>) : (<>
+            <input className={inputClass} value={parentSearch} role="combobox" aria-expanded={parentDropdownOpen} aria-controls="parent-listbox" aria-autocomplete="list" aria-activedescendant={parentHighlight >= 0 ? `parent-opt-${parentHighlight}` : undefined} onChange={(e) => {
+                setParentSearch(e.target.value);
+                setParentDropdownOpen(true);
+                setParentHighlight(-1);
+            }} onFocus={() => { setParentDropdownOpen(true); setParentHighlight(-1); }} onKeyDown={(e) => {
+                if (!parentDropdownOpen)
+                    return;
+                const filtered = parentOptions
+                    .filter((p) => !parentSearch || p.name.toLowerCase().includes(parentSearch.toLowerCase()) || p.vendor.toLowerCase().includes(parentSearch.toLowerCase()))
+                    .slice(0, 20);
+                if (e.key === "ArrowDown") {
+                    e.preventDefault();
+                    setParentHighlight((h) => Math.min(h + 1, filtered.length - 1));
+                }
+                else if (e.key === "ArrowUp") {
+                    e.preventDefault();
+                    setParentHighlight((h) => Math.max(h - 1, 0));
+                }
+                else if (e.key === "Enter" && parentHighlight >= 0 && filtered[parentHighlight]) {
+                    e.preventDefault();
+                    const p = filtered[parentHighlight];
+                    setForm({ ...form, parentId: p._id, vendor: form.vendor || p.vendor, type: (!form.type || form.type === "PLA") ? p.type : form.type });
+                    setParentSearch("");
+                    setParentDropdownOpen(false);
+                    setParentHighlight(-1);
+                }
+                else if (e.key === "Escape") {
+                    setParentDropdownOpen(false);
+                    setParentHighlight(-1);
+                }
+            }} placeholder={t("form.placeholder.parentSearch")}/>
+            {parentDropdownOpen && (<ul id="parent-listbox" role="listbox" className="absolute z-50 w-full mt-1 max-h-48 overflow-y-auto bg-white dark:bg-gray-800 border border-border dark:border-border rounded shadow-lg">
+                {parentOptions
+                    .filter((p) => !parentSearch ||
+                    p.name.toLowerCase().includes(parentSearch.toLowerCase()) ||
+                    p.vendor.toLowerCase().includes(parentSearch.toLowerCase()))
+                    .slice(0, 20)
+                    .map((p, i) => (<li key={p._id} id={`parent-opt-${i}`} role="option" aria-selected={p._id === form.parentId} className={`px-3 py-2 cursor-pointer text-gray-800 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2 ${i === parentHighlight ? "bg-gray-100 dark:bg-gray-600" : ""}`} onMouseDown={(e) => {
+                        e.preventDefault();
+                        setForm({
+                            ...form,
+                            parentId: p._id,
+                            vendor: form.vendor || p.vendor,
+                            type: (!form.type || form.type === "PLA") ? p.type : form.type,
+                        });
+                        setParentSearch("");
+                        setParentDropdownOpen(false);
+                    }}>
+                      <FilamentSwatch color={p.color} isParent={p.hasVariants === true} size={16}/>
+                      <span className="flex-1 truncate">{p.name}</span>
+                      <span className="text-gray-400 text-xs flex-shrink-0">{p.vendor} &middot; {p.type}</span>
+                    </li>))}
+                {parentOptions.filter((p) => !parentSearch ||
+                    p.name.toLowerCase().includes(parentSearch.toLowerCase()) ||
+                    p.vendor.toLowerCase().includes(parentSearch.toLowerCase())).length === 0 && (<li className="px-3 py-2 text-gray-500 text-sm">
+                    {parentsLoading ? t("form.loading") : t("form.noMatchingFilaments")}
+                  </li>)}
+              </ul>)}
+          </>)}
+        {form.parentId && (<p className="text-xs text-gray-500 mt-1">
+            {t("form.parentInheritHint")}
+          </p>)}
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div ref={vendorRef} className="relative">
+          <label className={labelClass} id="vendor-label">{t("form.vendor")} *</label>
+          <input className={inputClass} value={form.vendor} role="combobox" aria-expanded={vendorDropdownOpen} aria-controls="vendor-listbox" aria-labelledby="vendor-label" aria-autocomplete="list" aria-activedescendant={vendorHighlight >= 0 ? `vendor-opt-${vendorHighlight}` : undefined} onChange={(e) => {
+            const val = e.target.value;
+            setForm({ ...form, vendor: val });
+            setVendorDropdownOpen(true);
+            setVendorHighlight(-1);
+        }} onFocus={() => {
+            setVendorDropdownOpen(true);
+            setVendorHighlight(-1);
+        }} onKeyDown={(e) => {
+            if (!vendorDropdownOpen)
+                return;
+            const filtered = vendorOptions.filter((v) => !form.vendor || v.toLowerCase().includes(form.vendor.toLowerCase()));
+            if (e.key === "ArrowDown") {
+                e.preventDefault();
+                setVendorHighlight((h) => Math.min(h + 1, filtered.length - 1));
+            }
+            else if (e.key === "ArrowUp") {
+                e.preventDefault();
+                setVendorHighlight((h) => Math.max(h - 1, 0));
+            }
+            else if (e.key === "Enter" && vendorHighlight >= 0 && filtered[vendorHighlight]) {
+                e.preventDefault();
+                setForm({ ...form, vendor: filtered[vendorHighlight] });
+                setVendorDropdownOpen(false);
+                setVendorHighlight(-1);
+            }
+            else if (e.key === "Escape") {
+                setVendorDropdownOpen(false);
+                setVendorHighlight(-1);
+            }
+        }} placeholder={t("form.placeholder.selectOrType")} required/>
+          {vendorDropdownOpen && (<ul id="vendor-listbox" role="listbox" aria-labelledby="vendor-label" className="absolute z-50 w-full mt-1 max-h-48 overflow-y-auto bg-white dark:bg-gray-800 border border-border dark:border-border rounded shadow-lg">
+              {vendorOptions
+                .filter((v) => !form.vendor || v.toLowerCase().includes(form.vendor.toLowerCase()))
+                .map((v, i) => (<li key={v} id={`vendor-opt-${i}`} role="option" aria-selected={v === form.vendor} className={`px-3 py-1.5 cursor-pointer text-gray-800 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-700 ${i === vendorHighlight ? "bg-gray-100 dark:bg-gray-600" : ""} ${v === form.vendor ? "bg-gray-200 dark:bg-gray-700 font-semibold" : ""}`} onMouseDown={(e) => {
+                    e.preventDefault();
+                    setForm({ ...form, vendor: v });
+                    setVendorDropdownOpen(false);
+                }}>
+                    {v}
+                  </li>))}
+              {form.vendor && !vendorOptions.some((v) => v.toLowerCase() === form.vendor.toLowerCase()) && (<li role="option" aria-selected={false} className="px-3 py-1.5 cursor-pointer text-green-600 dark:text-green-400 hover:bg-gray-100 dark:hover:bg-gray-700 border-t border-border dark:border-border" onMouseDown={(e) => {
+                    e.preventDefault();
+                    setVendorOptions((prev) => Array.from(new Set([...prev, form.vendor])).sort());
+                    setVendorDropdownOpen(false);
+                }}>
+                  {t("form.addItem", { item: form.vendor })}
+                </li>)}
+            </ul>)}
+        </div>
+        <div ref={typeRef} className="relative">
+          <label className={labelClass} id="type-label">{t("form.type")} *</label>
+          <input className={inputClass} value={form.type} role="combobox" aria-expanded={typeDropdownOpen} aria-controls="type-listbox" aria-labelledby="type-label" aria-autocomplete="list" aria-activedescendant={typeHighlight >= 0 ? `type-opt-${typeHighlight}` : undefined} onChange={(e) => {
+            const val = e.target.value.toUpperCase();
+            setForm({ ...form, type: val });
+            setTypeDropdownOpen(true);
+            setTypeHighlight(-1);
+        }} onFocus={() => {
+            setTypeDropdownOpen(true);
+            setTypeHighlight(-1);
+        }} onKeyDown={(e) => {
+            if (!typeDropdownOpen)
+                return;
+            const filtered = filamentTypes.filter((ft) => !form.type || ft.includes(form.type));
+            if (e.key === "ArrowDown") {
+                e.preventDefault();
+                setTypeHighlight((h) => Math.min(h + 1, filtered.length - 1));
+            }
+            else if (e.key === "ArrowUp") {
+                e.preventDefault();
+                setTypeHighlight((h) => Math.max(h - 1, 0));
+            }
+            else if (e.key === "Enter" && typeHighlight >= 0 && filtered[typeHighlight]) {
+                e.preventDefault();
+                setForm({ ...form, type: filtered[typeHighlight] });
+                setTypeDropdownOpen(false);
+                setTypeHighlight(-1);
+            }
+            else if (e.key === "Escape") {
+                setTypeDropdownOpen(false);
+                setTypeHighlight(-1);
+            }
+        }} placeholder={t("form.placeholder.selectOrType")} required/>
+          {typeDropdownOpen && (<ul id="type-listbox" role="listbox" aria-labelledby="type-label" className="absolute z-50 w-full mt-1 max-h-48 overflow-y-auto bg-white dark:bg-gray-800 border border-border dark:border-border rounded shadow-lg">
+              {filamentTypes
+                .filter((ft) => !form.type || ft.includes(form.type))
+                .map((ft, i) => (<li key={ft} id={`type-opt-${i}`} role="option" aria-selected={ft === form.type} className={`px-3 py-1.5 cursor-pointer text-gray-800 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-700 ${i === typeHighlight ? "bg-gray-100 dark:bg-gray-600" : ""} ${ft === form.type ? "bg-gray-200 dark:bg-gray-700 font-semibold" : ""}`} onMouseDown={(e) => {
+                    e.preventDefault();
+                    setForm({ ...form, type: ft });
+                    setTypeDropdownOpen(false);
+                }}>
+                    {ft}
+                  </li>))}
+              {form.type && !filamentTypes.includes(form.type) && (<li role="option" aria-selected={false} className="px-3 py-1.5 cursor-pointer text-green-600 dark:text-green-400 hover:bg-gray-100 dark:hover:bg-gray-700 border-t border-border dark:border-border" onMouseDown={(e) => {
+                    e.preventDefault();
+                    setFilamentTypes((prev) => Array.from(new Set([...prev, form.type])).sort());
+                    setTypeDropdownOpen(false);
+                }}>
+                  {t("form.addItem", { item: form.type })}
+                </li>)}
+            </ul>)}
+        </div>
+      </div>
+
+      {/* Two columns, not four: at the form's width four cells were too
+            narrow to fit the colour swatch + hex input together, and the
+            "Density (g/cm³)" label wrapped to two lines, pushing its input
+            out of alignment with the rest of the row. Two columns matches
+            the vendor/type row above and gives every field room. */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        {/* GH #605: templates (filaments with variants) are colorless — the
+            primary color + color name live on each variant, and FilamentSwatch
+            renders parents as the hatched color group regardless. Hide both
+            editors and explain; the untouched seeded values are resubmitted
+            verbatim so a legacy parent's stored color survives an edit until
+            the user explicitly converts (decision 4, enforce forward only).
+            The multi-color editor below stays: secondaryColors is inheritable
+            (GH #477), so the shared set legitimately lives on the template. */}
+        {isParent ? (<p className="sm:col-span-2 text-sm text-gray-500 dark:text-gray-400">
+            {t("form.color.templateNote")}
+          </p>) : (<>
+        <div>
+          <label className={labelClass}>{t("form.color")}</label>
+          <div className="flex gap-2">
+            {form.color === "" ? (
+            // GH #605: cleared color. <input type="color"> can't render an
+            // empty value, so show a hatched placeholder instead — same
+            // hatch vocabulary as FilamentSwatch's "no single color"
+            // treatment. Clicking forwards to the always-mounted hidden
+            // picker below so choosing a color back is still one click.
+            <button type="button" aria-label={t("form.color.cleared")} title={t("form.color.cleared")} className="h-10 w-12 rounded border border-gray-400 dark:border-gray-500 cursor-pointer flex-shrink-0" style={{
+                    backgroundColor: "#e5e7eb",
+                    backgroundImage: [
+                        "repeating-linear-gradient(45deg, rgba(75,85,99,0.55) 0 2px, transparent 2px 6px)",
+                        "repeating-linear-gradient(-45deg, rgba(75,85,99,0.55) 0 2px, transparent 2px 6px)",
+                    ].join(", "),
+                }} onClick={() => colorPickerRef.current?.click()}/>) : (<input type="color" aria-label={t("form.color")} className="h-10 w-12 rounded border border-border dark:border-border cursor-pointer bg-transparent flex-shrink-0" value={form.color} onChange={(e) => {
+                    // Manual pick → this hex is now user-owned (even if it's the
+                    // gray sentinel); a later color name must not overwrite it (#794).
+                    setForm({ ...form, color: e.target.value });
+                    setColorHexUserSet(true);
+                }}/>)}
+            {/* GH #605: hidden picker backing the cleared-state placeholder.
+                Mounted unconditionally so the native dialog it opened doesn't
+                close the instant the first picked value flips the branch
+                above. Seeded with the neutral sentinel while cleared (the
+                cleared state has no hex to show; incomplete fragments would
+                be non-conforming input values). */}
+            <input ref={colorPickerRef} type="color" aria-hidden="true" tabIndex={-1} className="sr-only" value={isIncompleteColorHex(form.color) ? BLANK_COLOR_HEX : form.color} onChange={(e) => {
+                setForm({ ...form, color: e.target.value });
+                setColorHexUserSet(true);
+            }}/>
+            <input type="text" inputMode="text" className={`${inputClass} font-mono uppercase min-w-0`} value={form.color} placeholder="#RRGGBB" maxLength={7} onChange={(e) => {
+                // Allow incremental typing: prepend # if missing, keep only
+                // hex chars. GH #605: an emptied box stores "" (no color) —
+                // not a dangling "#" — so the submit maps it to null.
+                setForm({ ...form, color: normalizeColorHexInput(e.target.value) });
+                // Manual edit → user-owned hex; don't let a name overwrite it (#794).
+                setColorHexUserSet(true);
+            }} onBlur={(e) => {
+                const v = e.target.value.trim();
+                // Expand 3-digit shorthand on blur (e.g. #abc → #aabbcc)
+                const m = v.match(/^#([0-9a-fA-F]{3})$/);
+                if (m) {
+                    const [r, g, b] = m[1].split("");
+                    setForm({ ...form, color: `#${r}${r}${g}${g}${b}${b}` });
+                }
+            }}/>
+          </div>
+        </div>
+        <div ref={colorNameRef} className="relative">
+          <label className={labelClass} id="colorName-label">{t("form.colorName")}</label>
+          <input id="filament-colorName" className={inputClass} value={form.colorName} role="combobox" aria-expanded={colorNameDropdownOpen} aria-controls="colorName-listbox" aria-labelledby="colorName-label" aria-autocomplete="list" aria-activedescendant={colorNameHighlight >= 0 ? `colorName-opt-${colorNameHighlight}` : undefined} placeholder={t("form.placeholder.colorName")} onChange={(e) => {
+                // Typing the colorName never overwrites `color` on its own —
+                // we wait for the user to commit (Enter, click, or exact-
+                // match-then-blur) so we don't churn the hex picker on every
+                // keystroke. The user's free-text "I'm naming this whatever
+                // I want" path stays uninterrupted.
+                setForm({ ...form, colorName: e.target.value });
+                setColorNameDropdownOpen(true);
+                setColorNameHighlight(-1);
+            }} onFocus={() => {
+                setColorNameDropdownOpen(true);
+                setColorNameHighlight(-1);
+            }} onBlur={() => {
+                // Exact (case- and whitespace-insensitive) match on a CSS
+                // named color — populate the hex even though the user
+                // never opened the dropdown. Mirrors how a user expects
+                // the picker to behave after typing "navy" and tabbing.
+                // DB matches are NOT auto-applied on blur because there
+                // can be multiple hexes under the same name (e.g. several
+                // brands of "Galaxy Black"); the user must explicitly
+                // pick which one they meant via the dropdown.
+                // GH #794: fill the hex from the name only when the hex isn't
+                // user-owned — i.e. it's incomplete, or never picked / itself
+                // auto-filled (tracked by colorHexUserSet, which stays false after
+                // an autofill so a later name can replace it). Never clobber a hex
+                // the user picked, including a deliberately-chosen gray sentinel.
+                const cssHex = lookupCssNamedColor(form.colorName);
+                if (cssHex && (isIncompleteColorHex(form.color) || !colorHexUserSet)) {
+                    setForm((f) => ({ ...f, color: cssHex }));
+                    // Now name-auto-filled (not user-owned), so a later name can
+                    // still replace it — even if the user had just cleared the field,
+                    // which set the flag true (Codex P2).
+                    setColorHexUserSet(false);
+                }
+            }} onKeyDown={(e) => {
+                if (!colorNameDropdownOpen)
+                    return;
+                const filtered = filterColorSuggestions(colorNameSuggestions, form.colorName);
+                if (e.key === "ArrowDown") {
+                    e.preventDefault();
+                    setColorNameHighlight((h) => Math.min(h + 1, filtered.length - 1));
+                }
+                else if (e.key === "ArrowUp") {
+                    e.preventDefault();
+                    setColorNameHighlight((h) => Math.max(h - 1, 0));
+                }
+                else if (e.key === "Enter" &&
+                    colorNameHighlight >= 0 &&
+                    filtered[colorNameHighlight]) {
+                    e.preventDefault();
+                    const s = filtered[colorNameHighlight];
+                    // GH #794: always set the name; adopt the suggestion's hex only
+                    // when the hex isn't user-owned (incomplete, or never picked /
+                    // auto-filled) — don't clobber a user-picked color.
+                    const applyHex = isIncompleteColorHex(form.color) || !colorHexUserSet;
+                    setForm((f) => ({
+                        ...f,
+                        colorName: s.name,
+                        ...(applyHex ? { color: s.hex } : {}),
+                    }));
+                    // Filling from a name leaves the hex name-owned, so subsequent
+                    // names keep updating it (Codex P2).
+                    if (applyHex)
+                        setColorHexUserSet(false);
+                    setColorNameDropdownOpen(false);
+                    setColorNameHighlight(-1);
+                }
+                else if (e.key === "Escape") {
+                    setColorNameDropdownOpen(false);
+                    setColorNameHighlight(-1);
+                }
+            }}/>
+          {colorNameDropdownOpen && (() => {
+                const filtered = filterColorSuggestions(colorNameSuggestions, form.colorName);
+                if (filtered.length === 0)
+                    return null;
+                // Section boundaries — render a small "From your filaments"
+                // / "Standard colors" header before each source group.
+                // Pre-computing the first-of-each-source flag avoids an
+                // extra pass during render.
+                let lastSource = null;
+                return (<ul id="colorName-listbox" role="listbox" aria-labelledby="colorName-label" className="absolute z-50 w-full mt-1 max-h-64 overflow-y-auto bg-white dark:bg-gray-800 border border-border dark:border-border rounded shadow-lg">
+                {filtered.map((s, i) => {
+                        const showHeader = s.source !== lastSource;
+                        lastSource = s.source;
+                        return (
+                        // GH #637 (#3): was a <span> wrapping the <li>s — a
+                        // <span> is an invalid <ul> child (and put the <li>s
+                        // outside the list's content model), so AT could fail
+                        // to enumerate the options. A keyed Fragment keeps the
+                        // <li>s as direct <ul> children.
+                        <Fragment key={`${s.source}-${s.name}-${s.hex}`}>
+                      {showHeader && (<li role="presentation" aria-hidden="true" className="px-3 py-1 text-[10px] uppercase tracking-wide text-gray-400 bg-gray-50 dark:bg-gray-900 border-b border-border dark:border-border">
+                          {s.source === "db"
+                                    ? t("form.colorName.section.db")
+                                    : t("form.colorName.section.css")}
+                        </li>)}
+                      <li id={`colorName-opt-${i}`} role="option" aria-selected={i === colorNameHighlight} className={`px-3 py-1.5 cursor-pointer text-gray-800 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2 ${i === colorNameHighlight ? "bg-gray-100 dark:bg-gray-600" : ""}`} onMouseDown={(e) => {
+                                // mousedown beats blur — without preventDefault the
+                                // input's onBlur fires first and the dropdown closes
+                                // before the click registers.
+                                e.preventDefault();
+                                // GH #794: name always; hex only when not user-owned
+                                // (incomplete, or never picked / auto-filled) — never
+                                // clobber a user-picked color.
+                                const applyHex = isIncompleteColorHex(form.color) || !colorHexUserSet;
+                                setForm((f) => ({
+                                    ...f,
+                                    colorName: s.name,
+                                    ...(applyHex ? { color: s.hex } : {}),
+                                }));
+                                // Name-owned after a fill, so later names keep updating
+                                // it (Codex P2).
+                                if (applyHex)
+                                    setColorHexUserSet(false);
+                                setColorNameDropdownOpen(false);
+                                setColorNameHighlight(-1);
+                            }}>
+                        <span aria-hidden="true" className="inline-block w-4 h-4 rounded-full border border-border dark:border-gray-500 flex-shrink-0" style={{ backgroundColor: s.hex }}/>
+                        <span className="flex-1 truncate">{s.name}</span>
+                        <span className="text-xs font-mono text-gray-400">{s.hex.toUpperCase()}</span>
+                      </li>
+                    </Fragment>);
+                    })}
+              </ul>);
+            })()}
+        </div>
+        </>)}
+        {/* GH #477: Multi-color editor + arrangement radio. Spans the
+            full 2-col grid via sm:col-span-2. */}
+        <div className="sm:col-span-2">
+          <MultiColorEditor form={form} setForm={setForm} t={t}/>
+        </div>
+        <div>
+          <label htmlFor="filament-cost" className={labelClass}>{t("form.cost", { symbol: currencySymbol })}</label>
+          <input id="filament-cost" type="number" step="0.01" min="0" className={inputClass} value={form.cost} onChange={(e) => setForm({ ...form, cost: e.target.value })} placeholder={parentPh("cost")}/>
+        </div>
+        <div>
+          <label htmlFor="filament-density" className={labelClass}>{t("form.density")}</label>
+          <input id="filament-density" type="number" step="0.01" min="0" className={inputClass} value={form.density} onChange={(e) => setForm({ ...form, density: e.target.value })} placeholder={parentPh("density")}/>
+        </div>
+      </div>
+
+      {/* GH #605: a template (filament with variants) doesn't hold inventory —
+            spools and the total weight live on its color variants, and the PUT
+            route strips a non-null totalWeight for parents. But the SPEC pair
+            (empty-spool tare + net filament weight) legitimately lives on the
+            template: both are inheritable (resolveFilament), so setting them
+            here gives every variant its remaining-weight denominator (GH
+            #1048). Show the section with only the spec fields for parents;
+            hide the inventory inputs (initial weight, low-stock threshold)
+            whose values wouldn't mean anything / wouldn't persist. */}
+      <CollapsibleSection id="spool-weight" title={t("form.section.spoolWeight")} defaultOpen>
+        {isParent && (<p className="text-sm text-gray-500 dark:text-gray-400 mb-4">
+            {t("form.spoolWeight.templateNote")}
+          </p>)}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div>
+            <label htmlFor="filament-net-filament" className={labelClass}>{t("form.netFilament")}</label>
+            <input id="filament-net-filament" type="number" step="1" min="0" className={inputClass} value={form.netFilamentWeight} onChange={(e) => setForm({ ...form, netFilamentWeight: e.target.value })} placeholder={parentPh("netFilamentWeight") ?? t("form.placeholder.netFilament")}/>
+            <p className="text-xs text-gray-400 mt-1">{t("form.netFilamentHint")}</p>
+          </div>
+          <div>
+            <label htmlFor="filament-spool-weight" className={labelClass}>{t("form.emptySpool")}</label>
+            <input id="filament-spool-weight" type="number" step="1" min="0" className={inputClass} value={form.spoolWeight} onChange={(e) => setForm({ ...form, spoolWeight: e.target.value })} placeholder={parentPh("spoolWeight") ?? t("form.placeholder.emptySpool")}/>
+            <p className="text-xs text-gray-400 mt-1">{t("form.emptySpoolHint")}</p>
+          </div>
+          {/* Inventory inputs — hidden for templates (see the section
+            comment above): totalWeight is stripped by the PUT route, and
+            the low-stock threshold keys off remaining weight, which a
+            spool-less template doesn't have. The untouched seeded values
+            are still resubmitted verbatim (same posture as the hidden
+            color editor), so a legacy parent's stored value survives an
+            edit until explicitly converted/cleared. */}
+          {!isParent && (<>
+          <div>
+            <label htmlFor="filament-initial-weight" className={labelClass}>{t("form.initialWeight")}</label>
+            <input id="filament-initial-weight" type="number" step="1" min="0" className={inputClass} value={form.totalWeight} onChange={(e) => setForm({ ...form, totalWeight: e.target.value })} placeholder={t("form.placeholder.initialWeight")}/>
+            <p className="text-xs text-gray-400 mt-1">
+              {initialData?._id
+                ? t("form.initialWeightHintEdit")
+                : t("form.initialWeightHint")}
+            </p>
+          </div>
+          <div>
+            <label htmlFor="filament-low-stock-threshold" className={labelClass}>{t("form.lowStockThreshold")}</label>
+            <input id="filament-low-stock-threshold" type="number" step="1" min="0" className={inputClass} value={form.lowStockThreshold} onChange={(e) => setForm({ ...form, lowStockThreshold: e.target.value })} placeholder={t("form.placeholder.lowStockThreshold")}/>
+            <p className="text-xs text-gray-400 mt-1">{t("form.lowStockThresholdHint")}</p>
+          </div>
+          </>)}
+        </div>
+      </CollapsibleSection>
+
+      <div>
+        <label className={labelClass}>{t("form.tdsUrl")}</label>
+        <input type="url" className={inputClass} value={form.tdsUrl} onChange={(e) => setForm({ ...form, tdsUrl: e.target.value })} placeholder={parentPh("tdsUrl") ?? t("form.placeholder.tdsUrl")}/>
+        {!form.tdsUrl && tdsSuggestions.length > 0 && (<div className="mt-1">
+            <p className="text-xs text-gray-500 mb-1">{t("form.tdsFromVendor", { vendor: form.vendor })}</p>
+            <div className="flex flex-wrap gap-1">
+              {tdsSuggestions.map((s) => (<button key={s.name} type="button" onClick={() => setForm({ ...form, tdsUrl: s.tdsUrl })} className="text-xs px-2 py-1 bg-muted dark:bg-blue-900 text-foreground dark:text-foreground rounded hover:bg-blue-200 dark:hover:bg-blue-800">
+                  {t("form.useFrom", { name: s.name })}
+                </button>))}
+            </div>
+          </div>)}
+      </div>
+
+      <div>
+        <label className={labelClass}>{t("form.notes")}</label>
+        <textarea className={inputClass} rows={4} value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} placeholder={t("form.placeholder.notes")}/>
+      </div>
+      </div>
+
+      {/* ── PRINTING ───────────────────────────────────────────────── */}
+      <div role="tabpanel" id="tabpanel-printing" aria-labelledby="tab-printing" data-tab="printing" hidden={activeTab !== "printing"} className="space-y-4">
+
+      {/* #872: framed "Print Speed" section. These three fields used to be an
+            unframed orphan grid between sections, so they didn't align with the
+            other (bordered) groups. */}
+      <CollapsibleSection id="print-speed" title={t("form.section.printSpeed")} defaultOpen>
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+        <div>
+          <label htmlFor="filament-min-print-speed" className={labelClass}>{t("form.minPrintSpeed")}</label>
+          <input id="filament-min-print-speed" type="number" step="1" min="0" className={inputClass} value={form.minPrintSpeed} onChange={(e) => setForm({ ...form, minPrintSpeed: e.target.value })} placeholder={parentPh("minPrintSpeed")}/>
+        </div>
+        <div>
+          <label htmlFor="filament-max-print-speed" className={labelClass}>{t("form.maxPrintSpeed")}</label>
+          <input id="filament-max-print-speed" type="number" step="1" min="0" className={inputClass} value={form.maxPrintSpeed} onChange={(e) => setForm({ ...form, maxPrintSpeed: e.target.value })} placeholder={parentPh("maxPrintSpeed")}/>
+        </div>
+        <div>
+          <label htmlFor="filament-z-offset" className={labelClass}>{t("form.zOffset")}</label>
+          <input id="filament-z-offset" type="number" step="0.001" className={inputClass} value={form.zOffset} onChange={(e) => setForm({ ...form, zOffset: e.target.value })} placeholder={t("form.placeholder.zOffset")}/>
+        </div>
+      </div>
+      </CollapsibleSection>
+
+      <CollapsibleSection id="temperatures" title={t("form.section.temperatures")} defaultOpen>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <label htmlFor="filament-temp-nozzle" className={labelClass}>{t("form.nozzleTemp")}</label>
+            <input id="filament-temp-nozzle" type="number" min="0" className={inputClass} value={form.temperatures.nozzle} onChange={(e) => setForm({
+            ...form,
+            temperatures: { ...form.temperatures, nozzle: e.target.value },
+        })} placeholder={parentPh("temperatures.nozzle")}/>
+          </div>
+          <div>
+            <label htmlFor="filament-temp-nozzle-first-layer" className={labelClass}>{t("form.nozzleFirstLayer")}</label>
+            <input id="filament-temp-nozzle-first-layer" type="number" min="0" className={inputClass} value={form.temperatures.nozzleFirstLayer} onChange={(e) => setForm({
+            ...form,
+            temperatures: { ...form.temperatures, nozzleFirstLayer: e.target.value },
+        })} placeholder={parentPh("temperatures.nozzleFirstLayer")}/>
+          </div>
+          <div>
+            <label htmlFor="filament-temp-bed" className={labelClass}>{t("form.bedTemp")}</label>
+            <input id="filament-temp-bed" type="number" min="0" className={inputClass} value={form.temperatures.bed} onChange={(e) => setForm({
+            ...form,
+            temperatures: { ...form.temperatures, bed: e.target.value },
+        })} placeholder={parentPh("temperatures.bed")}/>
+          </div>
+          <div>
+            <label htmlFor="filament-temp-bed-first-layer" className={labelClass}>{t("form.bedFirstLayer")}</label>
+            <input id="filament-temp-bed-first-layer" type="number" min="0" className={inputClass} value={form.temperatures.bedFirstLayer} onChange={(e) => setForm({
+            ...form,
+            temperatures: { ...form.temperatures, bedFirstLayer: e.target.value },
+        })} placeholder={parentPh("temperatures.bedFirstLayer")}/>
+          </div>
+          <div>
+            <label htmlFor="filament-temp-chamber" className={labelClass}>{t("form.chamberTemp")}</label>
+            <input id="filament-temp-chamber" type="number" min="0" className={inputClass} value={form.temperatures.chamber} onChange={(e) => setForm({
+            ...form,
+            temperatures: { ...form.temperatures, chamber: e.target.value },
+        })}/>
+          </div>
+          <div>
+            <label htmlFor="filament-temp-standby" className={labelClass}>{t("form.standbyTemp")}</label>
+            <input id="filament-temp-standby" type="number" min="0" className={inputClass} value={form.temperatures.standby} onChange={(e) => setForm({
+            ...form,
+            temperatures: { ...form.temperatures, standby: e.target.value },
+        })} placeholder={parentPh("temperatures.standby")}/>
+          </div>
+          <div>
+            <label htmlFor="filament-temp-nozzle-range-min" className={labelClass}>{t("form.nozzleRangeMin")}</label>
+            <input id="filament-temp-nozzle-range-min" type="number" min="0" className={inputClass} value={form.temperatures.nozzleRangeMin} onChange={(e) => setForm({
+            ...form,
+            temperatures: { ...form.temperatures, nozzleRangeMin: e.target.value },
+        })} placeholder={parentPh("temperatures.nozzleRangeMin") ?? t("form.placeholder.safeMinimum")}/>
+          </div>
+          <div>
+            <label htmlFor="filament-temp-nozzle-range-max" className={labelClass}>{t("form.nozzleRangeMax")}</label>
+            <input ref={nozzleRangeMaxRef} id="filament-temp-nozzle-range-max" type="number" min="0" className={inputClass} value={form.temperatures.nozzleRangeMax} onChange={(e) => setForm({
+            ...form,
+            temperatures: { ...form.temperatures, nozzleRangeMax: e.target.value },
+        })} placeholder={parentPh("temperatures.nozzleRangeMax") ?? t("form.placeholder.safeMaximum")}/>
+          </div>
+        </div>
+
+        {/* Per-bed-type temperatures */}
+        {form.bedTypeTemps.length > 0 && (<div className="mt-3 space-y-2">
+            <p className="text-xs text-gray-400 font-medium uppercase">{t("form.perBedTypeTemps")}</p>
+            {form.bedTypeTemps.map((bt, idx) => (<div key={bt._uid} className="grid grid-cols-4 gap-2 items-end">
+                <div>
+                  <input className={inputClass} value={bt.bedType} onChange={(e) => {
+                    const updated = [...form.bedTypeTemps];
+                    updated[idx] = { ...bt, bedType: e.target.value };
+                    setForm({ ...form, bedTypeTemps: updated });
+                }} placeholder={t("form.placeholder.bedType")}/>
+                </div>
+                <div>
+                  <input type="number" min="0" className={inputClass} value={bt.temperature} onChange={(e) => {
+                    const updated = [...form.bedTypeTemps];
+                    updated[idx] = { ...bt, temperature: e.target.value };
+                    setForm({ ...form, bedTypeTemps: updated });
+                }} placeholder={t("form.placeholder.temp")}/>
+                </div>
+                <div>
+                  <input type="number" min="0" className={inputClass} value={bt.firstLayerTemperature} onChange={(e) => {
+                    const updated = [...form.bedTypeTemps];
+                    updated[idx] = { ...bt, firstLayerTemperature: e.target.value };
+                    setForm({ ...form, bedTypeTemps: updated });
+                }} placeholder={t("form.placeholder.firstLayer")}/>
+                </div>
+                <button type="button" className="text-red-500 text-sm hover:underline" onClick={() => {
+                    setForm({ ...form, bedTypeTemps: form.bedTypeTemps.filter((_, i) => i !== idx) });
+                }}>{t("form.remove")}</button>
+              </div>))}
+          </div>)}
+        <button type="button" className="mt-2 text-xs text-foreground hover:underline" onClick={() => {
+            setForm({ ...form, bedTypeTemps: [...form.bedTypeTemps, { _uid: makeUid(), bedType: "", temperature: "", firstLayerTemperature: "" }] });
+        }}>{t("form.addBedType")}</button>
+      </CollapsibleSection>
+      </div>
+
+      {/* ── ADVANCED ───────────────────────────────────────────────── */}
+      <div role="tabpanel" id="tabpanel-advanced" aria-labelledby="tab-advanced" data-tab="advanced" hidden={activeTab !== "advanced"} className="space-y-4">
+      <CollapsibleSection id="shrinkage" title={t("form.section.shrinkage")}>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <label className={labelClass}>{t("form.shrinkageXY")}</label>
+            <input type="text" className={inputClass} value={form.shrinkageXY} onChange={(e) => setForm({ ...form, shrinkageXY: e.target.value })} placeholder={parentPh("shrinkageXY") ?? t("form.placeholder.shrinkage")}/>
+          </div>
+          <div>
+            <label className={labelClass}>{t("form.shrinkageZ")}</label>
+            <input type="text" className={inputClass} value={form.shrinkageZ} onChange={(e) => setForm({ ...form, shrinkageZ: e.target.value })} placeholder={parentPh("shrinkageZ") ?? t("form.placeholder.shrinkage")}/>
+          </div>
+        </div>
+      </CollapsibleSection>
+
+      <CollapsibleSection id="fan" title={t("form.section.fan")}>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <label className={labelClass}>{t("form.fanMinSpeed")}</label>
+            <input type="number" min="0" max="100" className={inputClass} value={form.fanMinSpeed} onChange={(e) => setForm({ ...form, fanMinSpeed: e.target.value })}/>
+          </div>
+          <div>
+            <label className={labelClass}>{t("form.fanMaxSpeed")}</label>
+            <input type="number" min="0" max="100" className={inputClass} value={form.fanMaxSpeed} onChange={(e) => setForm({ ...form, fanMaxSpeed: e.target.value })}/>
+          </div>
+          <div>
+            <label className={labelClass}>{t("form.fanBridgeSpeed")}</label>
+            <input type="number" min="0" max="100" className={inputClass} value={form.fanBridgeSpeed} onChange={(e) => setForm({ ...form, fanBridgeSpeed: e.target.value })}/>
+          </div>
+          <div>
+            <label className={labelClass}>{t("form.fanDisableFirstLayers")}</label>
+            <input type="number" min="0" className={inputClass} value={form.fanDisableFirstLayers} onChange={(e) => setForm({ ...form, fanDisableFirstLayers: e.target.value })}/>
+          </div>
+          <div>
+            <label className={labelClass}>{t("form.overhangFanSpeed")}</label>
+            <input type="number" min="0" max="100" className={inputClass} value={form.overhangFanSpeed} onChange={(e) => setForm({ ...form, overhangFanSpeed: e.target.value })}/>
+          </div>
+          <div>
+            <label className={labelClass}>{t("form.auxFanSpeed")}</label>
+            <input type="number" min="0" max="100" className={inputClass} value={form.auxFanSpeed} onChange={(e) => setForm({ ...form, auxFanSpeed: e.target.value })}/>
+          </div>
+          <div>
+            <label className={labelClass}>{t("form.fanBelowLayerTime")}</label>
+            <input type="number" min="0" className={inputClass} value={form.fanBelowLayerTime} onChange={(e) => setForm({ ...form, fanBelowLayerTime: e.target.value })} placeholder={t("form.placeholder.fanBelowLayerTime")}/>
+          </div>
+          <div>
+            <label className={labelClass}>{t("form.slowDownMinSpeed")}</label>
+            <input type="number" min="0" className={inputClass} value={form.slowDownMinSpeed} onChange={(e) => setForm({ ...form, slowDownMinSpeed: e.target.value })} placeholder={t("form.placeholder.slowDownMinSpeed")}/>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 mt-3">
+          <input type="checkbox" id="airFiltration" checked={form.activateAirFiltration} onChange={(e) => setForm({ ...form, activateAirFiltration: e.target.checked })} className="w-4 h-4"/>
+          <label htmlFor="airFiltration" className="text-sm font-medium">{t("form.activateAirFiltration")}</label>
+        </div>
+      </CollapsibleSection>
+
+      <CollapsibleSection id="retraction" title={t("form.section.retraction")}>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div>
+            <label className={labelClass}>{t("form.retractLength")}</label>
+            <input type="number" min="0" step="0.1" className={inputClass} value={form.retractLength} onChange={(e) => setForm({ ...form, retractLength: e.target.value })}/>
+          </div>
+          <div>
+            <label className={labelClass}>{t("form.retractSpeed")}</label>
+            <input type="number" min="0" className={inputClass} value={form.retractSpeed} onChange={(e) => setForm({ ...form, retractSpeed: e.target.value })}/>
+          </div>
+          <div>
+            <label className={labelClass}>{t("form.retractZLift")}</label>
+            <input type="number" min="0" step="0.01" className={inputClass} value={form.retractLift} onChange={(e) => setForm({ ...form, retractLift: e.target.value })}/>
+          </div>
+          <div>
+            <label className={labelClass}>{t("form.retractMinTravel")}</label>
+            <input type="number" min="0" step="0.1" className={inputClass} value={form.retractMinTravel} onChange={(e) => setForm({ ...form, retractMinTravel: e.target.value })} placeholder={t("form.placeholder.retractMinTravel")}/>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 mt-3">
+          <input type="checkbox" id="wipe" checked={form.wipe} onChange={(e) => setForm({ ...form, wipe: e.target.checked })} className="w-4 h-4"/>
+          <label htmlFor="wipe" className="text-sm font-medium">{t("form.enableWipe")}</label>
+        </div>
+      </CollapsibleSection>
+
+      <CollapsibleSection id="multi-material" title={t("form.section.multiMaterial")}>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+          <div>
+            <label className={labelClass}>{t("form.loadingSpeed")}</label>
+            <input type="number" min="0" step="0.1" className={inputClass} value={form.filamentLoadingSpeed} onChange={(e) => setForm({ ...form, filamentLoadingSpeed: e.target.value })}/>
+          </div>
+          <div>
+            <label className={labelClass}>{t("form.unloadingSpeed")}</label>
+            <input type="number" min="0" step="0.1" className={inputClass} value={form.filamentUnloadingSpeed} onChange={(e) => setForm({ ...form, filamentUnloadingSpeed: e.target.value })}/>
+          </div>
+          <div>
+            <label className={labelClass}>{t("form.loadTime")}</label>
+            <input type="number" min="0" step="0.1" className={inputClass} value={form.filamentLoadTime} onChange={(e) => setForm({ ...form, filamentLoadTime: e.target.value })}/>
+          </div>
+          <div>
+            <label className={labelClass}>{t("form.unloadTime")}</label>
+            <input type="number" min="0" step="0.1" className={inputClass} value={form.filamentUnloadTime} onChange={(e) => setForm({ ...form, filamentUnloadTime: e.target.value })}/>
+          </div>
+        </div>
+        <div className="mt-3">
+          <label className={labelClass}>{t("form.rammingParameters")}</label>
+          <input className={inputClass} value={form.rammingParameters} onChange={(e) => setForm({ ...form, rammingParameters: e.target.value })} placeholder={t("form.placeholder.rammingParameters")}/>
+        </div>
+      </CollapsibleSection>
+
+      <CollapsibleSection id="material-properties" title={t("form.section.materialProperties")}>
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+        <div>
+          <label className={labelClass}>{t("form.glassTempTransition")}</label>
+          <input type="number" step="1" min="0" className={inputClass} value={form.glassTempTransition} onChange={(e) => setForm({ ...form, glassTempTransition: e.target.value })} placeholder={parentPh("glassTempTransition") ?? t("form.placeholder.glassTempTransition")}/>
+        </div>
+        <div>
+          <label className={labelClass}>{t("form.heatDeflectionTemp")}</label>
+          <input type="number" step="1" min="0" className={inputClass} value={form.heatDeflectionTemp} onChange={(e) => setForm({ ...form, heatDeflectionTemp: e.target.value })} placeholder={parentPh("heatDeflectionTemp") ?? t("form.placeholder.heatDeflectionTemp")}/>
+        </div>
+        <div>
+          <label className={labelClass}>{t("form.transmissionDistance")}</label>
+          <input type="number" step="any" min="0" className={inputClass} value={form.transmissionDistance} onChange={(e) => setForm({ ...form, transmissionDistance: e.target.value })} placeholder={parentPh("transmissionDistance") ?? t("form.placeholder.transmissionDistance")}/>
+        </div>
+        </div>
+      </CollapsibleSection>
+
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+        <div>
+          <label className={labelClass}>{t("form.dryingTemp")}</label>
+          <input className={inputClass} type="number" step="1" min="0" value={form.dryingTemperature} onChange={(e) => setForm({ ...form, dryingTemperature: e.target.value })} placeholder={parentPh("dryingTemperature") ?? t("form.placeholder.dryingTemp")}/>
+        </div>
+        <div>
+          <label className={labelClass}>{t("form.dryingTime")}</label>
+          <input className={inputClass} type="number" step="1" min="0" value={form.dryingTime} onChange={(e) => setForm({ ...form, dryingTime: e.target.value })} placeholder={parentPh("dryingTime") ?? t("form.placeholder.dryingTime")}/>
+        </div>
+        <div>
+          <label className={labelClass}>{t("form.spoolType")}</label>
+          <select className={selectClass} value={form.spoolType} onChange={(e) => setForm({ ...form, spoolType: e.target.value })}>
+            <option value="">—</option>
+            <option value="plastic">{t("form.spoolType.plastic")}</option>
+            <option value="cardboard">{t("form.spoolType.cardboard")}</option>
+            <option value="metal">{t("form.spoolType.metal")}</option>
+            <option value="refill">{t("form.spoolType.refill")}</option>
+          </select>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-4">
+        <div>
+          <label className={labelClass}>{t("form.shoreHardnessA")}</label>
+          <input className={inputClass} type="number" step="1" min="0" max="100" value={form.shoreHardnessA} onChange={(e) => setForm({ ...form, shoreHardnessA: e.target.value })} placeholder={parentPh("shoreHardnessA") ?? t("form.placeholder.shoreHardnessA")}/>
+        </div>
+        <div>
+          <label className={labelClass}>{t("form.shoreHardnessD")}</label>
+          <input className={inputClass} type="number" step="1" min="0" max="100" value={form.shoreHardnessD} onChange={(e) => setForm({ ...form, shoreHardnessD: e.target.value })} placeholder={parentPh("shoreHardnessD") ?? t("form.placeholder.shoreHardnessD")}/>
+        </div>
+      </div>
+
+      <CollapsibleSection id="material-tags" title={t("form.section.materialTags")}>
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+          {[
+            [4, t("form.tag.abrasive")],
+            [13, t("form.tag.waterSoluble")],
+            [9, t("form.tag.flexible")],
+            [31, t("form.tag.carbonFiber")],
+            [0, t("form.tag.glassFiber")],
+            [16, t("form.tag.matte")],
+            [17, t("form.tag.silk")],
+            [22, t("form.tag.sparkle")],
+            [24, t("form.tag.glowInTheDark")],
+            [25, t("form.tag.colorChanging")],
+            [71, t("form.tag.highSpeed")],
+            [49, t("form.tag.recycled")],
+            [2, t("form.tag.transparent")],
+            [3, t("form.tag.translucent")],
+            [19, t("form.tag.woodFill")],
+            [20, t("form.tag.metalFill")],
+            [12, t("form.tag.biodegradable")],
+            [5, t("form.tag.foodSafe")],
+        ].map(([val, label]) => (<label key={val} className="flex items-center gap-2 text-sm">
+              <input type="checkbox" checked={form.optTags.includes(val) || (val === 4 && form.abrasive) || (val === 13 && form.soluble)} onChange={(e) => {
+                const checked = e.target.checked;
+                // Keep abrasive/soluble booleans in sync
+                const updates = {};
+                if (val === 4)
+                    updates.abrasive = checked;
+                if (val === 13)
+                    updates.soluble = checked;
+                setForm((prev) => ({
+                    ...prev,
+                    ...updates,
+                    optTags: checked
+                        ? [...new Set([...prev.optTags, val])]
+                        : prev.optTags.filter((ft) => ft !== val),
+                }));
+            }} className="w-4 h-4"/>
+              {label}
+            </label>))}
+        </div>
+      </CollapsibleSection>
+      </div>
+
+      {/* ── CALIBRATION ────────────────────────────────────────────── */}
+      <div role="tabpanel" id="tabpanel-calibration" aria-labelledby="tab-calibration" data-tab="calibration" hidden={activeTab !== "calibration"} className="space-y-4">
+      <CollapsibleSection id="compatible-nozzles" title={t("form.section.compatibleNozzles")} defaultOpen>
+        {nozzlesLoading ? (<p className="text-sm text-gray-400">{t("form.loadingNozzles")}</p>) : nozzles.length > 0 && (<div className="flex gap-2 mb-2">
+            <button type="button" onClick={() => setForm({ ...form, compatibleNozzles: visibleNozzles.map((n) => n._id) })} className="text-xs text-foreground hover:underline">
+              {t("form.selectAll")}
+            </button>
+            <button type="button" onClick={() => setForm({ ...form, compatibleNozzles: [] })} className="text-xs text-foreground hover:underline">
+              {t("form.clearAll")}
+            </button>
+          </div>)}
+        {!nozzlesLoading && nozzles.length === 0 && (<p className="text-sm text-gray-500">
+            {t("form.noNozzlesDefined")} <a href="/nozzles/new" className="text-foreground hover:underline">{t("form.addOneFirst")}</a>
+          </p>)}
+        {/* #872: when abrasive hides soft nozzles, say so (and why). */}
+        {hiddenSoftNozzleCount > 0 && (<p className="text-xs text-amber-700 dark:text-amber-300 mb-2">
+            {t("form.nozzle.hardenedOnly", { count: hiddenSoftNozzleCount })}
+          </p>)}
+        {nozzles.length > 0 && (<div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {visibleNozzles.map((n) => (<label key={n._id} className={`flex items-center gap-2 p-2 rounded border cursor-pointer text-sm ${form.compatibleNozzles.includes(n._id)
+                    ? "border-primary bg-muted dark:bg-blue-950"
+                    : "border-border dark:border-border"}`}>
+                <input type="checkbox" checked={form.compatibleNozzles.includes(n._id)} onChange={() => toggleNozzle(n._id)} className="w-4 h-4"/>
+                <span>
+                  {n.name}
+                  {/* #872: always show diameter + type so same-diameter nozzles
+                    (e.g. 0.4 Brass vs 0.4 Diamondback) are distinguishable
+                    regardless of how the nozzle was named. */}
+                  <span className="ml-1 text-xs text-gray-500 dark:text-gray-400">
+                    · {n.diameter}mm{nozzleTypeLabel(n.type, t) ? ` ${nozzleTypeLabel(n.type, t)}` : ""}
+                  </span>
+                  {n.highFlow && (<span className="ml-1 px-1.5 py-0.5 bg-amber-200 dark:bg-amber-900 text-amber-800 dark:text-amber-200 rounded text-xs">
+                      HF
+                    </span>)}
+                  {/* #872: a soft nozzle that is still selected on an abrasive
+                    filament is flagged so the user knows to swap it out. */}
+                  {isAbrasive && !n.hardened && (<span className="ml-1 px-1.5 py-0.5 bg-red-200 dark:bg-red-900 text-red-800 dark:text-red-200 rounded text-xs">
+                      {t("form.nozzle.notHardened")}
+                    </span>)}
+                  {n.printers && n.printers.length > 0 && (<span className="ml-1.5 text-xs text-indigo-700 dark:text-indigo-300">
+                      · {n.printers.map((p) => p.name).join(", ")}
+                    </span>)}
+                </span>
+              </label>))}
+          </div>)}
+      </CollapsibleSection>
+
+      {form.compatibleNozzles.length > 0 && (<CollapsibleSection id="calibrations" title={t("form.section.calibrations")} defaultOpen>
+          <p className="text-xs text-gray-500 mb-3">
+            {t("form.calibrationsHint")}
+            {printers.length > 0 && ` ${t("form.calibrationsPrinterHint")}`}
+          </p>
+
+          {/* Printer selector tabs — restricted to printers that
+                physically own at least one of this filament's compatible
+                nozzles. See the `relevantPrinters` memo above for the
+                rationale (a calibration against a printer that doesn't
+                have the nozzle is meaningless). */}
+          {!printersLoading && relevantPrinters.length > 0 && (<div className="flex flex-wrap gap-1 mb-4 border-b border-border dark:border-border pb-2">
+              <button type="button" onClick={() => setSelectedPrinter("default")} className={`px-3 py-1.5 text-sm rounded-t ${effectiveSelectedPrinter === "default"
+                    ? "ui-primary text-white"
+                    : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700"}`}>
+                {t("form.defaultAnyPrinter")}
+              </button>
+              {relevantPrinters.map((p) => (<button key={p._id} type="button" onClick={() => setSelectedPrinter(p._id)} className={`px-3 py-1.5 text-sm rounded-t ${effectiveSelectedPrinter === p._id
+                        ? "ui-primary text-white"
+                        : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700"}`}>
+                  {p.name}
+                </button>))}
+            </div>)}
+
+          {/* Bed type selector tabs */}
+          {!bedTypesLoading && bedTypes.length > 0 && (<div className="flex flex-wrap gap-1 mb-4 border-b border-border dark:border-border pb-2">
+              <button type="button" onClick={() => setSelectedBedType("any")} className={`px-3 py-1.5 text-sm rounded-t ${selectedBedType === "any"
+                    ? "ui-primary text-white"
+                    : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700"}`}>
+                {t("form.cal.anyBed")}
+              </button>
+              {bedTypes.map((b) => (<button key={b._id} type="button" onClick={() => setSelectedBedType(b._id)} className={`px-3 py-1.5 text-sm rounded-t ${selectedBedType === b._id
+                        ? "ui-primary text-white"
+                        : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700"}`}>
+                  {b.name}
+                </button>))}
+            </div>)}
+
+          <div className="space-y-4">
+            {form.compatibleNozzles
+                // Filter calibration rows to nozzles physically installed on
+                // the selected printer. The Default / Any-printer tab keeps
+                // every compatible nozzle so the user can capture the
+                // baseline calibration for each, regardless of which printer
+                // currently owns it.
+                .filter((nozzleId) => {
+                if (effectiveSelectedPrinter === "default")
+                    return true;
+                const nozzle = nozzles.find((n) => n._id === nozzleId);
+                return nozzle?.printers?.some((p) => p._id === effectiveSelectedPrinter) ?? false;
+            })
+                .map((nozzleId) => {
+                const nozzle = nozzles.find((n) => n._id === nozzleId);
+                if (!nozzle)
+                    return null;
+                const printerId = effectiveSelectedPrinter === "default" ? null : effectiveSelectedPrinter;
+                const bedTypeId = selectedBedType === "any" ? null : selectedBedType;
+                const key = calKey(printerId, nozzleId, bedTypeId);
+                const cal = calibrations[key] || emptyCalibrationEntry;
+                // Show default values as placeholders when viewing printer/bed-specific calibrations
+                const defaultKey = calKey(null, nozzleId, null);
+                const isOverride = effectiveSelectedPrinter !== "default" || selectedBedType !== "any";
+                const defaultCal = isOverride ? calibrations[defaultKey] : undefined;
+                // The calibration scope — shown in the card header so it's clear
+                // that switching the printer/bed tab stores values independently.
+                const printerName = effectiveSelectedPrinter === "default"
+                    ? t("form.cal.scope.anyPrinter")
+                    : printers.find((p) => p._id === effectiveSelectedPrinter)?.name ?? "";
+                const bedName = selectedBedType === "any"
+                    ? t("form.cal.scope.anyBed")
+                    : bedTypes.find((b) => b._id === selectedBedType)?.name ?? "";
+                return (<div key={key} className="border border-border dark:border-border rounded p-3">
+                  <div className="mb-2">
+                    <p className="text-sm font-medium">
+                      {nozzle.name}
+                      {nozzle.highFlow && (<span className="ml-1.5 px-1.5 py-0.5 bg-amber-200 dark:bg-amber-900 text-amber-800 dark:text-amber-200 rounded text-xs">
+                          HF
+                        </span>)}
+                    </p>
+                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                      {t("form.cal.scope.for", {
+                        printer: printerName,
+                        bed: bedName,
+                    })}
+                    </p>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div>
+                      <label className="block text-xs text-gray-500 mb-1" title={t("form.tooltip.em")}>{t("form.cal.em")}</label>
+                      <input type="number" min="0" step="0.01" className={inputClass} value={cal.extrusionMultiplier} onChange={(e) => updateCalibration(key, "extrusionMultiplier", e.target.value)} placeholder={defaultCal?.extrusionMultiplier || form.extrusionMultiplier || t("form.base")}/>
+                    </div>
+                    <div>
+                      <label className="block text-xs text-gray-500 mb-1" title={t("form.tooltip.maxVol")}>{t("form.cal.maxVol")}</label>
+                      <input type="number" min="0" step="0.1" className={inputClass} value={cal.maxVolumetricSpeed} onChange={(e) => updateCalibration(key, "maxVolumetricSpeed", e.target.value)} placeholder={defaultCal?.maxVolumetricSpeed || form.maxVolumetricSpeed || t("form.base")}/>
+                    </div>
+                    <div>
+                      <label className="block text-xs text-gray-500 mb-1" title={t("form.tooltip.pa")}>{t("form.cal.pa")}</label>
+                      <input type="number" min="0" step="0.001" className={inputClass} value={cal.pressureAdvance} onChange={(e) => updateCalibration(key, "pressureAdvance", e.target.value)} placeholder={defaultCal?.pressureAdvance || form.pressureAdvance || t("form.base")}/>
+                    </div>
+                    <div>
+                      <label className="block text-xs text-gray-500 mb-1" title={t("form.tooltip.retractLength")}>{t("form.cal.retract")}</label>
+                      <input type="number" min="0" step="0.1" className={inputClass} value={cal.retractLength} onChange={(e) => updateCalibration(key, "retractLength", e.target.value)} placeholder={defaultCal?.retractLength || form.retractLength || t("form.base")}/>
+                    </div>
+                    <div>
+                      <label className="block text-xs text-gray-500 mb-1" title={t("form.tooltip.retractSpeed")}>{t("form.cal.retractSpeed")}</label>
+                      <input type="number" min="0" className={inputClass} value={cal.retractSpeed} onChange={(e) => updateCalibration(key, "retractSpeed", e.target.value)} placeholder={defaultCal?.retractSpeed || form.retractSpeed || t("form.base")}/>
+                    </div>
+                    <div>
+                      <label className="block text-xs text-gray-500 mb-1" title={t("form.tooltip.zLift")}>{t("form.cal.zLift")}</label>
+                      <input type="number" min="0" step="0.01" className={inputClass} value={cal.retractLift} onChange={(e) => updateCalibration(key, "retractLift", e.target.value)} placeholder={defaultCal?.retractLift || form.retractLift || t("form.base")}/>
+                    </div>
+                  </div>
+
+                  {/* Temperature overrides */}
+                  <p className="text-xs font-medium text-gray-500 mt-3 mb-2">{t("form.cal.tempOverrides")}</p>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div>
+                      <label className="block text-xs text-gray-500 mb-1">{t("form.cal.nozzleTemp")}</label>
+                      <input type="number" className={inputClass} value={cal.nozzleTemp} onChange={(e) => updateCalibration(key, "nozzleTemp", e.target.value)} placeholder={defaultCal?.nozzleTemp || form.temperatures.nozzle || t("form.base")}/>
+                    </div>
+                    <div>
+                      <label className="block text-xs text-gray-500 mb-1">{t("form.cal.nozzleTempFirstLayer")}</label>
+                      <input type="number" className={inputClass} value={cal.nozzleTempFirstLayer} onChange={(e) => updateCalibration(key, "nozzleTempFirstLayer", e.target.value)} placeholder={defaultCal?.nozzleTempFirstLayer || form.temperatures.nozzleFirstLayer || t("form.base")}/>
+                    </div>
+                    <div>
+                      <label className="block text-xs text-gray-500 mb-1">{t("form.cal.bedTemp")}</label>
+                      <input type="number" className={inputClass} value={cal.bedTemp} onChange={(e) => updateCalibration(key, "bedTemp", e.target.value)} placeholder={defaultCal?.bedTemp || form.temperatures.bed || t("form.base")}/>
+                    </div>
+                    <div>
+                      <label className="block text-xs text-gray-500 mb-1">{t("form.cal.bedTempFirstLayer")}</label>
+                      <input type="number" className={inputClass} value={cal.bedTempFirstLayer} onChange={(e) => updateCalibration(key, "bedTempFirstLayer", e.target.value)} placeholder={defaultCal?.bedTempFirstLayer || form.temperatures.bedFirstLayer || t("form.base")}/>
+                    </div>
+                    <div>
+                      <label className="block text-xs text-gray-500 mb-1">{t("form.cal.chamberTemp")}</label>
+                      <input type="number" className={inputClass} value={cal.chamberTemp} onChange={(e) => updateCalibration(key, "chamberTemp", e.target.value)} placeholder={defaultCal?.chamberTemp || t("form.base")}/>
+                    </div>
+                  </div>
+
+                  {/* Fan settings */}
+                  <p className="text-xs font-medium text-gray-500 mt-3 mb-2">{t("form.cal.fanSettings")}</p>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div>
+                      <label className="block text-xs text-gray-500 mb-1">{t("form.cal.fanMin")}</label>
+                      <input type="number" min="0" max="100" className={inputClass} value={cal.fanMinSpeed} onChange={(e) => updateCalibration(key, "fanMinSpeed", e.target.value)} placeholder={defaultCal?.fanMinSpeed || t("form.base")}/>
+                    </div>
+                    <div>
+                      <label className="block text-xs text-gray-500 mb-1">{t("form.cal.fanMax")}</label>
+                      <input type="number" min="0" max="100" className={inputClass} value={cal.fanMaxSpeed} onChange={(e) => updateCalibration(key, "fanMaxSpeed", e.target.value)} placeholder={defaultCal?.fanMaxSpeed || t("form.base")}/>
+                    </div>
+                    <div>
+                      <label className="block text-xs text-gray-500 mb-1">{t("form.cal.fanBridge")}</label>
+                      <input type="number" min="0" max="100" className={inputClass} value={cal.fanBridgeSpeed} onChange={(e) => updateCalibration(key, "fanBridgeSpeed", e.target.value)} placeholder={defaultCal?.fanBridgeSpeed || t("form.base")}/>
+                    </div>
+                  </div>
+                </div>);
+            })}
+          </div>
+        </CollapsibleSection>)}
+      </div>
+
+      {/* ── SLICER ─────────────────────────────────────────────────── */}
+      <div role="tabpanel" id="tabpanel-slicer" aria-labelledby="tab-slicer" data-tab="slicer" hidden={activeTab !== "slicer"} className="space-y-4">
+      <CollapsibleSection id="presets" title={t("form.section.presets")} subtitle={t("form.presetsHint")}>
+        <p className="text-xs text-gray-500 mb-3">
+          {t("form.presetsDescription")}
+        </p>
+        {presets.length > 0 && (<div className="space-y-3">
+            {presets.map((preset, idx) => (<div key={preset._uid} className="border border-border dark:border-border rounded p-3">
+                <div className="flex items-center gap-2 mb-2">
+                  <input type="text" aria-label={t("form.placeholder.presetLabel")} className={inputClass} value={preset.label} onChange={(e) => updatePreset(idx, "label", e.target.value)} placeholder={t("form.placeholder.presetLabel")} required/>
+                  <button type="button" onClick={() => removePreset(idx)} className="text-red-500 hover:text-red-700 text-sm flex-shrink-0 px-2" title={t("form.removePreset")}>
+                    ✕
+                  </button>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1" title={t("form.tooltip.em")}>{t("form.cal.em")}</label>
+                    <input type="number" step="0.01" className={inputClass} value={preset.extrusionMultiplier} onChange={(e) => updatePreset(idx, "extrusionMultiplier", e.target.value)} placeholder={form.extrusionMultiplier || t("form.base")}/>
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1">{t("form.preset.nozzle")}</label>
+                    <input type="number" className={inputClass} value={preset.nozzle} onChange={(e) => updatePreset(idx, "nozzle", e.target.value)} placeholder={form.temperatures.nozzle || t("form.base")}/>
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1">{t("form.preset.nozzleFirst")}</label>
+                    <input type="number" className={inputClass} value={preset.nozzleFirstLayer} onChange={(e) => updatePreset(idx, "nozzleFirstLayer", e.target.value)} placeholder={form.temperatures.nozzleFirstLayer || t("form.base")}/>
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1">{t("form.preset.bed")}</label>
+                    <input type="number" className={inputClass} value={preset.bed} onChange={(e) => updatePreset(idx, "bed", e.target.value)} placeholder={form.temperatures.bed || t("form.base")}/>
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1">{t("form.preset.bedFirst")}</label>
+                    <input type="number" className={inputClass} value={preset.bedFirstLayer} onChange={(e) => updatePreset(idx, "bedFirstLayer", e.target.value)} placeholder={form.temperatures.bedFirstLayer || t("form.base")}/>
+                  </div>
+                </div>
+              </div>))}
+          </div>)}
+        <button type="button" onClick={addPreset} className="mt-2 text-sm text-foreground hover:underline">
+          {t("form.addPreset")}
+        </button>
+      </CollapsibleSection>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div>
+          <label htmlFor="filament-diameter" className={labelClass}>{t("form.diameter")}</label>
+          <input id="filament-diameter" type="number" step="0.01" className={inputClass} value={form.diameter} onChange={(e) => setForm({ ...form, diameter: e.target.value })} placeholder={parentPh("diameter")}/>
+        </div>
+        <div>
+          <label className={labelClass}>{t("form.inherits")}</label>
+          <input className={inputClass} value={form.inherits} onChange={(e) => setForm({ ...form, inherits: e.target.value })} placeholder={t("form.placeholder.inherits")}/>
+        </div>
+      </div>
+
+      {/* GH #1066: surface the PrusaSlicer printer-restriction pair. A preset
+            duplicated in the slicer from another printer's profile carries its
+            source's compatible_printers_condition, silently hiding the synced
+            preset on every other printer — with no way to see or clear it
+            in-app before this. Empty = visible for every printer. */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div>
+          <label htmlFor="compat-printers" className={labelClass}>
+            {t("form.compatPrinters")}
+          </label>
+          <input id="compat-printers" className={inputClass} value={form.compatPrinters} onChange={(e) => setForm({ ...form, compatPrinters: e.target.value })} placeholder={t("form.placeholder.compatPrinters")}/>
+        </div>
+        <div>
+          <label htmlFor="compat-printers-condition" className={labelClass}>
+            {t("form.compatPrintersCondition")}
+          </label>
+          <input id="compat-printers-condition" className={inputClass} value={form.compatPrintersCondition} onChange={(e) => setForm({ ...form, compatPrintersCondition: e.target.value })} placeholder={t("form.placeholder.compatPrintersCondition")}/>
+        </div>
+      </div>
+      <p className="text-xs text-gray-500 dark:text-gray-400">
+        {t("form.compatPrinters.hint")}
+      </p>
+
+      <CollapsibleSection id="gcode" title={t("form.section.gcode")}>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <label className={labelClass}>{t("form.startGcode")}</label>
+            <textarea className={inputClass} rows={3} value={form.startGcode} onChange={(e) => setForm({ ...form, startGcode: e.target.value })} placeholder={t("form.placeholder.startGcode")}/>
+          </div>
+          <div>
+            <label className={labelClass}>{t("form.endGcode")}</label>
+            <textarea className={inputClass} rows={3} value={form.endGcode} onChange={(e) => setForm({ ...form, endGcode: e.target.value })} placeholder={t("form.placeholder.endGcode")}/>
+          </div>
+        </div>
+      </CollapsibleSection>
+      </div>
+
+      <button type="submit" disabled={saving} className="px-6 py-2 ui-primary text-white rounded hover:opacity-90 disabled:opacity-50">
+        {submitLabel}
+      </button>
+    </form>
+    </div>);
+}
+/**
+ * GH #477 — Multi-color editor + arrangement radio.
+ *
+ * Renders below the primary color picker. The arrangement radio toggles
+ * the canonical OpenPrintTag arrangement tags (GH #507: 27 = gradient,
+ * 28 = dual_color, 29 = triple_color — both 28 and 29 render coextruded)
+ * in the user's `optTags` array — there's no separate "arrangement" field
+ * on the schema, just bits in the existing tags
+ * list. When the user opts into the multi-color treatment we surface
+ * 0–5 secondary-color slots; the swatch preview to the right updates
+ * live so the user sees what the list / detail page will render.
+ *
+ * Kept as a sub-component so the (already very long) FilamentForm body
+ * doesn't grow another 100 lines. State stays in the parent — we read
+ * `form` / call `setForm` — so the existing dirty-tracking +
+ * unsaved-changes guard work unchanged.
+ */
+function MultiColorEditor({ form, setForm, t, }) {
+    const arrangement = deriveArrangement(form.optTags);
+    /** Toggle a single arrangement tag on/off in optTags, removing every
+     *  other arrangement tag so they're always mutually exclusive from
+     *  the UI's perspective.
+     *
+     *  GH #507: arrangement is driven by the canonical OPT_TAG enum —
+     *  27 = gradient, 28 = dual_color, 29 = triple_color. Both 28 and 29
+     *  surface as `"coextruded"` at render time; `arrangementToOptTag`
+     *  picks dual vs triple based on the current secondary-color count
+     *  so toggling the radio writes the right id. `stripArrangementTags`
+     *  removes ALL three so a prior arrangement's tag doesn't survive
+     *  the switch (pre-fix, swapping gradient → coextruded left tag 27
+     *  on the doc and deriveArrangement would then disagree with the
+     *  UI on the next render).
+     *
+     *  Coextruded + gradient simultaneously is theoretically possible per
+     *  spec but the form only models one arrangement at a time. */
+    const setArrangement = (next) => {
+        const stripped = stripArrangementTags(form.optTags);
+        const newTag = arrangementToOptTag(next, form.secondaryColors.length);
+        setForm({
+            ...form,
+            optTags: newTag != null ? [...stripped, newTag] : stripped,
+        });
+    };
+    /** GH #507: when the user adds/removes a coextruded secondary slot,
+     *  refresh the arrangement tag so dual→triple (or back) flips on the
+     *  saved doc without the user having to re-click the radio. Gradient
+     *  + solid don't carry a count distinction so they're untouched. */
+    const refreshArrangementTagForCount = (nextSecondaries, optTagsAfter) => {
+        if (arrangement !== "coextruded")
+            return optTagsAfter;
+        const stripped = stripArrangementTags(optTagsAfter);
+        const newTag = arrangementToOptTag("coextruded", nextSecondaries.length);
+        return newTag != null ? [...stripped, newTag] : stripped;
+    };
+    // GH #637: stable row keys. `form.secondaryColors` is a plain string[]
+    // shared with the parent form's prefill/submit paths, so rows carry no
+    // natural id — a parallel uid list gives each slot the stable key that
+    // bedTypeTemps/presets/amsSlots rows carry as `_uid` (see the makeUid
+    // docblock for why index keys jump focus on mid-list deletes). The
+    // add/remove handlers keep `uids` in lockstep with the array; a render-
+    // time length reconcile covers external resizes (NFC/clone prefill) via
+    // React's "adjust state during render" pattern — keeps existing rows'
+    // uids, only the appended/trimmed tail changes.
+    const [uids, setUids] = useState(() => form.secondaryColors.map(() => makeUid()));
+    if (uids.length !== form.secondaryColors.length) {
+        setUids((prev) => {
+            const next = prev.slice(0, form.secondaryColors.length);
+            while (next.length < form.secondaryColors.length)
+                next.push(makeUid());
+            return next;
+        });
+    }
+    const addColor = () => {
+        if (form.secondaryColors.length >= 5)
+            return; // spec cap
+        const nextSecondaries = [...form.secondaryColors, "#808080"];
+        setUids((prev) => [...prev, makeUid()]);
+        setForm({
+            ...form,
+            secondaryColors: nextSecondaries,
+            optTags: refreshArrangementTagForCount(nextSecondaries, form.optTags),
+        });
+    };
+    const removeColor = (idx) => {
+        // Drop the removed row's uid (not the last one) so the rows after it
+        // keep their keys — and the focus-sensitive hex inputs keep their DOM
+        // nodes — across a mid-list delete.
+        setUids((prev) => prev.filter((_, i) => i !== idx));
+        const nextSecondaries = form.secondaryColors.filter((_, i) => i !== idx);
+        setForm({
+            ...form,
+            secondaryColors: nextSecondaries,
+            optTags: refreshArrangementTagForCount(nextSecondaries, form.optTags),
+        });
+    };
+    const setColorAt = (idx, hex) => {
+        const next = [...form.secondaryColors];
+        next[idx] = hex;
+        setForm({ ...form, secondaryColors: next });
+    };
+    const labelClass = "block text-sm font-medium text-gray-900 dark:text-gray-100 mb-1";
+    const radioBase = "px-3 py-1.5 text-sm rounded border cursor-pointer transition-colors";
+    return (<fieldset className="border border-border dark:border-border rounded p-3 space-y-3">
+      <legend className="px-2 text-sm font-medium">
+        {t("form.multiColor.title")}
+      </legend>
+
+      {/* Arrangement radio — three exclusive options driving optTags
+            28/29. "None" clears both, "Coextruded" sets 29, "Gradient"
+            sets 28. */}
+      <div>
+        <span className={labelClass}>{t("form.multiColor.arrangement")}</span>
+        <div className="flex flex-wrap gap-2" role="radiogroup" aria-label={t("form.multiColor.arrangement")}>
+          {["solid", "coextruded", "gradient"].map((opt) => {
+            const active = arrangement === opt;
+            return (<label key={opt} className={`${radioBase} ${active
+                    ? "border-primary bg-muted dark:bg-blue-950 text-foreground dark:text-foreground font-medium"
+                    : "border-border dark:border-border hover:border-gray-400 dark:hover:border-gray-500"}`}>
+                  <input type="radio" name="filament-arrangement" value={opt} checked={active} onChange={() => setArrangement(opt)} className="sr-only"/>
+                  {t(`form.multiColor.arrangement.${opt}`)}
+                </label>);
+        })}
+        </div>
+        {arrangement === "coextruded" && (<p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+            {t("form.multiColor.coextrudedHint")}
+          </p>)}
+        {arrangement === "gradient" && (<p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+            {t("form.multiColor.gradientHint")}
+          </p>)}
+      </div>
+
+      {/* Secondary color slots — only render when the user has chosen a
+            multi-color arrangement OR already has secondaries set. Lets
+            a "solid" single-color filament keep a quiet form. */}
+      {(arrangement !== "solid" || form.secondaryColors.length > 0) && (<div>
+          <div className="flex items-center justify-between mb-2">
+            <span className={labelClass}>
+              {t("form.multiColor.secondaryColors")}
+              <span className="ml-1 text-xs text-gray-500 font-normal">
+                ({form.secondaryColors.length}/5)
+              </span>
+            </span>
+            <button type="button" onClick={addColor} disabled={form.secondaryColors.length >= 5} className="px-2 py-1 text-xs border border-border dark:border-border rounded hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed">
+              + {t("form.multiColor.addColor")}
+            </button>
+          </div>
+          {form.secondaryColors.length === 0 ? (<p className="text-xs text-gray-500 dark:text-gray-400 italic">
+              {t("form.multiColor.noColorsYet")}
+            </p>) : (<ul className="space-y-1.5">
+              {form.secondaryColors.map((c, i) => (<li key={uids[i] ?? i} className="flex gap-2 items-center">
+                  <span className="text-xs text-gray-500 w-6 text-right select-none">
+                    #{i + 2}
+                  </span>
+                  <input type="color" aria-label={t("form.multiColor.colorAriaLabel", {
+                        n: i + 2,
+                    })} className="h-9 w-11 rounded border border-border dark:border-border cursor-pointer bg-transparent flex-shrink-0" value={c} onChange={(e) => setColorAt(i, e.target.value)}/>
+                  <input type="text" inputMode="text" className="flex-1 min-w-0 px-3 py-2 border border-border dark:border-border rounded text-sm bg-transparent font-mono uppercase" value={c} placeholder="#RRGGBB" maxLength={7} onChange={(e) => {
+                        const raw = e.target.value.trim();
+                        let v = raw.startsWith("#") ? raw : `#${raw}`;
+                        v = "#" + v.slice(1).replace(/[^0-9a-fA-F]/g, "");
+                        setColorAt(i, v.slice(0, 7));
+                    }}/>
+                  <button type="button" onClick={() => removeColor(i)} aria-label={t("form.multiColor.removeColor", { n: i + 2 })} className="px-2 py-1 text-xs text-red-600 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-950 rounded">
+                    ×
+                  </button>
+                </li>))}
+            </ul>)}
+          {/* Live preview using the same swatch the list / detail page
+                renders — the user sees exactly what their multi-color
+                filament will look like everywhere else. Codex P2 on PR
+                #483: mirror the submit handler's "coextruded clears
+                primary to null" so the preview doesn't show a phantom
+                extra gray stripe (#808080) that would disappear after
+                save. For coextruded, only secondaryColors paint the
+                swatch — exactly what the list/detail view will render. */}
+          <div className="mt-2 flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
+            <span>{t("form.multiColor.preview")}:</span>
+            <FilamentSwatch color={arrangement === "coextruded" ? null : form.color} secondaryColors={form.secondaryColors} arrangement={arrangement} size={40}/>
+          </div>
+        </div>)}
+    </fieldset>);
+}

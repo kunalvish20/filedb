@@ -1,0 +1,194 @@
+/**
+ * Resolves a filament's effective values by merging parent defaults with variant overrides.
+ *
+ * For variants (filaments with a parentId), fields set to null/undefined inherit from the parent.
+ * Fields with explicit values on the variant override the parent.
+ *
+ * The `color` field always comes from the variant itself (never inherited).
+ * The `name` field always comes from the variant itself.
+ * The `settings` bag is shallow-merged: parent settings as base, variant settings as overrides.
+ */
+/**
+ * Fields that are always variant-specific and never inherited.
+ *
+ * GH #633: `_purged` and `openprinttagSnapshot` are bookkeeping fields
+ * (sync tombstone / OPT re-sync provenance) — they describe THIS document,
+ * never the parent, so a resolved variant must carry its own values.
+ * `lowStockThreshold` is variant-only too: it's an inventory setting read
+ * raw (no parent fallback) by the `/api/filaments` list aggregation and
+ * the dashboard low-stock loop, so inheriting it here would make a
+ * variant's detail/export view disagree with its list badge + dashboard
+ * card (Codex P2 on PR #648). Keeping it variant-only still fixes the
+ * original silent-drop bug — it's now in an allowlist rather than neither.
+ * Exported (along with INHERITABLE_FIELDS) so the schema-drift guard in
+ * tests/resolveFilament.test.ts can diff the allowlists against the
+ * Filament schema's top-level paths — a new schema field that lands in
+ * neither list would otherwise silently vanish from every resolved variant.
+ */
+export const VARIANT_ONLY_FIELDS = ["_id", "name", "color", "colorName", "parentId", "spools", "createdAt", "updatedAt", "__v", "instanceId", "syncId", "_deletedAt", "_purged", "totalWeight", "openprinttagSnapshot", "lowStockThreshold", "promotionInFlight", "promotedByToken"];
+/** Numeric/string fields that can be inherited from parent */
+export const INHERITABLE_FIELDS = [
+    "vendor",
+    "type",
+    "cost",
+    "density",
+    "diameter",
+    "maxVolumetricSpeed",
+    "spoolWeight",
+    "netFilamentWeight",
+    "dryingTemperature",
+    "dryingTime",
+    "transmissionDistance",
+    "glassTempTransition",
+    "heatDeflectionTemp",
+    "shoreHardnessA",
+    "shoreHardnessD",
+    "minPrintSpeed",
+    "maxPrintSpeed",
+    "spoolType",
+    "tdsUrl",
+    "inherits",
+    "shrinkageXY",
+    "shrinkageZ",
+];
+/**
+ * Resolve a filament by merging parent defaults with variant overrides.
+ * Returns a new object with all resolved values plus `_inherited` metadata
+ * indicating which fields came from the parent.
+ */
+export function resolveFilament(filament, parent) {
+    // No parent = standalone filament, nothing to resolve
+    if (!parent || !filament.parentId) {
+        return { ...filament, _inherited: [] };
+    }
+    const resolved = {};
+    const inherited = [];
+    // Copy variant-only fields directly
+    for (const field of VARIANT_ONLY_FIELDS) {
+        resolved[field] = filament[field];
+    }
+    // Resolve inheritable scalar fields
+    for (const field of INHERITABLE_FIELDS) {
+        const variantVal = filament[field];
+        if (variantVal != null && variantVal !== "") {
+            resolved[field] = variantVal;
+        }
+        else {
+            resolved[field] = parent[field];
+            if (parent[field] != null) {
+                inherited.push(field);
+            }
+        }
+    }
+    // Resolve temperatures (nested object)
+    const variantTemps = filament.temperatures || {};
+    const parentTemps = parent.temperatures || {};
+    resolved.temperatures = {
+        nozzle: variantTemps.nozzle ?? parentTemps.nozzle ?? null,
+        nozzleFirstLayer: variantTemps.nozzleFirstLayer ?? parentTemps.nozzleFirstLayer ?? null,
+        bed: variantTemps.bed ?? parentTemps.bed ?? null,
+        bedFirstLayer: variantTemps.bedFirstLayer ?? parentTemps.bedFirstLayer ?? null,
+        nozzleRangeMin: variantTemps.nozzleRangeMin ?? parentTemps.nozzleRangeMin ?? null,
+        nozzleRangeMax: variantTemps.nozzleRangeMax ?? parentTemps.nozzleRangeMax ?? null,
+        standby: variantTemps.standby ?? parentTemps.standby ?? null,
+    };
+    for (const tempField of ["nozzle", "nozzleFirstLayer", "bed", "bedFirstLayer", "nozzleRangeMin", "nozzleRangeMax", "standby"]) {
+        if (variantTemps[tempField] == null &&
+            parentTemps[tempField] != null) {
+            inherited.push(`temperatures.${tempField}`);
+        }
+    }
+    // Array fields (compatibleNozzles / optTags / bedTypeTemps / calibrations /
+    // presets) inherit from the parent when the variant's array is empty.
+    //
+    // We used to treat `undefined` as "inherit" and `[]` as "explicit override
+    // to empty", but Mongoose always materialises array schema fields as `[]`
+    // at load time — `undefined` was unreachable in practice, so variants
+    // silently failed to inherit any array field. Treating empty === inherit
+    // matches what users expect (GH #106 — "clone should track parent
+    // ongoing, not snapshot once").
+    //
+    // Trade-off: there's no way to explicitly say "this variant has zero
+    // calibrations even though the parent has some". That's a rare case —
+    // when it comes up, either drop the parent link or add a sentinel
+    // override field in a future iteration.
+    if (filament.compatibleNozzles && filament.compatibleNozzles.length > 0) {
+        resolved.compatibleNozzles = filament.compatibleNozzles;
+    }
+    else {
+        resolved.compatibleNozzles = parent.compatibleNozzles || [];
+        if (parent.compatibleNozzles?.length > 0) {
+            inherited.push("compatibleNozzles");
+        }
+    }
+    if (filament.optTags && filament.optTags.length > 0) {
+        resolved.optTags = filament.optTags;
+    }
+    else {
+        resolved.optTags = parent.optTags || [];
+        if (parent.optTags?.length > 0) {
+            inherited.push("optTags");
+        }
+    }
+    // GH #477: secondaryColors inherits as a whole array (same pattern as
+    // optTags above). Per-slot inheritance would let a variant override slot
+    // 2 only and create a Frankenfilament whose effective colors come from
+    // two different filaments — that ambiguity isn't worth the flexibility.
+    // Variant declares its own non-empty array to override; otherwise it
+    // inherits the parent's full array.
+    if (filament.secondaryColors && filament.secondaryColors.length > 0) {
+        resolved.secondaryColors = filament.secondaryColors;
+    }
+    else {
+        resolved.secondaryColors = parent.secondaryColors || [];
+        if (parent.secondaryColors?.length > 0) {
+            inherited.push("secondaryColors");
+        }
+    }
+    if (filament.bedTypeTemps && filament.bedTypeTemps.length > 0) {
+        resolved.bedTypeTemps = filament.bedTypeTemps;
+    }
+    else {
+        resolved.bedTypeTemps = parent.bedTypeTemps || [];
+        if (parent.bedTypeTemps?.length > 0) {
+            inherited.push("bedTypeTemps");
+        }
+    }
+    if (filament.calibrations && filament.calibrations.length > 0) {
+        resolved.calibrations = filament.calibrations;
+    }
+    else {
+        resolved.calibrations = parent.calibrations || [];
+        if (parent.calibrations?.length > 0) {
+            inherited.push("calibrations");
+        }
+    }
+    if (filament.presets && filament.presets.length > 0) {
+        resolved.presets = filament.presets;
+    }
+    else {
+        resolved.presets = parent.presets || [];
+        if (parent.presets?.length > 0) {
+            inherited.push("presets");
+        }
+    }
+    // Resolve settings — shallow merge, variant overrides parent
+    const parentSettings = parent.settings || {};
+    const variantSettings = filament.settings || {};
+    resolved.settings = { ...parentSettings, ...variantSettings };
+    if (Object.keys(parentSettings).length > 0 && Object.keys(variantSettings).length === 0) {
+        inherited.push("settings");
+    }
+    resolved._inherited = inherited;
+    return resolved;
+}
+/**
+ * Check if a filament is a parent (has variants pointing to it).
+ * This is a query helper — call with the Filament model.
+ */
+export async function hasVariants(
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+FilamentModel, parentId) {
+    const count = await FilamentModel.countDocuments({ parentId, _deletedAt: null });
+    return count > 0;
+}

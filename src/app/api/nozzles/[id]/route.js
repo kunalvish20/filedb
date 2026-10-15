@@ -1,0 +1,156 @@
+import { NextResponse } from "next/server";
+import dbConnect from "@/lib/mongodb";
+import Nozzle from "@/models/Nozzle";
+import Filament from "@/models/Filament";
+import Printer from "@/models/Printer";
+import { errorResponse, errorResponseFromCaught, handleDuplicateKeyError } from "@/lib/apiErrorHandler";
+import { assertSameOriginRequest } from "@/lib/requestGuard";
+import { validateNozzlePrinterAssignment } from "@/lib/nozzlePrinterAssignment";
+export async function GET(_request, { params }) {
+    try {
+        await dbConnect();
+        const { id } = await params;
+        const nozzle = await Nozzle.findOne({ _id: id, _deletedAt: null }).lean();
+        if (!nozzle) {
+            return errorResponse("Not found", 404);
+        }
+        // Attach the list of printers this nozzle is installed in (reverse lookup
+        // through Printer.installedNozzles) so the edit form can show the current
+        // assignment.
+        const printers = await Printer.find({
+            _deletedAt: null,
+            installedNozzles: id,
+        })
+            .select("_id name")
+            .lean();
+        return NextResponse.json({ ...nozzle, printers });
+    }
+    catch (err) {
+        return errorResponseFromCaught(err, "Failed to fetch nozzle");
+    }
+}
+export async function PUT(request, { params }) {
+    const guard = assertSameOriginRequest(request);
+    if (guard)
+        return guard;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let body;
+    try {
+        body = await request.json();
+    }
+    catch {
+        return errorResponse("Invalid JSON in request body", 400);
+    }
+    try {
+        await dbConnect();
+        const { id } = await params;
+        delete body._id;
+        delete body._deletedAt;
+        delete body.createdAt;
+        delete body.updatedAt;
+        delete body.__v;
+        delete body.instanceId;
+        delete body.syncId;
+        // GH #424: replace the "delete each known leak field + spread the rest"
+        // pattern with an explicit allowlist so a future schema field doesn't
+        // become automatically client-writable. Matches the Filament PUT
+        // posture.
+        const update = {};
+        if ("name" in body)
+            update.name = body.name;
+        if ("diameter" in body)
+            update.diameter = body.diameter;
+        if ("type" in body)
+            update.type = body.type;
+        if ("highFlow" in body)
+            update.highFlow = body.highFlow;
+        if ("hardened" in body)
+            update.hardened = body.hardened;
+        if ("notes" in body)
+            update.notes = body.notes;
+        // If the client sent `printerIds`, sync Printer.installedNozzles to match:
+        // any printer in the list gets this nozzle added, any other printer that
+        // currently has it installed gets it removed. This lets the nozzle edit
+        // form manage the assignment from the nozzle side while the Printer form
+        // continues to manage it from the printer side.
+        //
+        // GH #897 / #912 (Codex P2): VALIDATE printerIds BEFORE mutating the nozzle,
+        // so a rejected assignment (multi-printer, bad/missing target) doesn't leave
+        // the nozzle partially updated (e.g. renamed but the request 400s).
+        // A single physical nozzle lives in at most ONE printer (#232); the
+        // nozzle-side assignment is AUTHORITATIVE (auto-move) — the $pull below
+        // displaces the previous claim — but it can't be in two printers at once.
+        // The dedupe → one-printer → ObjectId → existence sequence lives in the
+        // shared validateNozzlePrinterAssignment helper so the POST route (#1083)
+        // enforces the identical contract and the two can't drift.
+        const assignment = await validateNozzlePrinterAssignment(body.printerIds, (targetId) => Printer.findOne({ _id: targetId, _deletedAt: null }, { _id: 1 }).lean());
+        if (!assignment.ok) {
+            return errorResponse(assignment.message, 400);
+        }
+        const { printerIds, targetId: validatedTargetId } = assignment;
+        const nozzle = await Nozzle.findOneAndUpdate({ _id: id, _deletedAt: null }, update, { returnDocument: "after", runValidators: true }).lean();
+        if (!nozzle) {
+            return errorResponse("Not found", 404);
+        }
+        if (printerIds !== undefined) {
+            if (validatedTargetId) {
+                await Printer.updateMany({ _id: validatedTargetId, _deletedAt: null }, { $addToSet: { installedNozzles: id } });
+            }
+            // Auto-move: remove this nozzle from every OTHER printer that has it
+            // (one-printer-per-nozzle). An empty printerIds clears the assignment.
+            await Printer.updateMany({ _id: { $nin: printerIds }, _deletedAt: null, installedNozzles: id }, { $pull: { installedNozzles: id } });
+        }
+        return NextResponse.json(nozzle);
+    }
+    catch (err) {
+        const dupResponse = handleDuplicateKeyError(err, "nozzle");
+        if (dupResponse)
+            return dupResponse;
+        return errorResponseFromCaught(err, "Failed to update nozzle");
+    }
+}
+export async function DELETE(request, { params }) {
+    const guard = assertSameOriginRequest(request);
+    if (guard)
+        return guard;
+    try {
+        await dbConnect();
+        const { id } = await params;
+        // Prevent deleting a nozzle that is referenced by any filament.
+        //
+        // GH #629: trashed filaments count too — a filament in the trash can be
+        // restored, which would resurrect a dangling nozzle ref if the nozzle
+        // were deleted in the meantime. Only `_purged` tombstones are gone
+        // forever and don't block.
+        const referencingCount = await Filament.countDocuments({
+            _purged: { $ne: true },
+            $or: [
+                { compatibleNozzles: id },
+                { "calibrations.nozzle": id },
+            ],
+        });
+        if (referencingCount > 0) {
+            return errorResponse(`Cannot delete this nozzle — it is referenced by ${referencingCount} filament${referencingCount !== 1 ? "s" : ""}, possibly including filaments in the trash. Remove it from those filaments (or permanently delete the trashed ones) first.`, 400);
+        }
+        // Prevent deleting a nozzle that is installed on any printer.
+        // Deliberately keeps the `_deletedAt: null` term (unlike the filament
+        // guard above): printers have no trash/restore loop, so a soft-deleted
+        // printer's refs can never resurrect — and counting them would block
+        // the delete with no way for the user to clear the reference.
+        const printerCount = await Printer.countDocuments({
+            _deletedAt: null,
+            installedNozzles: id,
+        });
+        if (printerCount > 0) {
+            return errorResponse(`Cannot delete this nozzle — it is installed on ${printerCount} printer${printerCount !== 1 ? "s" : ""}. Remove it from those printers first.`, 400);
+        }
+        const nozzle = await Nozzle.findOneAndUpdate({ _id: id, _deletedAt: null }, { _deletedAt: new Date() }, { returnDocument: "after" }).lean();
+        if (!nozzle) {
+            return errorResponse("Not found", 404);
+        }
+        return NextResponse.json({ message: "Deleted" });
+    }
+    catch (err) {
+        return errorResponseFromCaught(err, "Failed to delete nozzle");
+    }
+}

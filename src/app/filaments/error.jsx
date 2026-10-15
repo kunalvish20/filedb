@@ -1,0 +1,20 @@
+"use client";
+import Link from "next/link";
+import { useTranslation } from "@/i18n/TranslationProvider";
+export default function FilamentsError({ error, reset, }) {
+    const { t } = useTranslation();
+    return (<div className="max-w-2xl mx-auto p-8 text-center">
+      <h2 className="text-xl font-bold text-red-600 dark:text-red-400 mb-2">{t("error.failedToLoadFilaments")}</h2>
+      <p className="text-gray-600 dark:text-gray-400 text-sm mb-6">
+        {error.message || t("error.unexpected")}
+      </p>
+      <div className="flex gap-3 justify-center">
+        <button onClick={reset} className="px-6 py-2 ui-primary text-white rounded hover:opacity-90">
+          {t("error.tryAgain")}
+        </button>
+        <Link href="/" className="px-6 py-2 bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white rounded hover:bg-gray-300 dark:hover:bg-gray-600">
+          {t("error.goHome")}
+        </Link>
+      </div>
+    </div>);
+}

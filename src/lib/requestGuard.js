@@ -1,0 +1,222 @@
+import { errorResponse } from "@/lib/apiErrorHandler";
+/** Split a `host`, `host:port`, `[ipv6]` or `[ipv6]:port` value into a
+ * lower-cased hostname and its (possibly empty) port. */
+function splitAuthority(value) {
+    const v = value.trim();
+    if (v.startsWith("[")) {
+        const end = v.indexOf("]");
+        const hostname = (end !== -1 ? v.slice(1, end) : v.slice(1)).toLowerCase();
+        const port = end !== -1 && v[end + 1] === ":" ? v.slice(end + 2) : "";
+        return { hostname, port };
+    }
+    const colon = v.indexOf(":");
+    return colon !== -1
+        ? { hostname: v.slice(0, colon).toLowerCase(), port: v.slice(colon + 1) }
+        : { hostname: v.toLowerCase(), port: "" };
+}
+/**
+ * GH #252: trusted-origin guard for destructive / admin API routes —
+ * snapshot export·restore·wipe, the MongoDB connection test, and the
+ * Atlas import.
+ *
+ * The app serves an UNAUTHENTICATED HTTP server (the Electron renderer
+ * and a web/Docker deployment both talk to it same-origin). Without a
+ * guard, any web page the user visits can drive these routes
+ * cross-origin (CSRF): wipe the database, exfiltrate a snapshot, or
+ * make the server open MongoDB connections to probe the LAN.
+ *
+ * The guard rejects requests that carry cross-origin browser
+ * provenance:
+ *   - `Sec-Fetch-Site` present and not `same-origin` / `none` — every
+ *     modern browser tags each request; a CSRF request reads
+ *     `cross-site` or `same-site`.
+ *   - an `Origin` header whose host does not match the request `Host`.
+ *
+ * A non-browser client (curl, a slicer integration script) sends
+ * neither header and cannot be a CSRF vector, so it passes — this is a
+ * CSRF / trusted-origin guard, not an authentication layer. Protecting
+ * an instance that is reachable from an untrusted network is a
+ * deployment concern the README already calls out.
+ *
+ * Returns a 403 `NextResponse` to short-circuit the handler, or `null`
+ * when the request may proceed.
+ */
+export function assertSameOriginRequest(request) {
+    const secFetchSite = request.headers.get("sec-fetch-site");
+    if (secFetchSite &&
+        secFetchSite !== "same-origin" &&
+        secFetchSite !== "none") {
+        return errorResponse("Cross-origin request to a protected route was rejected.", 403);
+    }
+    const origin = request.headers.get("origin");
+    if (origin) {
+        const hostHeader = request.headers.get("host");
+        if (!hostHeader) {
+            return errorResponse("Cross-origin request to a protected route was rejected.", 403);
+        }
+        let originUrl;
+        try {
+            originUrl = new URL(origin);
+        }
+        catch {
+            return errorResponse("Cross-origin request to a protected route was rejected.", 403);
+        }
+        // Compare the full authority — hostname AND port. A hostname-only
+        // check is too lenient: when `Sec-Fetch-Site` is absent (older
+        // browsers, embedded webviews, intermediaries that strip Fetch
+        // Metadata) a cross-origin request from the SAME host but a
+        // different port would otherwise slip through (Codex review).
+        // Ports are normalised against the Origin's scheme default, so an
+        // explicit `:443`/`:80` on one side and an omitted default on the
+        // other still compare equal — no false-reject on the PORT behind a
+        // proxy. GH #899/#924: this normalisation only covers the port. The HOST
+        // is compared against the raw `Host` header and `X-Forwarded-Host` is NOT
+        // consulted. This check runs even when `Sec-Fetch-Site` was accepted above
+        // (the function doesn't early-return), and browsers DO send `Origin` on
+        // same-origin mutating requests (POST/PUT/PATCH/DELETE) — so a reverse
+        // proxy that rewrites Host to the upstream address (e.g. nginx's bare
+        // `proxy_pass`) makes EVERY browser mutation through it look cross-origin
+        // and 403, not just non-Fetch-Metadata clients. The proxy MUST preserve
+        // the original Host authority INCLUDING port (`proxy_set_header Host
+        // $http_host`; Caddy does by default) — documented in docs/setup.md.
+        // Forwarded headers are deliberately not trusted here: spoofable by a
+        // direct (non-proxied) client, and the only safe deployment already
+        // requires the app to be loopback-bound with the proxy as the sole ingress.
+        const defaultPort = originUrl.protocol === "https:" ? "443" : "80";
+        const originHostname = originUrl.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+        const originPort = originUrl.port || defaultPort;
+        const hostParts = splitAuthority(hostHeader);
+        const hostPort = hostParts.port || defaultPort;
+        if (originHostname !== hostParts.hostname || originPort !== hostPort) {
+            return errorResponse("Cross-origin request to a protected route was rejected.", 403);
+        }
+    }
+    return null;
+}
+/**
+ * Path segments that must never appear in a client-supplied update document.
+ *
+ * Anchored on a segment boundary (`^` or `.`) at both ends so it matches the
+ * dotted-path grammar Mongo/Mongoose use — `__proto__`, `__proto__.x`,
+ * `a.__proto__`, `a.constructor.b` — while leaving legitimate field names that
+ * merely CONTAIN one of the words alone (e.g. a hypothetical
+ * `prototypeNotes`).
+ */
+const UNSAFE_UPDATE_PATH_RE = /(^|\.)(__proto__|constructor|prototype)(\.|$)/;
+/**
+ * GH #1026: reject a client update body carrying a prototype-polluting key.
+ *
+ * GHSA-664h-wqgq-64gw — a `__proto__`-prefixed DOTTED key (e.g.
+ * `{"__proto__.x": 1}`) reaching Mongoose's update casting pollutes
+ * `Object.prototype`. `Schema.prototype.path()` does an unguarded
+ * `this.paths[path]` lookup on a plain object, so `"__proto__"` resolves up the
+ * prototype chain and returns `Object.prototype` itself; `_getSchema` then
+ * treats that as a schematype and writes `$fullPath` onto it — ENUMERABLE, so
+ * it leaks into every `for...in` in the process. Confirmed reproducible on
+ * mongoose 9.5.0 through `PUT /api/filaments/{id}`, which also 500s.
+ *
+ * Fixed upstream in mongoose >= 9.7.2 (this repo pins the patched floor). This
+ * guard is the belt-and-braces layer so a future regression, a downgraded
+ * lockfile, or a newly-added raw-body route cannot silently reopen it.
+ *
+ * WHERE TO USE IT: any handler that forwards a client-shaped object into an
+ * update. Today that is exactly ONE route — `PUT /api/filaments/{id}`, which
+ * passes the parsed body straight to `findOneAndUpdate`. Every other mutating
+ * route builds its update from string-LITERAL keys (`update.name = body.name`,
+ * `update["spools.$.totalWeight"] = …`), so no client-controlled key can reach
+ * the update document and the guard would be dead code there. Add the call
+ * alongside the existing `$`-operator check if you ever introduce another
+ * raw-body passthrough.
+ *
+ * Sibling of the `$`-operator guard in that route: that one blocks Mongo
+ * UPDATE OPERATORS, this one blocks PROTOTYPE PATHS. Neither subsumes the
+ * other — `"__proto__.x".startsWith("$")` is false.
+ *
+ * Only own enumerable keys are inspected, which is what `findOneAndUpdate`
+ * casts. Returns a 400 `NextResponse` to short-circuit the handler, or `null`
+ * when the body may proceed.
+ */
+/**
+ * GH #1072 (item 3): the SERVER-OWNED Filament fields a client body must
+ * never write — directly or via a dotted update path. One list shared by
+ * `POST /api/filaments` and `PUT /api/filaments/{id}` so the two strips
+ * cannot drift, and so a future server-owned field added here is swept from
+ * both routes (exact key AND dotted subpaths) by construction.
+ *
+ * Why each is here:
+ *   - `_id` / `createdAt` / `updatedAt` / `__v` — Mongo/Mongoose bookkeeping.
+ *   - `_deletedAt` — the trash flag; only the DELETE/restore routes set it.
+ *   - `_purged` — the sync-engine tombstone (GH #222): client-set it would
+ *     permanent-delete the row across hybrid-sync peers with no UI undo.
+ *   - `instanceId` / `syncId` — system-assigned identities.
+ *   - `spools` — dedicated, validated CRUD routes own spool writes
+ *     (GH #260/#431): a raw write could rewrite a spool's `usageHistory`
+ *     ledger, its `instanceId`, or inject an unvalidated `photoDataUrl`.
+ *   - `openprinttagSnapshot` — OPT provenance (GH #619): a forged snapshot
+ *     flips a user-edited field from `conflict` to auto-`adopt` on re-sync.
+ *   - `promotionInFlight` / `promotedByToken` — the durable promotion-marker
+ *     pair (GH #605 round 10): a forged pair could make a later gate pass
+ *     "resume" a promotion that never ran and clear a parent's inventory.
+ */
+export const SERVER_OWNED_FILAMENT_FIELDS = [
+    "_id",
+    "_deletedAt",
+    "_purged",
+    "createdAt",
+    "updatedAt",
+    "__v",
+    "instanceId",
+    "syncId",
+    "spools",
+    "openprinttagSnapshot",
+    "promotionInFlight",
+    "promotedByToken",
+];
+/**
+ * GH #1072 (item 3): strip every {@link SERVER_OWNED_FILAMENT_FIELDS} entry
+ * from a client body IN PLACE — the exact key and any `<field>.`-prefixed
+ * dotted path. Mongoose treats dotted keys as live update paths in BOTH
+ * `findOneAndUpdate` casting and document construction, so exact-key deletes
+ * alone were bypassable via `spools.0.usageHistory` /
+ * `openprinttagSnapshot.color` (the pre-#1072 code swept dotted paths only
+ * for the promotion-marker pair).
+ *
+ * `allowExact` keeps a field's EXACT key writable while still sweeping its
+ * dotted subpaths — the POST create path passes `["spools"]` because embedded
+ * spools on create are legitimate and go through their own allowlist +
+ * validateSpoolBody-contract loop in the route.
+ *
+ * Prefix matching is on the full `<field>.` boundary, so a field that merely
+ * starts with a listed name (e.g. `spoolsExtra`) is untouched.
+ *
+ * Returns the stripped keys (for tests/diagnostics).
+ */
+export function stripServerOwnedFields(body, options = {}) {
+    const allowExact = options.allowExact ?? [];
+    const stripped = [];
+    for (const key of Object.keys(body)) {
+        for (const field of SERVER_OWNED_FILAMENT_FIELDS) {
+            const exactHit = key === field && !allowExact.includes(field);
+            if (exactHit || key.startsWith(`${field}.`)) {
+                delete body[key];
+                stripped.push(key);
+                break;
+            }
+        }
+    }
+    return stripped;
+}
+export function assertSafeUpdateBody(body) {
+    if (body === null || typeof body !== "object" || Array.isArray(body)) {
+        // Not an object update document — the caller's own shape checks own this;
+        // nothing here can pollute, so let it through rather than changing an
+        // existing route's error contract.
+        return null;
+    }
+    for (const key of Object.keys(body)) {
+        if (UNSAFE_UPDATE_PATH_RE.test(key)) {
+            return errorResponse("Unsafe field path in request body — keys may not reference __proto__, constructor, or prototype.", 400);
+        }
+    }
+    return null;
+}

@@ -1,0 +1,378 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  # GH #852: run the full CI gate (lint, root + Electron typecheck, coverage
+  # tests, npm audit, build, standalone smoke) ONCE before the platform matrix,
+  # so a `v*` tag can't publish installers from a commit that branch CI would
+  # reject. Same reusable workflow test.yml runs on every PR/main push.
+  gate:
+    uses: ./.github/workflows/ci-gate.yml
+
+  build:
+    needs: gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS — both builds run on macos-latest (Apple Silicon). The x64
+          # build cross-compiles pcsclite via electron-rebuild --arch=x64 so
+          # the resulting dmg ships a true x86_64 .node. The macos-13 Intel
+          # runner was tried earlier but GitHub's queue for it is unusable
+          # (>18h waits) as Apple Silicon has become the default.
+          - os: macos-latest
+            platform: mac
+            arch: arm64
+          - os: macos-latest
+            platform: mac-x64-cross
+            arch: x64
+          - os: windows-latest
+            platform: win
+            arch: x64
+          - os: windows-latest
+            platform: win-arm64-cross
+            arch: arm64
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+          - os: ubuntu-latest
+            platform: linux-arm64
+            arch: arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install PC/SC development headers (Linux x64)
+        if: matrix.platform == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev
+
+      - name: Install PC/SC development headers + arm64 cross-compilation (Linux arm64)
+        if: matrix.platform == 'linux-arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcsclite-dev gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          sudo dpkg --add-architecture arm64
+          # Pin existing sources to amd64 only using DEB822 overrides
+          for f in /etc/apt/sources.list.d/*.sources; do
+            if [ -f "$f" ] && ! grep -q "Architectures:" "$f"; then
+              sudo sed -i '/^Types:/a Architectures: amd64' "$f"
+            fi
+          done
+          # Also handle traditional .list files
+          for f in /etc/apt/sources.list.d/*.list; do
+            if [ -f "$f" ]; then
+              sudo sed -i 's|^deb http|deb [arch=amd64] http|' "$f"
+            fi
+          done
+          # Add arm64 ports repository
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs) main restricted universe multiverse" | sudo tee /etc/apt/sources.list.d/arm64-ports.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs)-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/arm64-ports.list
+          sudo apt-get update
+          sudo apt-get install -y libpcsclite-dev:arm64
+
+      - name: Install dependencies
+        run: npm ci
+
+      # GH #852: lint + tests now run once in the `gate` job (ci-gate.yml), not
+      # per platform leg. GH #853: the technical-reference content is NO LONGER
+      # fetched per build leg — every leg (and the Docker image) ships the
+      # committed src/content/ snapshot, so a release can't bundle different
+      # reference content (or a different REFERENCE_WIKI_SHA) per platform.
+      # Refresh the snapshot via `npm run fetch:reference` in a PR before tagging
+      # (the scheduled reference-drift.yml flags when it's stale).
+
+      - name: Build Next.js and compile Electron
+        run: |
+          npm run build
+          npm run electron:fixlinks
+          npm run electron:compile
+
+      # macOS code signing + notarization. Exports the signing env (via
+      # $GITHUB_ENV) consumed by the mac packaging steps below. When the secrets
+      # aren't configured, it disables auto-discovery so the build is UNSIGNED —
+      # exactly today's behavior — instead of failing. Notarization is opt-in via
+      # SPILOFILA_MAC_NOTARIZE, set here only when the Apple key secrets exist.
+      - name: Prepare macOS code signing & notarization
+        if: startsWith(matrix.platform, 'mac')
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          if [ -z "$MAC_CSC_LINK" ] || [ -z "$APPLE_API_KEY_BASE64" ]; then
+            echo "::notice::macOS signing secrets not set — building UNSIGNED (no notarization)."
+            echo "CSC_IDENTITY_AUTO_DISCOVERY=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/apple_api_key.p8"
+          {
+            echo "CSC_LINK=$MAC_CSC_LINK"
+            echo "CSC_KEY_PASSWORD=$MAC_CSC_KEY_PASSWORD"
+            echo "APPLE_API_KEY=$RUNNER_TEMP/apple_api_key.p8"
+            echo "APPLE_API_KEY_ID=$APPLE_API_KEY_ID"
+            echo "APPLE_API_ISSUER=$APPLE_API_ISSUER"
+            echo "SPILOFILA_MAC_NOTARIZE=true"
+          } >> "$GITHUB_ENV"
+          echo "::notice::macOS signing + notarization enabled."
+
+      - name: Rebuild native modules and package (default — host arch matches target)
+        if: matrix.platform != 'linux-arm64' && matrix.platform != 'mac-x64-cross' && matrix.platform != 'win-arm64-cross' && matrix.platform != 'mac'
+        run: |
+          npm run electron:rebuild
+          npx electron-builder --config electron-builder.yml ${{ matrix.arch != '' && format('--{0}', matrix.arch) || '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rebuild native modules, sign, notarize, and package (macOS arm64)
+        if: matrix.platform == 'mac'
+        run: |
+          npm run electron:rebuild
+          # Notarize only when the Prepare step set the flag (i.e. secrets exist).
+          NOTARIZE_FLAG=""
+          [ "${SPILOFILA_MAC_NOTARIZE:-}" = "true" ] && NOTARIZE_FLAG="--config.mac.notarize=true"
+          # --publish never: electron-builder's `publish: github` config would
+          # otherwise upload this job's SINGLE-arch latest-mac.yml on the tag
+          # build (GH_TOKEN is set), racing the multi-arch merge job and serving
+          # one arch to every Mac if that merge is ever skipped. Installers go up
+          # via softprops; the yml is owned by merge-mac-metadata. (Mirrors #586.)
+          npx electron-builder --config electron-builder.yml --arm64 $NOTARIZE_FLAG --publish never
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rebuild native modules and package (Windows arm64 cross-compile on x64)
+        if: matrix.platform == 'win-arm64-cross'
+        shell: pwsh
+        run: |
+          # MSVC on windows-latest already ships an x64→arm64 cross toolchain
+          # (Microsoft.VisualStudio.Component.VC.Tools.ARM64), so this just
+          # works once --arch is set. Sanity-check the produced .node by
+          # parsing its PE header so a silent fallback to host arch fails
+          # fast instead of shipping an x64 binary inside an arm64 installer.
+          npx electron-rebuild -f -o "@pokusew/pcsclite" --arch=arm64
+          $node = "node_modules/@pokusew/pcsclite/build/Release/pcsclite.node"
+          $bytes = [System.IO.File]::ReadAllBytes($node)
+          $peOffset = [BitConverter]::ToUInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          $archName = switch ($machine) { 0x8664 {"x64"} 0xAA64 {"arm64"} default {"unknown:0x{0:X4}" -f $_} }
+          Write-Host "pcsclite.node arch: $archName (machine=0x$('{0:X4}' -f $machine))"
+          if ($archName -ne "arm64") { throw "pcsclite.node was rebuilt as $archName, expected arm64" }
+          # GH #586: --publish never so electron-builder can't upload this job's
+          # arch-less `latest.yml` (the Windows update channel) to the release
+          # in any draft-timing window. softprops still uploads the arm64
+          # installer below for manual download; the latest.yml is dropped
+          # before that upload (see the "Drop arm64 Windows latest.yml" step).
+          npx electron-builder --config electron-builder.yml --arm64 --publish never
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rebuild native modules and package (macOS x64 cross-compile on arm64)
+        if: matrix.platform == 'mac-x64-cross'
+        run: |
+          # Cross-compile pcsclite for x86_64 on the Apple Silicon runner.
+          # Xcode ships both arch toolchains, and PCSC.framework is a system
+          # framework available for both, so this just works once --arch is set.
+          npx electron-rebuild -f -o @pokusew/pcsclite --arch=x64
+          # Sanity-check: the compiled .node must actually be x86_64. If
+          # electron-rebuild silently fell back to host arch this line fails
+          # fast rather than shipping an arm64 binary inside an x64 dmg.
+          file node_modules/@pokusew/pcsclite/build/Release/pcsclite.node | tee /tmp/arch-check.txt
+          grep -q "x86_64" /tmp/arch-check.txt
+          # Notarize only when the Prepare step set the flag (i.e. secrets exist).
+          NOTARIZE_FLAG=""
+          [ "${SPILOFILA_MAC_NOTARIZE:-}" = "true" ] && NOTARIZE_FLAG="--config.mac.notarize=true"
+          # --publish never — see the macOS arm64 step: stop electron-builder
+          # publishing this job's single-arch latest-mac.yml; merge-mac-metadata
+          # owns the mac update channel.
+          npx electron-builder --config electron-builder.yml --x64 $NOTARIZE_FLAG --publish never
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rebuild native modules and package (Linux arm64)
+        if: matrix.platform == 'linux-arm64'
+        run: |
+          npx electron-rebuild -f -o @pokusew/pcsclite --arch=arm64
+          npx electron-builder --config electron-builder.yml --arm64
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CC: aarch64-linux-gnu-gcc
+          CXX: aarch64-linux-gnu-g++
+          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
+
+      - name: Remove blockmap files
+        shell: bash
+        run: rm -f dist-electron/*.blockmap
+
+      # macOS auto-update needs ONE multi-arch latest-mac.yml so electron-updater
+      # serves the native arch. Each mac job emits its own single-arch
+      # latest-mac.yml; uploading both would let the later one win and serve one
+      # arch to every Mac (the macOS analogue of the Windows #586 collision
+      # below). Stash each arch's yml as an artifact and drop it from the upload
+      # set; the `merge-mac-metadata` job combines them into the multi-arch file.
+      - name: Stash mac update metadata for the multi-arch merge
+        if: startsWith(matrix.platform, 'mac')
+        shell: bash
+        run: |
+          mkdir -p mac-update-yml
+          cp dist-electron/latest-mac.yml "mac-update-yml/latest-mac-${{ matrix.arch }}.yml"
+          rm -f dist-electron/latest-mac.yml
+
+      - name: Upload mac update metadata artifact
+        if: startsWith(matrix.platform, 'mac')
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-update-yml-${{ matrix.arch }}
+          path: mac-update-yml/latest-mac-${{ matrix.arch }}.yml
+          retention-days: 1
+
+      # GH #586: Windows update metadata is named `latest.yml` with NO arch
+      # suffix (unlike latest-mac.yml / latest-linux-arm64.yml), so the x64 and
+      # the arm64 Windows jobs each emit one and the later softprops upload
+      # wins on the release. An x64 user whose updater is served the arm64
+      # `latest.yml` auto-installs an arm64 build that can't run on x64 Windows
+      # → the "Problem with Shortcut / 'spilofila.exe' has been changed or
+      # moved" error, intermittently (every other release, by CI upload-order
+      # luck). Keep x64 as the single Windows update channel by dropping the
+      # arm64 job's copy. x64 installers run on arm64 Windows via the OS x64
+      # emulation layer, so arm64 users still auto-update; the native arm64
+      # installer stays on the release for manual download.
+      - name: Drop arm64 Windows latest.yml so x64 stays the update channel (#586)
+        if: matrix.platform == 'win-arm64-cross'
+        shell: bash
+        run: rm -f dist-electron/latest.yml
+
+      - name: Upload release artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          # Installers (spilofila-* — dmg, zip, AppImage, deb, exe) AND the
+          # electron-updater metadata files (latest-linux.yml,
+          # latest-linux-arm64.yml, latest.yml). Without the yml files the
+          # auto-updater cannot resolve the newest release and every update
+          # check fails with a 404. NOTE: the mac jobs deleted their
+          # latest-mac.yml above (stashed for the merge); the multi-arch
+          # latest-mac.yml is uploaded by the merge-mac-metadata job instead.
+          files: |
+            dist-electron/spilofila-*
+            dist-electron/latest*.yml
+          # Don't overwrite hand-authored release notes when the per-platform
+          # build steps re-run softprops/action-gh-release. Without
+          # append_body, an empty `body` input replaces whatever notes were
+          # set via `gh release create` minutes earlier.
+          append_body: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Combine the two macOS jobs' single-arch latest-mac.yml into ONE multi-arch
+  # file and upload it. electron-updater filters the yml's `files` by the
+  # running arch and downloads the matching .zip, so this is what makes an Apple
+  # Silicon Mac auto-update to the arm64 build and an Intel Mac to the x64 build.
+  # Runs after the whole build matrix so both arch artifacts exist.
+  merge-mac-metadata:
+    name: Merge multi-arch latest-mac.yml
+    needs: build
+    # GH #1037 (companion): without a condition here, ANY failed build leg —
+    # including a non-mac one — silently SKIPPED this job while the
+    # successful legs' installers still uploaded: the release ended up with
+    # mac zips but no latest-mac.yml, so every Mac's checkForUpdates() 404s
+    # into the amber error banner. `!cancelled()` runs the merge whenever the
+    # run wasn't cancelled: with both mac legs green the mac update channel
+    # ships intact regardless of other legs; with a mac leg failed, the
+    # artifact download / merge script fails LOUDLY here (red, not skipped) —
+    # the release is genuinely broken and the run now says so. The
+    # `needs.build.result != 'skipped'` clause keeps one non-case quiet: when
+    # the GATE fails (e.g. the #1037 tag-version mismatch), build never runs
+    # and there are no artifacts to merge — running here would add a
+    # confusing second red job to an already-failed run.
+    if: ${{ !cancelled() && needs.build.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # --ignore-scripts: only the declared `yaml` dependency (pure JS) is
+      # needed for the merge + verify steps; skip the native-module postinstall
+      # (pcsclite) that needs PC/SC headers.
+      - run: npm ci --ignore-scripts
+      - name: Download both arches' latest-mac.yml
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mac-update-yml-*
+          path: mac-yml
+          merge-multiple: true
+      - name: Merge into a multi-arch latest-mac.yml
+        run: |
+          ls -la mac-yml
+          node scripts/merge-mac-latest-yml.mjs \
+            mac-yml/latest-mac-arm64.yml \
+            mac-yml/latest-mac-x64.yml \
+            > latest-mac.yml
+          echo "=== merged latest-mac.yml ==="
+          cat latest-mac.yml
+      # GH #1037 review: a mac leg can fail at its FINAL softprops
+      # installer-upload step, AFTER its yml artifact was stashed — the merge
+      # above then succeeds while the feed it built references a .zip that
+      # never reached the release (electron-updater fetches the metadata,
+      # then 404s on the download). And on a RE-RUN over a release that
+      # already holds a same-named zip from an earlier attempt, a mere
+      # name-presence check would pass while the fresh feed's sha512 points
+      # at different bytes — electron-updater downloads the stale zip and
+      # rejects it on checksum (Codex P2 on PR #1058). So: download each zip
+      # the merged feed references and verify its sha512 (the exact digest
+      # electron-updater enforces, base64) BEFORE publishing the feed. A
+      # green merge job then certifies the whole mac update channel —
+      # presence AND content.
+      - name: Verify the referenced mac zips on the release match the feed's sha512
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Parse with the DECLARED `yaml` dependency — the same package
+          # scripts/merge-mac-latest-yml.mjs uses. js-yaml is NOT declared
+          # (its overrides entry only pins a version where the tree already
+          # requires it); depending on the transitive hoist meant a routine
+          # dependency bump could drop it and crash this step mid-release,
+          # shipping mac installers with no update feed (GH #1082).
+          node -e "
+            const y = require('yaml').parse(require('fs').readFileSync('latest-mac.yml', 'utf8'));
+            for (const f of y.files.filter((f) => f.url.endsWith('.zip'))) {
+              console.log(f.url + ' ' + f.sha512);
+            }
+          " > expected-zips.txt
+          mkdir -p asset-check
+          while read -r NAME SHA; do
+            if ! gh release download "$GITHUB_REF_NAME" -p "$NAME" -D asset-check; then
+              echo "::error::latest-mac.yml references $NAME but it is not on the $GITHUB_REF_NAME release — a mac leg's installer upload failed. Re-run the failed build jobs, then re-run this job."
+              exit 1
+            fi
+            ACTUAL=$(openssl dgst -sha512 -binary "asset-check/$NAME" | base64 -w 0)
+            if [ "$ACTUAL" != "$SHA" ]; then
+              echo "::error::$NAME on the release does not match latest-mac.yml's sha512 — a stale asset from an earlier run. Re-run the mac build legs so the assets and metadata agree, then re-run this job."
+              exit 1
+            fi
+            echo "$NAME: present on the release, sha512 matches the feed."
+          done < expected-zips.txt
+      - name: Upload merged latest-mac.yml to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: latest-mac.yml
+          append_body: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

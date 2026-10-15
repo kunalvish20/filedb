@@ -1,0 +1,209 @@
+"use client";
+import { useEffect, useState } from "react";
+import Link from "next/link";
+import { useToast } from "@/components/Toast";
+import { useConfirm } from "@/components/ConfirmDialog";
+import CopyButton from "@/components/CopyButton";
+import FilamentPicker from "@/components/FilamentPicker";
+import { useTranslation } from "@/i18n/TranslationProvider";
+import { useDateFormat } from "@/hooks/useDateFormat";
+import { isShareLinkLocalOnly } from "@/lib/shareLink";
+export default function ShareManagementPage() {
+    const { t } = useTranslation();
+    const { formatDate } = useDateFormat();
+    const { toast } = useToast();
+    const confirm = useConfirm();
+    const [catalogs, setCatalogs] = useState([]);
+    const [filaments, setFilaments] = useState([]);
+    const [selectedIds, setSelectedIds] = useState(new Set());
+    const [title, setTitle] = useState("");
+    const [description, setDescription] = useState("");
+    const [publishing, setPublishing] = useState(false);
+    // Lazy initializer so the origin is captured once on first render without
+    // an effect. `window` is undefined during SSR, so fall back to empty.
+    const [origin] = useState(() => typeof window !== "undefined" ? window.location.origin : "");
+    // GH #780/#784: `origin` is read synchronously from window via a lazy
+    // initializer, so the loopback warning would render on the first client
+    // render but not in the SSR HTML (origin === "") — a hydration mismatch.
+    // Gate it on a post-mount flag so the first client render matches the server.
+    const [mounted, setMounted] = useState(false);
+    useEffect(() => {
+        const ac = new AbortController();
+        Promise.all([
+            fetch("/api/share", { signal: ac.signal }).then((r) => (r.ok ? r.json() : [])),
+            fetch("/api/filaments", { signal: ac.signal }).then((r) => (r.ok ? r.json() : [])),
+        ])
+            .then(([cats, fils]) => {
+            setCatalogs(cats);
+            setFilaments(fils);
+        })
+            .catch(() => { });
+        return () => ac.abort();
+    }, []);
+    useEffect(() => {
+        // Mark hydrated so the origin-dependent loopback warning only renders after
+        // the first client render (which matches the server's empty-origin HTML).
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- post-hydration gate
+        setMounted(true);
+    }, []);
+    // GH #780/#784: warn when the link is loopback-only. We do NOT rewrite the
+    // link to the host's LAN IP — the /share/<slug> Import action writes to the
+    // serving origin, so a publisher-hosted LAN link would let a recipient write
+    // into the publisher's DB (Codex P2 on PR #784). The link stays the local
+    // origin; the warning points the user to the Share-on-LAN toggle.
+    const linkLocalOnly = isShareLinkLocalOnly(origin);
+    // GH #640: never throws — a failed refresh keeps the existing list in
+    // place (same silent posture as the mount fetch above), so the
+    // publish/unpublish handlers' catch blocks can't mis-report a mutation
+    // that already succeeded as failed.
+    const refreshCatalogs = async () => {
+        try {
+            const res = await fetch("/api/share");
+            if (res.ok)
+                setCatalogs(await res.json());
+        }
+        catch {
+            // keep the current (stale) list
+        }
+    };
+    const toggleFilament = (id) => {
+        setSelectedIds((prev) => {
+            const next = new Set(prev);
+            if (next.has(id))
+                next.delete(id);
+            else
+                next.add(id);
+            return next;
+        });
+    };
+    const handlePublish = async () => {
+        if (!title.trim() || selectedIds.size === 0)
+            return;
+        setPublishing(true);
+        try {
+            const res = await fetch("/api/share", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    title: title.trim(),
+                    description: description.trim(),
+                    filamentIds: Array.from(selectedIds),
+                }),
+            });
+            if (!res.ok) {
+                const body = await res.json().catch(() => null);
+                toast(body?.error || t("share.publishError"), "error");
+                return;
+            }
+            const body = await res.json();
+            toast(t("share.published"));
+            setTitle("");
+            setDescription("");
+            setSelectedIds(new Set());
+            await refreshCatalogs();
+            // Copy the link to clipboard for convenience.
+            const url = `${window.location.origin}/share/${body.slug}`;
+            navigator.clipboard?.writeText(url).catch(() => { });
+            toast(t("share.linkCopied"));
+        }
+        catch {
+            // GH #640: try/finally without a catch left a dropped connection
+            // silent — the button just un-disabled with no feedback.
+            toast(t("share.publishError"), "error");
+        }
+        finally {
+            setPublishing(false);
+        }
+    };
+    const handleUnpublish = async (slug) => {
+        if (!(await confirm({ message: t("share.unpublishConfirm"), destructive: true, confirmLabel: t("share.unpublish") })))
+            return;
+        // GH #640: same silent-network-failure gap as handlePublish.
+        try {
+            const res = await fetch(`/api/share/${slug}`, { method: "DELETE" });
+            if (!res.ok) {
+                toast(t("share.unpublishError"), "error");
+                return;
+            }
+        }
+        catch {
+            toast(t("share.unpublishError"), "error");
+            return;
+        }
+        toast(t("share.unpublished"));
+        await refreshCatalogs();
+    };
+    return (<main id="main-content" className="max-w-4xl mx-auto px-4 py-8">
+      <h1 className="text-3xl font-bold mb-2">{t("share.title")}</h1>
+      <p className="text-sm text-gray-500 mb-6">{t("share.subtitle")}</p>
+
+      {/* GH #780: warn when share links resolve to localhost (desktop install,
+            Share-on-LAN off) so the user knows the link isn't actually shareable
+            and how to fix it. */}
+      {mounted && linkLocalOnly && (<div className="mb-6 text-sm px-3 py-2 rounded bg-amber-50 dark:bg-amber-900/30 border border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-300">
+          {t("share.localOnlyWarning")}{" "}
+          <Link href="/settings/network" className="underline font-medium">
+            {t("share.localOnlySettingsLink")}
+          </Link>
+          .
+        </div>)}
+
+      {/* Publish form */}
+      <section className="mb-10 border border-border dark:border-border rounded p-4">
+        <h2 className="text-lg font-semibold mb-3">{t("share.publishSection")}</h2>
+        <div className="space-y-3">
+          <div>
+            <label className="block text-sm font-medium mb-1">{t("share.titleLabel")}</label>
+            <input className="w-full px-3 py-2 border border-border dark:border-border rounded text-sm bg-transparent" value={title} onChange={(e) => setTitle(e.target.value)} placeholder={t("share.titlePlaceholder")}/>
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">{t("share.descriptionLabel")}</label>
+            <textarea className="w-full px-3 py-2 border border-border dark:border-border rounded text-sm bg-transparent" rows={2} value={description} onChange={(e) => setDescription(e.target.value)} placeholder={t("share.descriptionPlaceholder")}/>
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">
+              {t("share.pickFilaments", { count: selectedIds.size })}
+            </label>
+            <FilamentPicker filaments={filaments} selectedIds={selectedIds} onToggle={toggleFilament} ariaLabel={t("share.pickerAriaLabel")}/>
+          </div>
+          <button type="button" onClick={handlePublish} disabled={publishing || !title.trim() || selectedIds.size === 0} className="px-4 py-2 ui-primary text-white rounded hover:opacity-90 disabled:opacity-50 text-sm">
+            {publishing ? t("share.publishing") : t("share.publish")}
+          </button>
+        </div>
+      </section>
+
+      {/* Existing shares */}
+      <section>
+        <h2 className="text-lg font-semibold mb-3">{t("share.existingShares")}</h2>
+        {catalogs.length === 0 ? (<p className="text-sm text-gray-500">{t("share.noShares")}</p>) : (<ul className="space-y-2">
+            {catalogs.map((c) => {
+                const url = `${origin}/share/${c.slug}`;
+                return (<li key={c.slug} className="border border-border dark:border-border rounded p-3 flex items-start gap-3">
+                  <div className="flex-1 min-w-0">
+                    <p className="font-medium">{c.title}</p>
+                    {c.description && (<p className="text-xs text-gray-500 mt-1">{c.description}</p>)}
+                    <div className="flex items-center gap-2 mt-1 text-xs text-gray-400">
+                      <Link href={`/share/${c.slug}`} className="text-foreground hover:underline dark:text-foreground">
+                        <code>{url}</code>
+                      </Link>
+                      <CopyButton value={url}/>
+                    </div>
+                    <p className="text-xs text-gray-500 mt-1">
+                      {t("share.viewCount", { count: c.viewCount })} ·{" "}
+                      {formatDate(c.createdAt)}
+                    </p>
+                  </div>
+                  <div className="flex flex-col items-end gap-2 shrink-0">
+                    <Link href={`/share/${c.slug}`} className="text-foreground hover:underline dark:text-foreground text-sm">
+                      {t("share.view")}
+                    </Link>
+                    <button type="button" onClick={() => handleUnpublish(c.slug)} className="text-red-500 hover:text-red-700 text-sm">
+                      {t("share.unpublish")}
+                    </button>
+                  </div>
+                </li>);
+            })}
+          </ul>)}
+      </section>
+    </main>);
+}

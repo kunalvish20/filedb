@@ -1,0 +1,214 @@
+"use client";
+import { useState, useRef, useEffect } from "react";
+import { useToast } from "@/components/Toast";
+import { useTranslation } from "@/i18n/TranslationProvider";
+const SAMPLE_CSV = `filament,vendor,label,totalWeight,lotNumber,purchaseDate,location
+Prusament PLA Galaxy Black,Prusa,Spool 1,1000,LOT-A,2025-01-01,Drybox #1
+Bambu PLA Basic,Bambu,,820,,,Garage`;
+/**
+ * Modal dialog for bulk-importing spools from a pasted or uploaded CSV.
+ *
+ * Shows a per-row success/failure summary after POST, so users can see which
+ * lines matched a filament and which didn't. Intentionally keeps the parsing
+ * server-side — the client just forwards the CSV text and renders results.
+ */
+export default function SpoolCsvImportDialog({ onClose, onImported }) {
+    const { t } = useTranslation();
+    const { toast } = useToast();
+    const [csv, setCsv] = useState("");
+    const [submitting, setSubmitting] = useState(false);
+    const [results, setResults] = useState(null);
+    const dialogRef = useRef(null);
+    const fileInputRef = useRef(null);
+    // GH #319: abort the in-flight import on unmount / on a new submit.
+    const acRef = useRef(null);
+    useEffect(() => () => acRef.current?.abort(), []);
+    // GH #522.1: focus capture/restore + Tab loop + initial focus, mirroring
+    // ImportAtlasDialog and PrusamentImportDialog. Pre-fix the dialog
+    // declared role="dialog" aria-modal="true" but the dialogRef was unused,
+    // so keyboard users could Tab past the backdrop into the underlying
+    // page (still focusable, still actionable via Enter/Space) and
+    // screen-readers landed on whatever was previously focused, breaking
+    // the aria-modal contract. Two effects — one for capture/restore +
+    // initial-focus + Tab trap (empty deps so a parent re-render doesn't
+    // bounce focus, see #522.2 below), one for Escape (live onClose).
+    useEffect(() => {
+        const previouslyFocused = document.activeElement;
+        // Codex P2 round 1 on PR #540: filter out elements that can't
+        // actually receive focus. The dialog's first DOM input is the
+        // `className="hidden"` file input (display:none), so a naive
+        // "first focusable" query would .focus() something invisible — and
+        // including it in the Tab-boundary list means Shift+Tab from the
+        // first VISIBLE button lands on a hidden node, which the browser
+        // skips, letting focus escape to the page behind the modal. Filter
+        // on offsetParent !== null (covers display:none ancestors) +
+        // hidden/inert attributes.
+        const collectFocusable = () => {
+            if (!dialogRef.current)
+                return [];
+            return Array.from(dialogRef.current.querySelectorAll('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')).filter((el) => !el.hasAttribute("inert") &&
+                !el.hasAttribute("hidden") &&
+                // offsetParent is null for display:none elements (and their
+                // descendants) — the cheapest visibility check that catches
+                // the hidden file input here.
+                el.offsetParent !== null);
+        };
+        // Initial focus on the first VISIBLE focusable (or the dialog
+        // container itself as a fallback).
+        const focusableOnOpen = collectFocusable();
+        (focusableOnOpen[0] ?? dialogRef.current)?.focus();
+        const handleKeydown = (e) => {
+            if (e.key !== "Tab" || !dialogRef.current)
+                return;
+            const focusable = collectFocusable();
+            if (focusable.length === 0)
+                return;
+            const firstEl = focusable[0];
+            const lastEl = focusable[focusable.length - 1];
+            if (e.shiftKey && document.activeElement === firstEl) {
+                e.preventDefault();
+                lastEl.focus();
+            }
+            else if (!e.shiftKey && document.activeElement === lastEl) {
+                e.preventDefault();
+                firstEl.focus();
+            }
+        };
+        document.addEventListener("keydown", handleKeydown);
+        return () => {
+            document.removeEventListener("keydown", handleKeydown);
+            previouslyFocused?.focus?.();
+        };
+    }, []);
+    useEffect(() => {
+        const handler = (e) => {
+            // GH #1081: never close mid-import — the unmount abort only cancels
+            // the CLIENT fetch; the server keeps importing rows, and a reflexive
+            // Escape + re-run would duplicate spools.
+            if (e.key === "Escape" && !submitting)
+                onClose();
+        };
+        document.addEventListener("keydown", handler);
+        return () => document.removeEventListener("keydown", handler);
+    }, [onClose, submitting]);
+    const handleFile = async (file) => {
+        const text = await file.text();
+        setCsv(text);
+    };
+    const handleSubmit = async () => {
+        if (!csv.trim() || submitting)
+            return;
+        setSubmitting(true);
+        setResults(null);
+        acRef.current?.abort();
+        const ac = new AbortController();
+        acRef.current = ac;
+        try {
+            const res = await fetch("/api/spools/import", {
+                method: "POST",
+                headers: { "Content-Type": "text/csv" },
+                body: csv,
+                signal: ac.signal,
+            });
+            const body = await res.json().catch(() => null);
+            if (ac.signal.aborted)
+                return;
+            if (!res.ok) {
+                toast(body?.error || t("spoolImport.error"), "error");
+                return;
+            }
+            setResults(body);
+            if (body.imported > 0) {
+                toast(t("spoolImport.success", { imported: body.imported }));
+                onImported();
+            }
+        }
+        catch (err) {
+            // GH #319: a network error used to escape with no user feedback.
+            if (ac.signal.aborted || (err instanceof DOMException && err.name === "AbortError"))
+                return;
+            toast(t("spoolImport.error"), "error");
+        }
+        finally {
+            if (!ac.signal.aborted)
+                setSubmitting(false);
+        }
+    };
+    return (<div role="dialog" aria-modal="true" aria-labelledby="csv-import-title" className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={(e) => {
+            // GH #1081: backdrop click gets the same mid-import guard as Escape.
+            if (e.target === e.currentTarget && !submitting)
+                onClose();
+        }}>
+      <div ref={dialogRef} className="bg-white dark:bg-gray-900 border border-border dark:border-border rounded-lg shadow-xl max-w-3xl w-full mx-4 max-h-[85vh] flex flex-col">
+        <div className="p-4 border-b border-border dark:border-border">
+          <h2 id="csv-import-title" className="text-lg font-semibold">
+            {t("spoolImport.title")}
+          </h2>
+          <p className="text-sm text-gray-500 mt-1">{t("spoolImport.description")}</p>
+        </div>
+
+        <div className="p-4 overflow-y-auto flex-1">
+          <div className="mb-3">
+            <h3 className="text-sm font-medium mb-1">{t("spoolImport.columnsHeading")}</h3>
+            <p className="text-xs text-gray-500 mb-2">
+              {t("spoolImport.columnsDescription")}
+            </p>
+            <pre className="text-[11px] bg-gray-100 dark:bg-gray-800 rounded px-2 py-1 overflow-x-auto">
+    {SAMPLE_CSV}
+            </pre>
+          </div>
+
+          <div className="flex items-center justify-between mb-2">
+            <label htmlFor="spool-csv-paste" className="text-sm font-medium">{t("spoolImport.csvLabel")}</label>
+            <div className="flex items-center gap-2">
+              <input ref={fileInputRef} type="file" accept=".csv,text/csv,text/plain" className="hidden" onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f)
+                handleFile(f);
+            if (fileInputRef.current)
+                fileInputRef.current.value = "";
+        }}/>
+              <button type="button" onClick={() => fileInputRef.current?.click()} className="px-2 py-1 text-xs border border-border dark:border-border rounded hover:border-gray-400">
+                {t("spoolImport.chooseFile")}
+              </button>
+              <button type="button" onClick={() => setCsv(SAMPLE_CSV)} className="px-2 py-1 text-xs border border-border dark:border-border rounded hover:border-gray-400">
+                {t("spoolImport.useSample")}
+              </button>
+            </div>
+          </div>
+          <textarea id="spool-csv-paste" value={csv} onChange={(e) => setCsv(e.target.value)} rows={10} placeholder={SAMPLE_CSV} aria-label={t("csv.import.pasteLabel")} className="w-full px-3 py-2 border border-border dark:border-border rounded text-xs font-mono bg-transparent"/>
+
+          {results && (<div className="mt-4">
+              <h3 className="text-sm font-medium mb-2">
+                {t("spoolImport.resultsHeading", {
+                imported: results.imported,
+                failed: results.failed,
+            })}
+              </h3>
+              <div className="max-h-48 overflow-y-auto border border-border dark:border-border rounded text-xs">
+                {results.results.map((r) => (<div key={r.row} className={`px-2 py-1 border-b border-gray-100 dark:border-border last:border-b-0 flex items-center gap-2 ${r.ok
+                    ? "text-green-700 dark:text-green-400"
+                    : "text-red-700 dark:text-red-400"}`}>
+                    <span className="w-12 font-mono">{t("csv.import.rowLabel", { row: r.row })}</span>
+                    <span className="flex-1 truncate">
+                      {r.ok ? `✓ ${r.filament}` : `✕ ${r.error}`}
+                    </span>
+                  </div>))}
+              </div>
+            </div>)}
+        </div>
+
+        <div className="p-4 border-t border-border dark:border-border flex justify-end gap-2">
+          <button type="button" onClick={onClose} 
+    // GH #1081: every close path is gated while the import is
+    // in flight — this button included.
+    disabled={submitting} className="px-4 py-2 text-sm rounded border border-border dark:border-border hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed">
+            {t("common.cancel")}
+          </button>
+          <button type="button" onClick={handleSubmit} disabled={submitting || !csv.trim()} className="px-4 py-2 text-sm rounded ui-primary text-white hover:opacity-90 disabled:opacity-50">
+            {submitting ? t("spoolImport.importing") : t("spoolImport.importButton")}
+          </button>
+        </div>
+      </div>
+    </div>);
+}

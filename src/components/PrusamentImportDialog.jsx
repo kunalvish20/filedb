@@ -1,0 +1,345 @@
+"use client";
+import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "@/i18n/TranslationProvider";
+import { useNumberFormat } from "@/hooks/useNumberFormat";
+export default function PrusamentImportDialog({ onClose, onImported, targetFilamentId, }) {
+    const { t } = useTranslation();
+    const { formatGrams, formatNumber } = useNumberFormat();
+    const [step, setStep] = useState("input");
+    const [spoolInput, setSpoolInput] = useState("");
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState("");
+    const [spool, setSpool] = useState(null);
+    const [matches, setMatches] = useState([]);
+    const [action, setAction] = useState(targetFilamentId ? "add-spool" : "create");
+    const [selectedFilamentId, setSelectedFilamentId] = useState(targetFilamentId || "");
+    const dialogRef = useRef(null);
+    // GH #319: abort the in-flight request on unmount / on a new submit.
+    const acRef = useRef(null);
+    useEffect(() => () => acRef.current?.abort(), []);
+    // GH #320/#329: focus capture, initial focus, and restore run once —
+    // on mount and unmount only. Keying this to `onClose` (an inline
+    // parent callback) made the cleanup fire on every parent re-render,
+    // bouncing focus out of the still-open modal. Empty deps tie restore
+    // to a real unmount.
+    useEffect(() => {
+        const prevFocus = document.activeElement;
+        dialogRef.current?.focus();
+        return () => prevFocus?.focus?.();
+    }, []);
+    // Tab trap + Escape. Re-bound when `onClose` / `step` changes — no focus
+    // side-effects, so a parent re-render is harmless here.
+    useEffect(() => {
+        const dialog = dialogRef.current;
+        if (!dialog)
+            return;
+        const handleKey = (e) => {
+            if (e.key === "Escape") {
+                // GH #1081: never close mid-import — the unmount abort only cancels
+                // the CLIENT fetch; the server keeps appending the spool, and a
+                // reflexive Escape + re-run would double-import it.
+                if (step !== "importing")
+                    onClose();
+                return;
+            }
+            if (e.key !== "Tab")
+                return;
+            // GH #1081: exclude disabled elements — a disabled submit button used
+            // as the trap boundary let Tab escape into the background page while
+            // the modal was still up (same selector as SpoolCsvImportDialog).
+            const focusable = dialog.querySelectorAll('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])');
+            if (focusable.length === 0) {
+                // Importing step: nothing focusable remains (the × is disabled),
+                // so park focus on the dialog container instead of letting Tab
+                // walk into the background page.
+                e.preventDefault();
+                dialog.focus();
+                return;
+            }
+            const first = focusable[0];
+            const last = focusable[focusable.length - 1];
+            if (e.shiftKey) {
+                if (document.activeElement === first ||
+                    document.activeElement === dialog) {
+                    e.preventDefault();
+                    last.focus();
+                }
+            }
+            else if (document.activeElement === last) {
+                e.preventDefault();
+                first.focus();
+            }
+        };
+        document.addEventListener("keydown", handleKey);
+        return () => document.removeEventListener("keydown", handleKey);
+    }, [onClose, step]);
+    // GH #320: move focus into the newly-rendered step on a wizard
+    // transition so keyboard / screen-reader users follow the flow.
+    // Prefer a field over the header's close button (which is first in
+    // DOM order) so the input step lands on the spool-id input.
+    useEffect(() => {
+        const root = dialogRef.current;
+        if (!root)
+            return;
+        // GH #1081: skip disabled controls (`.focus()` on one is a silent
+        // no-op → focus falls to <body>); the importing step has no enabled
+        // control at all, so fall back to the dialog container.
+        const el = root.querySelector("input:not([disabled]), select:not([disabled]), textarea:not([disabled])") ??
+            root.querySelector("button:not([disabled]), [href]");
+        (el ?? root).focus();
+    }, [step]);
+    const handleLookup = async () => {
+        const input = spoolInput.trim();
+        if (!input || loading)
+            return;
+        // Extract spool ID from URL or bare ID
+        let id = input;
+        if (input.includes("spoolId=")) {
+            try {
+                const url = new URL(input);
+                id = url.searchParams.get("spoolId") || input;
+            }
+            catch {
+                // not a URL, use as-is
+            }
+        }
+        setLoading(true);
+        setError("");
+        acRef.current?.abort();
+        const ac = new AbortController();
+        acRef.current = ac;
+        try {
+            const res = await fetch(`/api/prusament?spoolId=${encodeURIComponent(id)}`, { signal: ac.signal });
+            const data = await res.json();
+            if (ac.signal.aborted)
+                return;
+            if (!res.ok) {
+                setError(data.error || t("prusament.import.lookupFailed"));
+                return;
+            }
+            setSpool(data);
+            // Find matching filaments by material type
+            const filRes = await fetch(`/api/filaments?type=${encodeURIComponent(data.material)}`, { signal: ac.signal });
+            if (ac.signal.aborted)
+                return;
+            if (filRes.ok) {
+                const filaments = await filRes.json();
+                setMatches(filaments);
+                // Auto-select if target provided
+                if (targetFilamentId) {
+                    setAction("add-spool");
+                    setSelectedFilamentId(targetFilamentId);
+                }
+                else {
+                    // Check for exact name match
+                    const exactName = `Prusament ${data.material} ${data.colorName}`;
+                    const exact = filaments.find((f) => f.name === exactName);
+                    if (exact) {
+                        setAction("add-spool");
+                        setSelectedFilamentId(exact._id);
+                    }
+                }
+            }
+            setStep("preview");
+        }
+        catch (err) {
+            if (ac.signal.aborted || (err instanceof DOMException && err.name === "AbortError"))
+                return;
+            setError(t("prusament.import.networkError"));
+        }
+        finally {
+            if (!ac.signal.aborted)
+                setLoading(false);
+        }
+    };
+    const handleImport = async () => {
+        if (!spool)
+            return;
+        setStep("importing");
+        setError("");
+        acRef.current?.abort();
+        const ac = new AbortController();
+        acRef.current = ac;
+        try {
+            const res = await fetch("/api/prusament/import", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    spool,
+                    action,
+                    filamentId: action === "add-spool" ? selectedFilamentId : undefined,
+                }),
+                signal: ac.signal,
+            });
+            const data = await res.json();
+            if (ac.signal.aborted)
+                return;
+            if (!res.ok) {
+                // Structured rejections (GH #605 `template_no_spools`) carry a
+                // machine-readable `error` code plus a human `message` — show the
+                // message when present so the user never sees the raw code.
+                setError(data.message || data.error || t("prusament.import.importFailed"));
+                setStep("preview");
+                return;
+            }
+            onImported(data.message);
+        }
+        catch (err) {
+            if (ac.signal.aborted || (err instanceof DOMException && err.name === "AbortError"))
+                return;
+            setError(t("prusament.import.networkErrorDuringImport"));
+            setStep("preview");
+        }
+    };
+    return (<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+      <div ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-labelledby="prusament-import-title" className="bg-white dark:bg-zinc-900 rounded-lg shadow-xl w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto outline-none">
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 py-4 border-b dark:border-zinc-700">
+          <h2 id="prusament-import-title" className="text-lg font-semibold">{t("prusament.import.title")}</h2>
+          <button onClick={onClose} 
+    // GH #1081: same mid-import close guard as the Escape handler.
+    disabled={step === "importing"} aria-label={t("common.close")} className="text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 text-xl leading-none disabled:opacity-40 disabled:cursor-not-allowed">
+            &times;
+          </button>
+        </div>
+
+        <div className="px-6 py-4 space-y-4">
+          {error && (<div className="bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 rounded p-3 text-sm text-red-700 dark:text-red-300">
+              {error}
+            </div>)}
+
+          {/* Step 1: Input */}
+          {step === "input" && (<>
+              <p className="text-sm text-zinc-600 dark:text-zinc-400">
+                {t("prusament.import.description")}
+              </p>
+              <label htmlFor="prusament-spool-id" className="sr-only">
+                {t("prusament.import.spoolIdLabel")}
+              </label>
+              <input id="prusament-spool-id" type="text" value={spoolInput} onChange={(e) => setSpoolInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && handleLookup()} placeholder={t("prusament.import.placeholder")} className="w-full px-3 py-2 border rounded dark:bg-zinc-800 dark:border-zinc-700 focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none" autoFocus/>
+              <div className="flex justify-end gap-2">
+                <button onClick={onClose} className="px-4 py-2 text-sm border rounded hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-800">
+                  {t("prusament.import.cancel")}
+                </button>
+                <button onClick={handleLookup} disabled={loading || !spoolInput.trim()} className="px-4 py-2 text-sm bg-orange-600 text-white rounded hover:bg-orange-700 disabled:opacity-50">
+                  {loading ? t("prusament.import.lookingUp") : t("prusament.import.lookUp")}
+                </button>
+              </div>
+            </>)}
+
+          {/* Step 2: Preview */}
+          {step === "preview" && spool && (<>
+              {/* Spool info card */}
+              <div className="border rounded-lg dark:border-zinc-700 overflow-hidden">
+                <div className="bg-zinc-50 dark:bg-zinc-800 px-4 py-3 border-b dark:border-zinc-700">
+                  <div className="flex items-center gap-3">
+                    <div className="w-8 h-8 rounded-full border dark:border-zinc-600 shrink-0" style={{ backgroundColor: spool.colorHex }}/>
+                    <div>
+                      <div className="font-medium">{spool.productName}</div>
+                      <div className="text-xs text-zinc-500">
+                        {spool.colorName} &middot; {t("prusament.import.spool")} {spool.spoolId}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-x-4 gap-y-1 px-4 py-3 text-sm">
+                  <div className="text-zinc-500">{t("prusament.import.material")}</div>
+                  <div>{spool.material}</div>
+                  <div className="text-zinc-500">{t("prusament.import.diameter")}</div>
+                  <div>
+                    {formatNumber(spool.diameterAvg, { minDecimals: 2, maxDecimals: 2, trimTrailingZeros: false })} mm (avg) &plusmn;{" "}
+                    {spool.diameterStdDev != null
+                ? formatNumber(spool.diameterStdDev, { minDecimals: 1, maxDecimals: 1, trimTrailingZeros: false })
+                : "?"}{" "}
+                    &micro;m
+                  </div>
+                  <div className="text-zinc-500">{t("prusament.import.netWeight")}</div>
+                  <div>{formatGrams(spool.netWeight)} g</div>
+                  <div className="text-zinc-500">{t("prusament.import.spoolWeight")}</div>
+                  <div>{formatGrams(spool.spoolWeight)} g</div>
+                  <div className="text-zinc-500">{t("prusament.import.totalWeight")}</div>
+                  <div className="font-medium">{formatGrams(spool.totalWeight)} g</div>
+                  <div className="text-zinc-500">{t("prusament.import.length")}</div>
+                  <div>{formatNumber(spool.lengthMeters, { maxDecimals: 0 })} m</div>
+                  <div className="text-zinc-500">{t("prusament.import.nozzleTemp")}</div>
+                  <div>
+                    {spool.nozzleTempMin}&ndash;{spool.nozzleTempMax} &deg;C
+                  </div>
+                  <div className="text-zinc-500">{t("prusament.import.bedTemp")}</div>
+                  <div>
+                    {spool.bedTempMin}&ndash;{spool.bedTempMax} &deg;C
+                  </div>
+                  <div className="text-zinc-500">{t("prusament.import.manufactured")}</div>
+                  <div>{spool.manufactureDate.split(" ")[0]}</div>
+                  {spool.priceUsd && (<>
+                      <div className="text-zinc-500">{t("prusament.import.price")}</div>
+                      <div>${spool.priceUsd}</div>
+                    </>)}
+                </div>
+              </div>
+
+              {/* Action selector */}
+              <div className="space-y-3">
+                <label className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                  {t("prusament.import.importAs")}
+                </label>
+
+                <label className="flex items-start gap-2 p-3 border rounded-lg cursor-pointer hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-800">
+                  <input type="radio" name="action" value="create" checked={action === "create"} onChange={() => setAction("create")} className="mt-0.5"/>
+                  <div>
+                    <div className="text-sm font-medium">
+                      {t("prusament.import.newFilament")}
+                    </div>
+                    <div className="text-xs text-zinc-500">
+                      {t("prusament.import.createDescription", { material: spool.material, color: spool.colorName })}
+                    </div>
+                  </div>
+                </label>
+
+                <label className="flex items-start gap-2 p-3 border rounded-lg cursor-pointer hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-800">
+                  <input type="radio" name="action" value="add-spool" checked={action === "add-spool"} onChange={() => setAction("add-spool")} className="mt-0.5"/>
+                  <div className="flex-1">
+                    <div className="text-sm font-medium">
+                      {t("prusament.import.addToExisting")}
+                    </div>
+                    {matches.length > 0 ? (<select value={selectedFilamentId} onChange={(e) => {
+                    setSelectedFilamentId(e.target.value);
+                    setAction("add-spool");
+                }} className="mt-1 w-full text-sm px-2 py-1.5 border rounded dark:bg-zinc-800 dark:border-zinc-700">
+                        <option value="">{t("prusament.import.selectFilament")}</option>
+                        {matches.map((f) => (<option key={f._id} value={f._id}>
+                            {f.name}
+                          </option>))}
+                      </select>) : (<div className="text-xs text-zinc-500 mt-1">
+                        {t("prusament.import.noExistingFilaments", { material: spool.material })}
+                      </div>)}
+                  </div>
+                </label>
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2">
+                <button onClick={() => {
+                setStep("input");
+                setSpool(null);
+                setError("");
+            }} className="px-4 py-2 text-sm border rounded hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-800">
+                  {t("prusament.import.back")}
+                </button>
+                <button onClick={handleImport} disabled={action === "add-spool" && !selectedFilamentId} className="px-4 py-2 text-sm bg-orange-600 text-white rounded hover:bg-orange-700 disabled:opacity-50">
+                  {t("prusament.import.import")}
+                </button>
+              </div>
+            </>)}
+
+          {/* Step 3: Importing */}
+          {step === "importing" && (<div className="flex items-center justify-center py-8 gap-3 text-zinc-500">
+              <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24" fill="none">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+              </svg>
+              {t("prusament.import.importingSpool")}
+            </div>)}
+        </div>
+      </div>
+    </div>);
+}

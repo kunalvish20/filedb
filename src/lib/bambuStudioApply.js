@@ -1,0 +1,579 @@
+/**
+ * Applier-side helper for the Bambu Studio importer. Sibling to the
+ * pure-parser `bambuStudioImport.ts`; lives separately because it has
+ * Mongo dependencies (Printer / Nozzle lookups for the calibration
+ * context match) and the parser deliberately stays DB-free so tests can
+ * exercise the mapping with no fixtures.
+ *
+ * Shared by the two import routes:
+ *   - `POST /api/filaments/bambustudio` (upsert by name)
+ *   - `POST /api/filaments/{id}/bambustudio` (target pinned by id)
+ *
+ * Both call:
+ *   1. `buildStructuredUpdate` — projects the parsed payload to the
+ *      subset of model fields we update, merging into existing values
+ *      so a partial Bambu profile doesn't blank pre-existing data.
+ *   2. `resolveAndApplyCalibration` — tries to match the printer hint
+ *      in the profile to a Printer doc + one of its installed nozzles,
+ *      and either writes a `calibrations[]` row or signals unresolved.
+ */
+import Printer from "@/models/Printer";
+import Nozzle from "@/models/Nozzle";
+import { mergeSlicerSettings, } from "@/lib/slicerSettings";
+import { resolveSyncBackColor } from "@/lib/prusaSlicerBundle";
+import { stripLegacyMachineCondition } from "@/lib/stripLegacyNozzleCondition";
+import { isUpdateNozzleRangeInverted } from "@/lib/temperatureRange";
+/**
+ * One-shot builder used by both the bulk and per-id routes to turn a
+ * parsed Bambu profile + the existing filament doc into the update
+ * payload. Centralises:
+ *   1. structured-field projection (buildStructuredUpdate)
+ *   2. settings-bag merge with size caps (mergeSlicerSettings)
+ *   3. calibration row dedup + resolve (resolveAndApplyCalibration)
+ *
+ * The bulk route calls this from each phase of its upsert (active /
+ * trashed / race-on-create branch) since `existing` differs per phase.
+ * The per-id route calls it once with the pinned target.
+ *
+ * `existing === null` is the create branch: no merge anchor, no
+ * settings carryover, no calibration row dedup against existing rows.
+ */
+export async function prepareBambuUpdate(parsed, existing) {
+    const { set: update, unset: unsetKeys } = buildStructuredUpdate(parsed.filament, existing);
+    const settingsResult = mergeSlicerSettings(existing?.settings || {}, parsed.filament.settings, 
+    // Already-structured keys we own — pulled into `update` above; the
+    // parser already excludes them from `parsed.filament.settings`, so
+    // pass an empty owned-keys set here (the merge has no extra keys
+    // to strip).
+    new Set());
+    // GH #950 (Codex r10): also write when the merge PURGED a never-baggable key
+    // from the existing bag (`removed`) — matching the OrcaSlicer route. Otherwise a
+    // Bambu sync that only updates structured fields on a row with a stale
+    // filament_settings_id/filamentdb_id returns 200 but never persists the cleaned
+    // bag, so the stale key keeps shadowing the re-derived name/id on later exports.
+    // GH #1021 (Codex P1 r14): same ingestion guard as the PrusaSlicer/Orca
+    // sync + INI import boundaries — a Bambu/Orca JSON exported before the
+    // one-shot cleanup carries the machine-derived nozzle condition as
+    // passthrough, and re-persisting it here (either Bambu route; both funnel
+    // through this shared apply) would resurrect the hidden-preset bug. Strip
+    // it (→ "") when the INCOMING profile owns the key and it
+    // provenance-matches the target's effective ticks; incoming-only, so a
+    // profile that omits the key never re-judges a stored post-cleanup pin.
+    // Creates (`existing === null`) have no ticks to test against.
+    if (existing &&
+        parsed.filament.settings &&
+        Object.prototype.hasOwnProperty.call(parsed.filament.settings, "compatible_printers_condition")) {
+        await stripLegacyMachineCondition(settingsResult.settings, existing);
+    }
+    if (settingsResult.added.length > 0 || settingsResult.removed.length > 0) {
+        update.settings = settingsResult.settings;
+    }
+    const calibrationOutcome = await resolveAndApplyCalibration(parsed.filament, parsed.calibrationHints, update, existing);
+    // GH #950 (Codex P2 on PR #968): chamber_temperature has NO top-level filament
+    // field — its only structured home is calibrations[].chamberTemp, which
+    // `resolveAndApplyCalibration` writes ONLY when it resolves a printer/nozzle
+    // context. Because the parser excludes chamber_temperature/activate_chamber_
+    // temp_control from the settings passthrough bag (they're in CALIBRATION_KEYS),
+    // a standalone profile whose calibration context can't be resolved would
+    // silently DROP the value. When no calibration row was written, fall back to
+    // preserving the raw chamber keys in the settings bag — the "misfiled but
+    // survives" state the #950 finding explicitly rates acceptable (P2), and the
+    // same no-data-loss guarantee maxVolumetricSpeed gets via its top-level field.
+    // A RESOLVED profile keeps chamber cleanly in calibrations[].chamberTemp and
+    // out of the filament-global bag (the #950 fix's whole point).
+    //
+    // Codex P1 on PR #968: base on the MERGED settings bag (existing + incoming
+    // passthrough), NOT `update.settings` — which is only assigned when
+    // `settingsResult.added.length > 0`, so for an existing filament whose profile
+    // adds no passthrough keys it is undefined here, and starting from {} would make
+    // the later `$set` REPLACE the whole bag, dropping existing filament_notes /
+    // filament_soluble / slicer options. `settingsResult.settings` is always the
+    // full {existing, ...incoming} bag. Skip when the merge errored (the route 400s
+    // on it anyway) so we never build on a partial bag.
+    if (parsed.calibrationHints.chamberTemp != null && !settingsResult.error) {
+        if (!calibrationOutcome.applied) {
+            // Unresolved: no structural home → preserve the raw chamber keys in the bag.
+            // Route them through the CAPPED merge (Codex r7) so appending them can't
+            // bypass MAX_SETTINGS_KEYS; a genuinely over-cap result surfaces as
+            // settingsResult.error → the route 400s instead of silently over-filling.
+            const chamberMerge = mergeSlicerSettings(settingsResult.settings, {
+                chamber_temperature: String(parsed.calibrationHints.chamberTemp),
+                activate_chamber_temp_control: "1",
+            }, new Set());
+            if (chamberMerge.error)
+                settingsResult.error = chamberMerge.error;
+            else
+                update.settings = chamberMerge.settings;
+        }
+        else if ("chamber_temperature" in settingsResult.settings ||
+            "activate_chamber_temp_control" in settingsResult.settings) {
+            // Codex P2 on PR #968 r4: the chamber value went to calibrations[].chamberTemp
+            // (authoritative, per-nozzle). Strip any STALE raw chamber keys the merged bag
+            // carried over from a PRIOR unresolved/disabled import — otherwise they'd
+            // re-export as a filament-global chamber value that double-counts the
+            // calibration. The parser already excludes the INCOMING chamber keys from the
+            // bag, so this only clears a carried-over value from `existing`.
+            const settings = { ...settingsResult.settings };
+            delete settings.chamber_temperature;
+            delete settings.activate_chamber_temp_control;
+            update.settings = settings;
+        }
+    }
+    // GH #1075: a variant's Bambu/Orca export flattens its settings bag through
+    // resolveFilament's shallow parent-merge (`{ ...parentSettings,
+    // ...variantSettings }`), so the exported preset echoes every passthrough
+    // key the variant merely INHERITS. Persisting the merged bag verbatim would
+    // copy those echoed keys onto the variant as local overrides and silently
+    // sever GH #106 live inheritance — the same defect class #1008 F2 fixed for
+    // the Orca/PrusaSlicer per-id syncs via `splitInheritedImportSet`'s settings
+    // branch (importFilaments.ts). Apply the SAME rule to the FINALIZED bag —
+    // after mergeSlicerSettings, the legacy-condition strip, and the chamber
+    // fallback above, so those keys need no special-casing (strict equality
+    // handles them): drop every key whose value strictly equals the parent's.
+    // Because `update.settings` is a whole-object $set, the filtered write also
+    // self-heals a STORED parent-equal pin (the GH #971/#972-locked posture);
+    // variant-only keys differ from the parent by construction and survive the
+    // replace. Gated on the bag actually being written (`update.settings`
+    // assigned above) — a sync that never touches the bag keeps today's
+    // no-write behaviour, matching the OrcaSlicer route's added/removed
+    // persist-gate. A missing or malformed parent settings object proves
+    // nothing, so the bag writes verbatim (same fallback as
+    // splitInheritedImportSet's settings branch).
+    const parentSettings = existing?.parentId && existing.parent ? existing.parent.settings : null;
+    if (update.settings &&
+        parentSettings &&
+        typeof parentSettings === "object" &&
+        !Array.isArray(parentSettings)) {
+        const bag = update.settings;
+        const parentBag = parentSettings;
+        const filtered = {};
+        for (const [key, value] of Object.entries(bag)) {
+            if (parentBag[key] !== value)
+                filtered[key] = value;
+        }
+        update.settings = filtered;
+    }
+    // GH #892: reject an inverted nozzle range, mirroring the OrcaSlicer sync
+    // route. `update.temperatures` is a full replace (built from existing +
+    // parsed), so it IS the effective own range; the variant inherits any null
+    // endpoint from its already-resolved parent. The caller maps true → 400.
+    //
+    // Codex P2 (#921): gate on whether THIS profile actually carried a range
+    // endpoint. buildStructuredUpdate copies the stored endpoints into
+    // update.temperatures even when the profile only set e.g. nozzle_temperature,
+    // so without this gate an unrelated sync against legacy data that already has
+    // an inverted (own or inherited) range would 400. Matches the OrcaSlicer
+    // route's `touchesNozzleRange` gate (validate only on actual range input).
+    const incoming = parsed.filament.temperatures;
+    const rangeTouched = incoming?.nozzleRangeMin != null || incoming?.nozzleRangeMax != null;
+    const nozzleRangeInverted = rangeTouched &&
+        isUpdateNozzleRangeInverted(update, existing?.temperatures, existing?.parent?.temperatures ?? null);
+    return { update, unsetKeys, settingsResult, calibrationOutcome, nozzleRangeInverted };
+}
+export function buildStructuredUpdate(parsed, existing) {
+    const u = {};
+    const unset = [];
+    // GH #403: when the existing doc is a variant of another filament,
+    // only PIN an inheritable scalar to the variant when the parsed
+    // value DIFFERS from what the parent already provides. If the parent
+    // already carries the same value, leave the variant alone so it
+    // continues to inherit dynamically via `resolveFilament` at read
+    // time. Same class as the GH #106 / #223 / #265 guards the
+    // PrusaSlicer-sync path uses.
+    //
+    // Codex P1 on PR #473: "leave the variant alone" only works when the
+    // variant doesn't ALREADY carry a stale local override. If the
+    // imported value matches the parent AND the variant currently has its
+    // own diverging value, a no-op leaves the stale value in place forever
+    // (it would never be cleared by a subsequent identical-to-parent
+    // import either). Emit an `$unset` for that field so the variant
+    // returns to inheriting from the parent — which is what the user
+    // expects when their slicer profile finally agrees with the parent.
+    //
+    // `color` is intentionally NOT inheritable (each variant has its
+    // own color — that's the whole point of being a variant) so it
+    // sets unconditionally below.
+    const parent = existing?.parent ?? null;
+    const isVariantWithParent = !!(existing?.parentId && parent);
+    const existingRow = existing;
+    const variantHasLocalValue = (key) => {
+        if (!existingRow)
+            return false;
+        const v = existingRow[key];
+        return v != null && v !== "";
+    };
+    // Codex P2 on PR #473 round 3: the Filament schema declares `vendor`
+    // and `type` as required. Routing them into `$unset` with
+    // `runValidators: true` (which both Bambu routes pass) would fail
+    // schema validation. For required fields, leave the variant override
+    // in place — it's still serving its purpose (it's not null), even if
+    // it now happens to equal the parent's value. Optional fields
+    // (density, cost, diameter, etc.) are safe to unset because the
+    // schema accepts missing/null and `resolveFilament` falls back to
+    // the parent. This matches the rule the form-side honours too:
+    // required fields never get cleared, only re-pointed.
+    const REQUIRED_FIELDS = new Set(["type", "vendor"]);
+    const setIfNotInherited = (key, parsedVal) => {
+        if (parsedVal == null)
+            return;
+        if (isVariantWithParent && parent && parent[key] === parsedVal) {
+            // Parent already carries this exact value. If the variant doc
+            // currently has a stale local value for this field AND the field
+            // is safe to unset (not required by the schema), emit $unset so
+            // inheritance resumes; otherwise leave the variant alone.
+            if (!REQUIRED_FIELDS.has(key) &&
+                variantHasLocalValue(key) &&
+                existingRow?.[key] !== parsedVal) {
+                unset.push(key);
+            }
+            return;
+        }
+        u[key] = parsedVal;
+    };
+    setIfNotInherited("type", parsed.type);
+    setIfNotInherited("vendor", parsed.vendor);
+    // not inheritable. GH #883: for a coextruded filament (null primary +
+    // secondaries) the export echoes secondaryColors[0] as the single color, so
+    // suppress writing that echo back onto the null primary; undefined = leave it.
+    if (parsed.color != null) {
+        // GH #913: pass the parent so an inherited-coextruded variant is detected.
+        const resolvedColor = resolveSyncBackColor(existing, parsed.color, parent);
+        if (resolvedColor !== undefined)
+            u.color = resolvedColor;
+    }
+    setIfNotInherited("diameter", parsed.diameter);
+    setIfNotInherited("density", parsed.density);
+    setIfNotInherited("cost", parsed.cost);
+    setIfNotInherited("maxVolumetricSpeed", parsed.maxVolumetricSpeed);
+    setIfNotInherited("shrinkageXY", parsed.shrinkageXY);
+    setIfNotInherited("shrinkageZ", parsed.shrinkageZ);
+    // Temperatures: merge with whatever's already on the doc so we don't
+    // clobber e.g. nozzleRangeMin when the import only carries `nozzle`.
+    //
+    // GH #1008 F5 (import-side guard, least-lossy — user decision; the export
+    // stays unchanged): `hot_plate_temp` double-maps on BOTH sides. The export
+    // emits it from `temperatures.bed` and then re-emits it from the
+    // "Hot Plate" bedTypeTemps entry (which wins when both exist); the parser
+    // inverts it into BOTH `temperatures.bed` AND a "Hot Plate" bedTypeTemps
+    // entry. So a filament with bed=60 + bedTypeTemps=[{Hot Plate, 65}] exports
+    // hot_plate_temp=65 only, and syncing that same profile back used to
+    // rewrite the generic bed temp 60→65 — silently replacing the value the
+    // PrusaSlicer export and OpenPrintTag writes read. Guard: when the parsed
+    // profile carries a distinct "Hot Plate" bedTypeTemps entry AND the target
+    // already has a bed temp (its own, or — for a variant — inherited from its
+    // parent, mirroring resolveFilament's own ?? parent), keep the stored value
+    // and do NOT merge the parsed hot-plate value into `temperatures.bed`. The
+    // plate-specific value still lands in bedTypeTemps["Hot Plate"] below, so
+    // nothing is lost and the Bambu round-trip stays stable. A fresh import
+    // (no existing bed temp anywhere) still seeds bed from hot_plate_temp.
+    // Same guard for `bedFirstLayer` / hot_plate_temp_initial_layer — the
+    // identical double-mapping.
+    const t = parsed.temperatures;
+    let tempKeys = Object.entries(t).filter(([, v]) => v != null);
+    const hotPlate = parsed.bedTypeTemps.find((e) => e.bedType === "Hot Plate");
+    if (hotPlate) {
+        const ownTemps = existing?.temperatures ?? {};
+        const inheritedTemps = isVariantWithParent
+            ? (parent?.temperatures ?? {})
+            : {};
+        const hasEffectiveBed = (sub) => (ownTemps[sub] ?? inheritedTemps[sub]) != null;
+        tempKeys = tempKeys.filter(([key, value]) => {
+            const guarded = (key === "bed" && hotPlate.temperature != null) ||
+                (key === "bedFirstLayer" && hotPlate.firstLayerTemperature != null);
+            if (!guarded || !hasEffectiveBed(key))
+                return true;
+            // Codex P2 on #1018: a PARENT-EQUAL incoming value must still reach the
+            // F4 nulling branch below — the hot-plate key is the only Bambu field
+            // that can express "set my bed back to the parent's", and filtering it
+            // here left a stale divergent variant pin un-healable forever (F4 nulls
+            // a parent-equal merged value, resuming GH #106 inheritance). Only a
+            // parent-DIVERGENT hot-plate value is suppressed, which is the F5
+            // data-loss case this guard exists for. `inheritedTemps` is {} for a
+            // standalone filament, so this passes nothing extra through there.
+            return value != null && value === inheritedTemps[key];
+        });
+    }
+    if (tempKeys.length > 0) {
+        const mergedTemps = {
+            ...(existing?.temperatures || {}),
+            ...Object.fromEntries(tempKeys),
+        };
+        // GH #1008 F4 (sibling of GH #403's scalar guard — which covers scalars
+        // only): a variant's export flattens its inherited temps through
+        // resolveFilament, so syncing that preset back used to write the
+        // parent's temps into the variant as local pins, severing GH #106 live
+        // inheritance. Reset each merged subfield whose value EQUALS the
+        // parent's to null — the inherit sentinel resolveFilament reads
+        // (own ?? parent) — so inheritance resumes; divergent values stay as
+        // genuine overrides. Null-in-the-object rather than a `$unset` because
+        // `u.temperatures` must STAY a nested full-replace object: the bulk
+        // route's create path spreads this update into `Filament.create`, where
+        // dotted keys would be silently dropped by strict mode (and a $unset
+        // would conflict with the object $set on the same path). This also
+        // self-heals a stale parent-equal pin the profile didn't touch (it rides
+        // in via the merge spread) — the GH #971 posture.
+        if (isVariantWithParent && parent) {
+            const parentTemps = parent.temperatures ?? {};
+            for (const sub of Object.keys(mergedTemps)) {
+                const v = mergedTemps[sub];
+                if (v != null && v === parentTemps[sub])
+                    mergedTemps[sub] = null;
+            }
+        }
+        u.temperatures = mergedTemps;
+    }
+    if (parsed.bedTypeTemps.length > 0) {
+        const existingBedTypes = (existing?.bedTypeTemps || []).map((e) => ({
+            bedType: e.bedType,
+            temperature: e.temperature ?? undefined,
+            firstLayerTemperature: e.firstLayerTemperature ?? undefined,
+        }));
+        const byName = new Map(existingBedTypes.map((e) => [e.bedType, e]));
+        for (const entry of parsed.bedTypeTemps) {
+            byName.set(entry.bedType, { ...byName.get(entry.bedType), ...entry });
+        }
+        const mergedBedTypes = [...byName.values()];
+        // GH #1008 F4: bedTypeTemps inherits as a WHOLE array (empty === inherit,
+        // GH #106/#477 array-fallback in resolveFilament). A variant's export
+        // flattens the parent's plate list into per-plate keys, so syncing it
+        // back used to materialize a full copy on the variant — a non-empty own
+        // array that then shadows every later parent edit. When the merged array
+        // deep-equals the parent's effective array (same entries by bedType,
+        // order-insensitive), write `[]` — the inherit sentinel — instead of the
+        // copy. Writing [] (rather than skipping) also self-heals a stale
+        // materialized copy that now matches the parent (GH #971 posture). A
+        // divergent merged array still writes as a genuine override.
+        if (isVariantWithParent &&
+            parent &&
+            bedTypeTempsEqualParent(mergedBedTypes, parent.bedTypeTemps)) {
+            u.bedTypeTemps = [];
+        }
+        else {
+            u.bedTypeTemps = mergedBedTypes;
+        }
+    }
+    return { set: u, unset };
+}
+/**
+ * GH #1008 F4: order-insensitive deep equality between the merged
+ * bedTypeTemps array and the parent's effective array (a parent is never
+ * itself a variant, so its own array IS its effective array). Entries match
+ * when bedType, temperature, and firstLayerTemperature agree —
+ * null/undefined are collapsed (the model stores null defaults where the
+ * parser emits undefined). Conservative on malformed parent data (duplicate
+ * bedTypes, non-array): returns false so the merged array writes through.
+ */
+function bedTypeTempsEqualParent(merged, parentArr) {
+    if (!Array.isArray(parentArr) || parentArr.length !== merged.length) {
+        return false;
+    }
+    const byType = new Map();
+    for (const raw of parentArr) {
+        const e = raw;
+        if (typeof e.bedType !== "string" || byType.has(e.bedType))
+            return false;
+        byType.set(e.bedType, e);
+    }
+    return merged.every((m) => {
+        const p = byType.get(m.bedType);
+        return (p != null &&
+            (m.temperature ?? null) === (p.temperature ?? null) &&
+            (m.firstLayerTemperature ?? null) === (p.firstLayerTemperature ?? null));
+    });
+}
+/**
+ * Try to match the printer hint in the parsed profile to a Printer doc
+ * and one of its installed nozzles. When that succeeds we add/update a
+ * `calibrations[]` entry on `update`. When it fails, the
+ * maxVolumetricSpeed value still lands as a top-level update (handled
+ * in `buildStructuredUpdate`) but per-nozzle-only hints are dropped.
+ */
+export async function resolveAndApplyCalibration(parsed, hints, update, existing) {
+    // GH #950 (Codex P2 on PR #968): decouple "attempt resolution" from "warn".
+    // chamber_temperature has a structured home too — calibrations[].chamberTemp —
+    // so we must TRY to resolve a printer/nozzle whenever a chamber temp is present,
+    // even though chamber is excluded from `hasAnyHint`. The UNRESOLVED WARNING,
+    // however, stays gated on `hasAnyHint`: chamber has a settings-bag fallback (see
+    // prepareBambuUpdate), so a chamber-only profile that can't resolve loses
+    // nothing and must not surface a misleading "calibration unresolved" toast.
+    // GH #950 (Codex r5): also attempt resolution when the profile DISABLES chamber
+    // heating — a resolved context lets us CLEAR a pre-existing calibrations[].
+    // chamberTemp so the disable actually takes (else /calibration re-enables it).
+    const wantsResolution = hints.hasAnyHint || hints.chamberTemp != null || hints.chamberDisabled === true;
+    if (!wantsResolution) {
+        return { applied: false, unresolved: false };
+    }
+    const ctx = await matchPrinterNozzle(hints);
+    if (!ctx) {
+        // Per-nozzle hints (if any) are dropped → warn. A chamber-only profile has
+        // its settings-bag fallback, so its presence alone does NOT warn.
+        return { applied: false, unresolved: hints.hasAnyHint };
+    }
+    const row = {
+        printer: ctx.printerId,
+        nozzle: ctx.nozzleId,
+    };
+    // Chamber: write a new value, or (on an explicit disable) null to clear it. This
+    // is the ONE thing a chamber-only sync (enabled or disabled) writes to the row.
+    if (hints.chamberTemp != null)
+        row.chamberTemp = hints.chamberTemp; // GH #950
+    else if (hints.chamberDisabled === true)
+        row.chamberTemp = null;
+    // All NON-chamber calibration values + ordinary temps: copied ONLY when there's
+    // a real per-nozzle hint (`hasAnyHint`). GH #950 (Codex r6/r7/r11): a chamber-only
+    // sync — whether it ENABLES chamber (chamberTemp != null) or disables it — must
+    // NOT pin the profile's top-level-homed temps / max-vol into calibrations[].
+    // Those already land on the filament via buildStructuredUpdate; a fabricated
+    // per-nozzle override would later shadow user-edited top-level values. Gating on
+    // `hasAnyHint` (not merely "chamber present") closes the enabled + disabled cases
+    // together — max-vol is excluded from hasAnyHint precisely because it has a
+    // top-level home, so a chamber+max-vol-only sync leaves max-vol at the top level.
+    if (hints.hasAnyHint) {
+        if (hints.extrusionMultiplier != null)
+            row.extrusionMultiplier = hints.extrusionMultiplier;
+        if (hints.maxVolumetricSpeed != null)
+            row.maxVolumetricSpeed = hints.maxVolumetricSpeed;
+        if (hints.pressureAdvance != null)
+            row.pressureAdvance = hints.pressureAdvance;
+        if (hints.retractLength != null)
+            row.retractLength = hints.retractLength;
+        if (hints.retractSpeed != null)
+            row.retractSpeed = hints.retractSpeed;
+        if (hints.retractLift != null)
+            row.retractLift = hints.retractLift;
+        if (hints.fanMinSpeed != null)
+            row.fanMinSpeed = hints.fanMinSpeed;
+        if (hints.fanMaxSpeed != null)
+            row.fanMaxSpeed = hints.fanMaxSpeed;
+        if (hints.fanBridgeSpeed != null)
+            row.fanBridgeSpeed = hints.fanBridgeSpeed;
+        if (parsed.temperatures.nozzle != null)
+            row.nozzleTemp = parsed.temperatures.nozzle;
+        if (parsed.temperatures.nozzleFirstLayer != null)
+            row.nozzleTempFirstLayer = parsed.temperatures.nozzleFirstLayer;
+        if (parsed.temperatures.bed != null)
+            row.bedTemp = parsed.temperatures.bed;
+        if (parsed.temperatures.bedFirstLayer != null)
+            row.bedTempFirstLayer = parsed.temperatures.bedFirstLayer;
+    }
+    // Normalize to PLAIN objects before spreading: the bulk/per-id routes pass a
+    // HYDRATED Mongoose doc, so `existing.calibrations[i]` are Mongoose subdocuments
+    // whose schema-field data lives in `_doc` (exposed via prototype getters, NOT own
+    // enumerable props). `{ ...subdoc }` would drop that data, so merging a new value
+    // onto an existing row silently lost the row's other fields (latent pre-#950 bug,
+    // only reachable when a re-sync updates an EXISTING calibration row — now exercised
+    // by the chamber-disable clear). `.toObject()` materialises the real data; plain
+    // objects (unit tests) have no toObject and pass through unchanged.
+    const existingRows = (existing?.calibrations || []).map((c) => {
+        const maybe = c;
+        return typeof maybe?.toObject === "function" ? maybe.toObject() : c;
+    });
+    const idx = existingRows.findIndex((c) => String(c.printer) === ctx.printerId && String(c.nozzle) === ctx.nozzleId);
+    const merged = [...existingRows];
+    if (idx >= 0) {
+        // A chamber-only sync merges just its chamber value here (a real hint also
+        // brings its calibration fields); the matched row's other fields stay intact.
+        merged[idx] = { ...merged[idx], ...row };
+    }
+    else {
+        // GH #950 (Codex r5/r6/r11): create a row only when there's real data to store
+        // — a per-nozzle hint, or an ENABLED chamber value (chamberTemp != null, its
+        // structured home). A bare chamber CLEAR (chamberTemp === null) with no
+        // matching row has nothing to clear, so don't fabricate an empty row.
+        if (!hints.hasAnyHint && row.chamberTemp == null) {
+            return { applied: false, unresolved: false };
+        }
+        merged.push(row);
+    }
+    update.calibrations = merged;
+    return { applied: true, unresolved: false, context: ctx };
+}
+/**
+ * Parse `printer_settings_id` (or the compatible_printers fallback)
+ * into a model name + nozzle diameter, look up a Printer that matches,
+ * and pick the unique installed nozzle at that diameter.
+ *
+ * Bambu printer_settings_id format examples:
+ *   "Bambu Lab P1S 0.4 nozzle"
+ *   "Bambu Lab X1C 0.6 nozzle"
+ *   "Prusa Core One 0.4"
+ */
+async function matchPrinterNozzle(hints) {
+    const hint = hints.printerSettingsId ?? hints.compatiblePrinters;
+    if (!hint)
+        return null;
+    // Extract trailing diameter. The "nozzle" suffix is optional because
+    // some exports omit it (Prusa-format presets, OrcaSlicer custom names).
+    const diameterMatch = hint.match(/(\d+(?:\.\d+)?)\s*(?:nozzle)?\s*$/i);
+    if (!diameterMatch)
+        return null;
+    const diameter = Number(diameterMatch[1]);
+    if (!Number.isFinite(diameter) || diameter <= 0)
+        return null;
+    // The substring up to the diameter is the printer-name hint.
+    const modelHint = hint
+        .slice(0, diameterMatch.index)
+        .trim()
+        .replace(/[-—]\s*$/, "");
+    if (!modelHint)
+        return null;
+    // Find printers whose name CONTAINS the model hint (case-insensitive).
+    // Users name their printers freely ("My Bambu", "Prusa in the garage"),
+    // so the contains check on either side is a pragmatic heuristic.
+    //
+    // Codex P2 on PR #387: collect ALL matches and punt to unresolved when
+    // >1 — silently picking the first when "Bambu Lab P1S" matches both
+    // "Bambu Lab P1S" and "Bambu Lab P1S (downstairs)" would tag the
+    // calibration to whichever Mongo returned first (nondeterministic, and
+    // wrong on average). Same posture as the ambiguous-nozzle branch
+    // below.
+    const printers = await Printer.find({ _deletedAt: null })
+        .populate("installedNozzles")
+        .lean();
+    const re = new RegExp(escapeRegex(modelHint), "i");
+    const matches = printers.filter((p) => re.test(p.name) || re.test(`${p.manufacturer} ${p.printerModel}`));
+    if (matches.length !== 1)
+        return null;
+    const matched = matches[0];
+    // `installedNozzles` is typed as ObjectId[] on the model, but
+    // `.populate()` replaces those refs with the full Nozzle docs at
+    // runtime. Cast through `unknown` so TS lets us read the populated shape.
+    const candidates = matched.installedNozzles ?? [];
+    const sameDiameter = candidates.filter((n) => Math.abs(n.diameter - diameter) < 0.001);
+    if (sameDiameter.length === 1) {
+        return {
+            printerId: String(matched._id),
+            printerName: matched.name,
+            nozzleId: String(sameDiameter[0]._id),
+            nozzleDiameter: diameter,
+        };
+    }
+    if (sameDiameter.length === 0) {
+        // Fallback: the matched printer doesn't have a nozzle at this
+        // diameter installed yet, but maybe a matching one exists in the
+        // global catalog. Codex P2 on PR #387 round 4: `findOne` here was
+        // non-deterministic when MULTIPLE global nozzles share the
+        // diameter (Brass / Hardened / ObXidian variants — common). Use
+        // `find` + a length check so we only adopt a global nozzle when
+        // exactly one candidate exists; otherwise punt to unresolved, same
+        // posture as the in-printer ambiguous branch right below.
+        const globalCandidates = await Nozzle.find({
+            diameter,
+            _deletedAt: null,
+        }).lean();
+        if (globalCandidates.length !== 1)
+            return null;
+        return {
+            printerId: String(matched._id),
+            printerName: matched.name,
+            nozzleId: String(globalCandidates[0]._id),
+            nozzleDiameter: diameter,
+        };
+    }
+    // >1 candidate — ambiguous (e.g. Brass + ObXidian 0.4 on the same
+    // machine). Punt rather than guess; the caller surfaces unresolved.
+    return null;
+}
+function escapeRegex(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}

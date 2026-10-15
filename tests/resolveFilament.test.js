@@ -1,0 +1,558 @@
+import { describe, it, expect, beforeAll } from "vitest";
+import { resolveFilament, hasVariants, VARIANT_ONLY_FIELDS, INHERITABLE_FIELDS, } from "@/lib/resolveFilament";
+const makeParent = (overrides = {}) => ({
+    _id: "parent-id",
+    name: "Prusament PC Blend",
+    vendor: "Prusament",
+    type: "PC",
+    color: "#333333",
+    cost: 35,
+    density: 1.22,
+    diameter: 1.75,
+    temperatures: {
+        nozzle: 275,
+        nozzleFirstLayer: 280,
+        bed: 110,
+        bedFirstLayer: 115,
+        nozzleRangeMin: 260,
+        nozzleRangeMax: 290,
+        standby: 150,
+    },
+    maxVolumetricSpeed: 8,
+    compatibleNozzles: ["nozzle-1", "nozzle-2"],
+    calibrations: [
+        { nozzle: "nozzle-1", extrusionMultiplier: 0.95, maxVolumetricSpeed: null, pressureAdvance: 0.05, retractLength: null, retractSpeed: null, retractLift: null },
+    ],
+    tdsUrl: "https://example.com/tds.pdf",
+    inherits: "Generic PC",
+    parentId: null,
+    settings: { chamber_temperature: "40", filament_retract_length: "0.8" },
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    ...overrides,
+});
+const makeVariant = (overrides = {}) => ({
+    _id: "variant-id",
+    name: "Prusament PC Blend - Galaxy Black",
+    vendor: "",
+    type: "",
+    color: "#1a1a2e",
+    cost: null,
+    density: null,
+    diameter: null,
+    temperatures: {
+        nozzle: null,
+        nozzleFirstLayer: null,
+        bed: null,
+        bedFirstLayer: null,
+        nozzleRangeMin: null,
+        nozzleRangeMax: null,
+        standby: null,
+    },
+    maxVolumetricSpeed: null,
+    compatibleNozzles: [],
+    calibrations: [],
+    tdsUrl: null,
+    inherits: null,
+    parentId: "parent-id",
+    settings: {},
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    ...overrides,
+});
+describe("resolveFilament", () => {
+    it("returns standalone filament unchanged with empty _inherited", () => {
+        const standalone = makeParent();
+        const result = resolveFilament(standalone, null);
+        expect(result._inherited).toEqual([]);
+        expect(result.name).toBe("Prusament PC Blend");
+        expect(result.vendor).toBe("Prusament");
+    });
+    it("inherits vendor and type from parent when variant has empty values", () => {
+        const parent = makeParent();
+        const variant = makeVariant();
+        const result = resolveFilament(variant, parent);
+        expect(result.vendor).toBe("Prusament");
+        expect(result.type).toBe("PC");
+        expect(result._inherited).toContain("vendor");
+        expect(result._inherited).toContain("type");
+    });
+    it("keeps variant name and color (never inherited)", () => {
+        const parent = makeParent();
+        const variant = makeVariant();
+        const result = resolveFilament(variant, parent);
+        expect(result.name).toBe("Prusament PC Blend - Galaxy Black");
+        expect(result.color).toBe("#1a1a2e");
+        expect(result._inherited).not.toContain("name");
+        expect(result._inherited).not.toContain("color");
+    });
+    it("inherits temperatures from parent", () => {
+        const parent = makeParent();
+        const variant = makeVariant();
+        const result = resolveFilament(variant, parent);
+        expect(result.temperatures.nozzle).toBe(275);
+        expect(result.temperatures.bed).toBe(110);
+        expect(result._inherited).toContain("temperatures.nozzle");
+        expect(result._inherited).toContain("temperatures.bed");
+    });
+    it("inherits nozzleRangeMin, nozzleRangeMax, and standby temps from parent", () => {
+        const parent = makeParent();
+        const variant = makeVariant();
+        const result = resolveFilament(variant, parent);
+        expect(result.temperatures.nozzleRangeMin).toBe(260);
+        expect(result.temperatures.nozzleRangeMax).toBe(290);
+        expect(result.temperatures.standby).toBe(150);
+        expect(result._inherited).toContain("temperatures.nozzleRangeMin");
+        expect(result._inherited).toContain("temperatures.nozzleRangeMax");
+        expect(result._inherited).toContain("temperatures.standby");
+    });
+    it("variant can override individual temperature fields", () => {
+        const parent = makeParent();
+        const variant = makeVariant({
+            temperatures: { nozzle: 270, nozzleFirstLayer: null, bed: null, bedFirstLayer: null, nozzleRangeMin: null, nozzleRangeMax: null, standby: null },
+        });
+        const result = resolveFilament(variant, parent);
+        expect(result.temperatures.nozzle).toBe(270);
+        expect(result.temperatures.bed).toBe(110); // inherited
+        expect(result._inherited).not.toContain("temperatures.nozzle");
+        expect(result._inherited).toContain("temperatures.bed");
+    });
+    it("inherits density and diameter from parent", () => {
+        const parent = makeParent();
+        const variant = makeVariant();
+        const result = resolveFilament(variant, parent);
+        expect(result.density).toBe(1.22);
+        expect(result._inherited).toContain("density");
+    });
+    it("variant can override cost", () => {
+        const parent = makeParent();
+        const variant = makeVariant({ cost: 40 });
+        const result = resolveFilament(variant, parent);
+        expect(result.cost).toBe(40);
+        expect(result._inherited).not.toContain("cost");
+    });
+    it("inherits compatibleNozzles when variant has undefined", () => {
+        const parent = makeParent();
+        const variant = makeVariant({ compatibleNozzles: undefined });
+        const result = resolveFilament(variant, parent);
+        expect(result.compatibleNozzles).toEqual(["nozzle-1", "nozzle-2"]);
+        expect(result._inherited).toContain("compatibleNozzles");
+    });
+    it("variant can override compatibleNozzles", () => {
+        const parent = makeParent();
+        const variant = makeVariant({ compatibleNozzles: ["nozzle-3"] });
+        const result = resolveFilament(variant, parent);
+        expect(result.compatibleNozzles).toEqual(["nozzle-3"]);
+        expect(result._inherited).not.toContain("compatibleNozzles");
+    });
+    it("inherits calibrations when variant has undefined", () => {
+        const parent = makeParent();
+        const variant = makeVariant({ calibrations: undefined });
+        const result = resolveFilament(variant, parent);
+        expect(result.calibrations).toHaveLength(1);
+        expect(result._inherited).toContain("calibrations");
+    });
+    it("merges settings — parent base with variant overrides", () => {
+        const parent = makeParent();
+        const variant = makeVariant({
+            settings: { chamber_temperature: "50" },
+        });
+        const result = resolveFilament(variant, parent);
+        expect(result.settings.chamber_temperature).toBe("50"); // variant override
+        expect(result.settings.filament_retract_length).toBe("0.8"); // from parent
+    });
+    it("inherits tdsUrl from parent", () => {
+        const parent = makeParent();
+        const variant = makeVariant();
+        const result = resolveFilament(variant, parent);
+        expect(result.tdsUrl).toBe("https://example.com/tds.pdf");
+        expect(result._inherited).toContain("tdsUrl");
+    });
+    it("variant can override tdsUrl", () => {
+        const parent = makeParent();
+        const variant = makeVariant({ tdsUrl: "https://example.com/variant-tds.pdf" });
+        const result = resolveFilament(variant, parent);
+        expect(result.tdsUrl).toBe("https://example.com/variant-tds.pdf");
+        expect(result._inherited).not.toContain("tdsUrl");
+    });
+    it("handles missing parent gracefully (no parentId)", () => {
+        const variant = makeVariant({ parentId: null });
+        const result = resolveFilament(variant, null);
+        expect(result._inherited).toEqual([]);
+        expect(result.vendor).toBe("");
+    });
+    it("does not inherit spools from parent (variant-only field)", () => {
+        const parent = makeParent({
+            spools: [{ _id: "spool-1", label: "Parent Spool", totalWeight: 800 }],
+        });
+        const variant = makeVariant({
+            spools: [{ _id: "spool-2", label: "Variant Spool", totalWeight: 500 }],
+        });
+        const result = resolveFilament(variant, parent);
+        expect(result.spools).toHaveLength(1);
+        expect(result.spools[0].label).toBe("Variant Spool");
+    });
+    it("variant with empty spools does not get parent spools", () => {
+        const parent = makeParent({
+            spools: [{ _id: "spool-1", label: "Parent Spool", totalWeight: 800 }],
+        });
+        const variant = makeVariant({ spools: [] });
+        const result = resolveFilament(variant, parent);
+        expect(result.spools).toEqual([]);
+    });
+    it("inherits spoolWeight and netFilamentWeight from parent", () => {
+        const parent = makeParent({ spoolWeight: 200, netFilamentWeight: 1000 });
+        const variant = makeVariant({ spoolWeight: null, netFilamentWeight: null });
+        const result = resolveFilament(variant, parent);
+        expect(result.spoolWeight).toBe(200);
+        expect(result.netFilamentWeight).toBe(1000);
+        expect(result._inherited).toContain("spoolWeight");
+        expect(result._inherited).toContain("netFilamentWeight");
+    });
+    it("inherits presets when variant has undefined", () => {
+        const parent = makeParent({
+            presets: [{ label: "Default", extrusionMultiplier: 0.95, temperatures: { nozzle: 275, nozzleFirstLayer: null, bed: null, bedFirstLayer: null } }],
+        });
+        const variant = makeVariant({ presets: undefined });
+        const result = resolveFilament(variant, parent);
+        expect(result.presets).toHaveLength(1);
+        expect(result._inherited).toContain("presets");
+    });
+    it("uses variant's own calibrations when it has them", () => {
+        const parent = makeParent();
+        const variant = makeVariant({
+            calibrations: [
+                { nozzle: "nozzle-3", extrusionMultiplier: 0.98, maxVolumetricSpeed: 12, pressureAdvance: 0.04, retractLength: null, retractSpeed: null, retractLift: null },
+            ],
+        });
+        const result = resolveFilament(variant, parent);
+        expect(result.calibrations).toHaveLength(1);
+        expect(result.calibrations[0].nozzle).toBe("nozzle-3");
+        expect(result._inherited).not.toContain("calibrations");
+    });
+    it("uses variant's own presets when it has them", () => {
+        const parent = makeParent({
+            presets: [{ label: "Parent Preset", extrusionMultiplier: 0.95, temperatures: {} }],
+        });
+        const variant = makeVariant({
+            presets: [{ label: "Variant Preset", extrusionMultiplier: 0.97, temperatures: {} }],
+        });
+        const result = resolveFilament(variant, parent);
+        expect(result.presets).toHaveLength(1);
+        expect(result.presets[0].label).toBe("Variant Preset");
+        expect(result._inherited).not.toContain("presets");
+    });
+    it("inherits settings fully when variant has none", () => {
+        const parent = makeParent();
+        const variant = makeVariant({ settings: {} });
+        const result = resolveFilament(variant, parent);
+        expect(result.settings.chamber_temperature).toBe("40");
+        expect(result._inherited).toContain("settings");
+    });
+    it("copies colorName from variant (never inherited)", () => {
+        const parent = makeParent({ colorName: "Prusa Orange" });
+        const variant = makeVariant({ colorName: "Galaxy Black" });
+        const result = resolveFilament(variant, parent);
+        expect(result.colorName).toBe("Galaxy Black");
+        expect(result._inherited).not.toContain("colorName");
+    });
+    it("does not inherit colorName when variant has none", () => {
+        const parent = makeParent({ colorName: "Prusa Orange" });
+        const variant = makeVariant({ colorName: undefined });
+        const result = resolveFilament(variant, parent);
+        expect(result.colorName).toBeUndefined();
+        expect(result._inherited).not.toContain("colorName");
+    });
+    it("copies instanceId and syncId from variant (never inherited)", () => {
+        const parent = makeParent({ instanceId: "parent-inst", syncId: "parent-sync" });
+        const variant = makeVariant({ instanceId: "variant-inst", syncId: "variant-sync" });
+        const result = resolveFilament(variant, parent);
+        expect(result.instanceId).toBe("variant-inst");
+        expect(result.syncId).toBe("variant-sync");
+    });
+    it("copies _deletedAt from variant (never inherited)", () => {
+        const deletedAt = new Date();
+        const parent = makeParent({ _deletedAt: null });
+        const variant = makeVariant({ _deletedAt: deletedAt });
+        const result = resolveFilament(variant, parent);
+        expect(result._deletedAt).toBe(deletedAt);
+    });
+    it("inherits optTags from parent when variant has undefined", () => {
+        const parent = makeParent({ optTags: [1, 2, 4] });
+        const variant = makeVariant({ optTags: undefined });
+        const result = resolveFilament(variant, parent);
+        expect(result.optTags).toEqual([1, 2, 4]);
+        expect(result._inherited).toContain("optTags");
+    });
+    it("uses variant optTags when it has them", () => {
+        const parent = makeParent({ optTags: [1, 2] });
+        const variant = makeVariant({ optTags: [8] });
+        const result = resolveFilament(variant, parent);
+        expect(result.optTags).toEqual([8]);
+        expect(result._inherited).not.toContain("optTags");
+    });
+    it("inherits bedTypeTemps from parent when variant has undefined", () => {
+        const parentBedTemps = [{ bedType: "Textured PEI", temperature: 85, firstLayerTemperature: 90 }];
+        const parent = makeParent({ bedTypeTemps: parentBedTemps });
+        const variant = makeVariant({ bedTypeTemps: undefined });
+        const result = resolveFilament(variant, parent);
+        expect(result.bedTypeTemps).toEqual(parentBedTemps);
+        expect(result._inherited).toContain("bedTypeTemps");
+    });
+    it("uses variant bedTypeTemps when it has them", () => {
+        const parentBedTemps = [{ bedType: "Textured PEI", temperature: 85 }];
+        const variantBedTemps = [{ bedType: "Smooth PEI", temperature: 90 }];
+        const parent = makeParent({ bedTypeTemps: parentBedTemps });
+        const variant = makeVariant({ bedTypeTemps: variantBedTemps });
+        const result = resolveFilament(variant, parent);
+        expect(result.bedTypeTemps).toEqual(variantBedTemps);
+        expect(result._inherited).not.toContain("bedTypeTemps");
+    });
+    it("copies totalWeight from variant (never inherited)", () => {
+        const parent = makeParent({ totalWeight: 1200 });
+        const variant = makeVariant({ totalWeight: 800 });
+        const result = resolveFilament(variant, parent);
+        expect(result.totalWeight).toBe(800);
+    });
+    // --- GH #633: fields the allowlists used to silently drop ---
+    // lowStockThreshold is variant-only, NOT inherited (Codex P2 on PR #648):
+    // the list aggregation + dashboard read it raw with no parent fallback, so
+    // inheriting it in resolveFilament would make the variant's detail/export
+    // view disagree with its list badge. It must still be PRESERVED (the #633
+    // bug was the field silently vanishing because it was in neither allowlist).
+    it("preserves the variant's own lowStockThreshold, never inheriting (#633, #648)", () => {
+        const parent = makeParent({ lowStockThreshold: 250 });
+        const variant = makeVariant({ lowStockThreshold: 100 });
+        const result = resolveFilament(variant, parent);
+        expect(result.lowStockThreshold).toBe(100);
+        expect(result._inherited).not.toContain("lowStockThreshold");
+    });
+    it("does not fall back to the parent's lowStockThreshold (#648)", () => {
+        const parent = makeParent({ lowStockThreshold: 250 });
+        const variant = makeVariant({ lowStockThreshold: null });
+        const result = resolveFilament(variant, parent);
+        expect(result.lowStockThreshold).toBeNull();
+        expect(result._inherited).not.toContain("lowStockThreshold");
+    });
+    it("copies openprinttagSnapshot from variant (never inherited) (#633)", () => {
+        // OPT re-sync provenance describes THIS document's last-seen upstream
+        // offer — inheriting the parent's snapshot would misclassify every
+        // diff on the variant as "OPT-owned".
+        const parent = makeParent({ openprinttagSnapshot: { density: 1.24 } });
+        const variant = makeVariant({ openprinttagSnapshot: { density: 1.3 } });
+        const result = resolveFilament(variant, parent);
+        expect(result.openprinttagSnapshot).toEqual({ density: 1.3 });
+        expect(result._inherited).not.toContain("openprinttagSnapshot");
+    });
+    it("does not inherit openprinttagSnapshot when variant has none (#633)", () => {
+        const parent = makeParent({ openprinttagSnapshot: { density: 1.24 } });
+        const variant = makeVariant({ openprinttagSnapshot: null });
+        const result = resolveFilament(variant, parent);
+        expect(result.openprinttagSnapshot).toBeNull();
+        expect(result._inherited).not.toContain("openprinttagSnapshot");
+    });
+    it("copies _purged from variant (never inherited) (#633)", () => {
+        const parent = makeParent({ _purged: true });
+        const variant = makeVariant({ _purged: false });
+        const result = resolveFilament(variant, parent);
+        expect(result._purged).toBe(false);
+    });
+    // --- GH #106: empty array on a variant inherits from parent ---
+    //
+    // Previously a variant's empty array (e.g. calibrations: []) was treated
+    // as an explicit "override to empty" — but Mongoose always materialises
+    // array fields as [] at load time, so variants silently lost inheritance
+    // the moment they were fetched. Treating empty === inherit fixes the
+    // ongoing parent→variant relationship reported in issue #106.
+    it("inherits compatibleNozzles when variant has empty array", () => {
+        const parent = makeParent({ compatibleNozzles: ["nozzle-1", "nozzle-2"] });
+        const variant = makeVariant({ compatibleNozzles: [] });
+        const result = resolveFilament(variant, parent);
+        expect(result.compatibleNozzles).toEqual(["nozzle-1", "nozzle-2"]);
+        expect(result._inherited).toContain("compatibleNozzles");
+    });
+    it("inherits optTags when variant has empty array", () => {
+        const parent = makeParent({ optTags: [1, 2, 4] });
+        const variant = makeVariant({ optTags: [] });
+        const result = resolveFilament(variant, parent);
+        expect(result.optTags).toEqual([1, 2, 4]);
+        expect(result._inherited).toContain("optTags");
+    });
+    it("inherits calibrations when variant has empty array", () => {
+        const parent = makeParent();
+        const variant = makeVariant({ calibrations: [] });
+        const result = resolveFilament(variant, parent);
+        // Parent's calibrations were one entry per the makeParent helper.
+        expect(result.calibrations).toHaveLength(1);
+        expect(result._inherited).toContain("calibrations");
+    });
+    it("inherits presets when variant has empty array", () => {
+        const parent = makeParent({
+            presets: [{ label: "Default", extrusionMultiplier: 0.95, temperatures: {} }],
+        });
+        const variant = makeVariant({ presets: [] });
+        const result = resolveFilament(variant, parent);
+        expect(result.presets).toHaveLength(1);
+        expect(result._inherited).toContain("presets");
+    });
+    it("inherits bedTypeTemps when variant has empty array", () => {
+        const parent = makeParent({
+            bedTypeTemps: [{ bedType: "Textured PEI", temperature: 85 }],
+        });
+        const variant = makeVariant({ bedTypeTemps: [] });
+        const result = resolveFilament(variant, parent);
+        expect(result.bedTypeTemps).toHaveLength(1);
+        expect(result._inherited).toContain("bedTypeTemps");
+    });
+    it("variant's non-empty array overrides the parent's", () => {
+        const parent = makeParent({ compatibleNozzles: ["nozzle-1", "nozzle-2"] });
+        const variant = makeVariant({ compatibleNozzles: ["nozzle-3"] });
+        const result = resolveFilament(variant, parent);
+        expect(result.compatibleNozzles).toEqual(["nozzle-3"]);
+        expect(result._inherited).not.toContain("compatibleNozzles");
+    });
+    // GH #477: secondaryColors uses the same array-fallback inheritance
+    // pattern as optTags / compatibleNozzles. Tested separately because
+    // it's the first nullable-primary-aware field — null variant color
+    // must NOT trigger inheritance (color is VARIANT_ONLY_FIELDS), while
+    // empty secondaryColors DOES trigger inheritance.
+    describe("secondaryColors inheritance (#477)", () => {
+        it("inherits parent's secondaryColors when variant's is empty", () => {
+            const parent = makeParent({ secondaryColors: ["#FF0000", "#00FF00"] });
+            const variant = makeVariant({ secondaryColors: [] });
+            const result = resolveFilament(variant, parent);
+            expect(result.secondaryColors).toEqual(["#FF0000", "#00FF00"]);
+            expect(result._inherited).toContain("secondaryColors");
+        });
+        it("uses variant's secondaryColors when non-empty (overrides parent)", () => {
+            const parent = makeParent({ secondaryColors: ["#FF0000", "#00FF00"] });
+            const variant = makeVariant({ secondaryColors: ["#0000FF"] });
+            const result = resolveFilament(variant, parent);
+            expect(result.secondaryColors).toEqual(["#0000FF"]);
+            expect(result._inherited).not.toContain("secondaryColors");
+        });
+        it("returns empty array (not undefined) when neither variant nor parent has any", () => {
+            const parent = makeParent({});
+            const variant = makeVariant({});
+            const result = resolveFilament(variant, parent);
+            expect(result.secondaryColors).toEqual([]);
+            expect(result._inherited).not.toContain("secondaryColors");
+        });
+        it("preserves variant's null color even when parent has a color (no inheritance)", () => {
+            // Coextruded variants opt into null primary; that null must NOT
+            // be replaced by the parent's color. `color` is in
+            // VARIANT_ONLY_FIELDS so this is structural, not coincidental.
+            const parent = makeParent({ color: "#FF0000" });
+            const variant = makeVariant({
+                color: null,
+                secondaryColors: ["#00FF00", "#0000FF"],
+            });
+            const result = resolveFilament(variant, parent);
+            expect(result.color).toBeNull();
+            expect(result.secondaryColors).toEqual(["#00FF00", "#0000FF"]);
+        });
+    });
+});
+describe("hasVariants", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let Filament;
+    beforeAll(async () => {
+        const mongoose = await import("mongoose");
+        // Use the already-registered model or import it
+        Filament = mongoose.default.models.Filament || (await import("@/models/Filament")).default;
+    });
+    it("returns true when parent has non-deleted variants", async () => {
+        const parent = await Filament.create({ name: "HasVar Parent", vendor: "V", type: "PLA" });
+        await Filament.create({ name: "HasVar Child", vendor: "V", type: "PLA", parentId: parent._id });
+        expect(await hasVariants(Filament, parent._id.toString())).toBe(true);
+    });
+    it("returns false when parent has no variants", async () => {
+        const parent = await Filament.create({ name: "NoVar Parent", vendor: "V", type: "PLA" });
+        expect(await hasVariants(Filament, parent._id.toString())).toBe(false);
+    });
+    it("returns false when all variants are soft-deleted", async () => {
+        const parent = await Filament.create({ name: "SoftDel Parent", vendor: "V", type: "PLA" });
+        await Filament.create({
+            name: "SoftDel Child",
+            vendor: "V",
+            type: "PLA",
+            parentId: parent._id,
+            _deletedAt: new Date(),
+        });
+        expect(await hasVariants(Filament, parent._id.toString())).toBe(false);
+    });
+});
+/**
+ * GH #633 drift guard: resolveFilament rebuilds the resolved object from
+ * scratch, so any Filament schema field that is in neither allowlist nor
+ * the specially-handled merge logic silently vanishes from every resolved
+ * variant (that's exactly how lowStockThreshold, openprinttagSnapshot, and
+ * _purged got lost). This invariant diffs the schema's top-level paths
+ * against the union so the NEXT added field fails loudly here instead.
+ *
+ * Style mirrors tests/i18n-key-coverage.test.ts: derive the ground truth
+ * from the source of record (the Mongoose schema), assert set equality,
+ * and make the failure message say exactly what to do.
+ */
+describe("resolveFilament allowlist ↔ Filament schema drift guard (#633)", () => {
+    /**
+     * Fields resolveFilament handles with dedicated merge logic (nested
+     * temperature resolution, array-fallback inheritance, settings shallow
+     * merge) rather than via the two allowlists. If you remove a field's
+     * special handling, move it into an allowlist — and vice versa.
+     */
+    const SPECIALLY_HANDLED_FIELDS = [
+        "temperatures", // nested per-key own ?? parent ?? null resolution
+        "compatibleNozzles", // array-fallback inheritance
+        "optTags", // array-fallback inheritance
+        "secondaryColors", // array-fallback inheritance (#477)
+        "bedTypeTemps", // array-fallback inheritance
+        "calibrations", // array-fallback inheritance
+        "presets", // array-fallback inheritance
+        "settings", // shallow merge, variant overrides parent
+    ];
+    async function schemaTopLevelPaths() {
+        const Filament = (await import("@/models/Filament")).default;
+        // Nested paths register dotted (`temperatures.nozzle`) — collapse to
+        // the root segment, which is the granularity the allowlists work at.
+        return new Set(Object.keys(Filament.schema.paths).map((p) => p.split(".")[0]));
+    }
+    it("every top-level Filament schema path is covered by exactly one resolveFilament bucket", async () => {
+        const schemaFields = await schemaTopLevelPaths();
+        const union = new Set([
+            ...VARIANT_ONLY_FIELDS,
+            ...INHERITABLE_FIELDS,
+            ...SPECIALLY_HANDLED_FIELDS,
+        ]);
+        const uncovered = [...schemaFields].filter((f) => !union.has(f));
+        expect(uncovered, `Filament schema field(s) [${uncovered.join(", ")}] are in neither ` +
+            `VARIANT_ONLY_FIELDS nor INHERITABLE_FIELDS (src/lib/resolveFilament.ts) ` +
+            `nor this test's SPECIALLY_HANDLED_FIELDS list. resolveFilament will ` +
+            `silently DROP them from every resolved variant — add each field to ` +
+            `the bucket matching its semantics (inheritable scalar, ` +
+            `variant-only bookkeeping, or dedicated merge logic + this list).`).toEqual([]);
+    });
+    it("the allowlists carry no stale fields that no longer exist on the schema", async () => {
+        const schemaFields = await schemaTopLevelPaths();
+        const allListed = [
+            ...VARIANT_ONLY_FIELDS,
+            ...INHERITABLE_FIELDS,
+            ...SPECIALLY_HANDLED_FIELDS,
+        ];
+        const stale = allListed.filter((f) => !schemaFields.has(f));
+        expect(stale, `Field(s) [${stale.join(", ")}] appear in a resolveFilament allowlist ` +
+            `(or this test's SPECIALLY_HANDLED_FIELDS) but are not Filament ` +
+            `schema paths — remove the stale entries so the lists keep matching ` +
+            `the schema.`).toEqual([]);
+    });
+    it("no field appears in more than one bucket", () => {
+        const allListed = [
+            ...VARIANT_ONLY_FIELDS,
+            ...INHERITABLE_FIELDS,
+            ...SPECIALLY_HANDLED_FIELDS,
+        ];
+        const dupes = allListed.filter((f, i) => allListed.indexOf(f) !== i);
+        expect(dupes, `Field(s) [${dupes.join(", ")}] appear in more than one resolveFilament ` +
+            `bucket — each field must have exactly one resolution rule.`).toEqual([]);
+    });
+});

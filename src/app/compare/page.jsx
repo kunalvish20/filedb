@@ -1,0 +1,244 @@
+"use client";
+import { useEffect, useMemo, useState, Suspense } from "react";
+import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useTranslation } from "@/i18n/TranslationProvider";
+import { useCurrency } from "@/hooks/useCurrency";
+import FilamentPicker from "@/components/FilamentPicker";
+import { useNumberFormat } from "@/hooks/useNumberFormat";
+export default function ComparePage() {
+    // GH #638: the Suspense fallback was hardcoded English. The provider
+    // mounts above this component (ClientProviders in the root layout), so
+    // t() is available here.
+    const { t } = useTranslation();
+    return (<Suspense fallback={<main id="main-content" className="p-8"><p className="text-gray-500">{t("common.loading")}</p></main>}>
+      <ComparePageInner />
+    </Suspense>);
+}
+function ComparePageInner() {
+    const { t } = useTranslation();
+    const { format: formatCurrency } = useCurrency();
+    const { formatGrams } = useNumberFormat();
+    const router = useRouter();
+    const searchParams = useSearchParams();
+    const initialIds = (searchParams.get("ids") || "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    const [allFilaments, setAllFilaments] = useState([]);
+    const [selectedIds, setSelectedIds] = useState(initialIds);
+    const [comparison, setComparison] = useState([]);
+    const [loading, setLoading] = useState(false);
+    useEffect(() => {
+        const ac = new AbortController();
+        fetch("/api/filaments", { signal: ac.signal })
+            .then((r) => (r.ok ? r.json() : []))
+            .then(setAllFilaments)
+            .catch(() => { });
+        return () => ac.abort();
+    }, []);
+    useEffect(() => {
+        if (selectedIds.length === 0) {
+            // eslint-disable-next-line react-hooks/set-state-in-effect -- clearing derived state
+            setComparison([]);
+            // Codex P2 on PR #1013: also clear loading here. When the last selection
+            // is removed while a compare fetch is still in flight, the previous
+            // effect's cleanup aborts it and the AbortError branch below now
+            // (correctly) ignores that rejection — so without this, `loading` would
+            // stay true forever: a stuck spinner with no request behind it.
+            setLoading(false);
+            return;
+        }
+        const ac = new AbortController();
+        setLoading(true);
+        fetch(`/api/filaments/compare?ids=${selectedIds.join(",")}`, { signal: ac.signal })
+            .then((r) => (r.ok ? r.json() : []))
+            .then((data) => {
+            setComparison(data);
+            setLoading(false);
+        })
+            .catch((err) => {
+            // GH #1007 F5: a rapid selection change aborts the in-flight request
+            // AFTER the new effect already set loading=true. Without filtering
+            // AbortError, that stale rejection flips the "Loading…" cue off
+            // mid-fetch and the previous comparison reads as current. Matches
+            // every sibling fetch (analytics / inventory / home).
+            if (err?.name === "AbortError")
+                return;
+            setLoading(false);
+        });
+        return () => ac.abort();
+    }, [selectedIds]);
+    // Keep the URL in sync so the page is linkable/shareable.
+    useEffect(() => {
+        const qs = selectedIds.length > 0 ? `?ids=${selectedIds.join(",")}` : "";
+        router.replace(`/compare${qs}`, { scroll: false });
+    }, [selectedIds, router]);
+    const toggleFilament = (id) => {
+        setSelectedIds((prev) => {
+            if (prev.includes(id))
+                return prev.filter((x) => x !== id);
+            if (prev.length >= 8)
+                return prev; // API limit
+            return [...prev, id];
+        });
+    };
+    // GH #522.3: was previously inlined as
+    // `selectedIds={useMemo(() => new Set(selectedIds), [selectedIds])}`
+    // inside the FilamentPicker JSX, which calls useMemo lexically inside
+    // a JSX prop expression — still legal Hook rules-wise (the call is in
+    // the function component body, not a callback), but the React team
+    // flags this shape because the dep is read implicitly and refactors
+    // tend to break it. Hoisted into a real binding.
+    const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+    const totalGrams = useMemo(() => {
+        return comparison.map((f) => {
+            // GH #182: subtract the empty-spool weight so the "On hand" row
+            // reports remaining filament, not the gross scale reading. The
+            // pre-fix sum was inflated by one empty-spool mass per tracked
+            // spool — same root cause as the dashboard / locations totals.
+            const spoolMass = typeof f.spoolWeight === "number" ? f.spoolWeight : 0;
+            let grams = 0;
+            for (const s of f.spools || []) {
+                if (s.retired)
+                    continue;
+                if (typeof s.totalWeight === "number") {
+                    grams += Math.max(0, s.totalWeight - spoolMass);
+                }
+            }
+            return grams;
+        });
+    }, [comparison]);
+    const rows = [
+        { label: t("compare.row.vendor"), get: (f) => f.vendor },
+        { label: t("compare.row.type"), get: (f) => f.type },
+        {
+            label: t("compare.row.color"),
+            get: (f) => (f.colorName ? `${f.colorName} (${f.color})` : f.color),
+        },
+        {
+            // `cost` is stored per-kg (the form labels it "Cost ({symbol}/kg)"), so a
+            // single per-kg row covers it — the old plain "Cost" row showed the same
+            // number without the /kg suffix (#779). No density needed: it's already
+            // per-kg, no 1kg-spool conversion.
+            label: t("compare.row.costPerKg"),
+            get: (f) => (f.cost != null ? `${formatCurrency(f.cost)}/kg` : "—"),
+        },
+        { label: t("compare.row.diameter"), get: (f) => `${f.diameter} mm` },
+        {
+            label: t("compare.row.density"),
+            get: (f) => (f.density != null ? `${f.density} g/cm³` : "—"),
+        },
+        {
+            label: t("compare.row.nozzleTemp"),
+            get: (f) => (f.temperatures.nozzle != null ? `${f.temperatures.nozzle}°C` : "—"),
+        },
+        {
+            label: t("compare.row.bedTemp"),
+            get: (f) => (f.temperatures.bed != null ? `${f.temperatures.bed}°C` : "—"),
+        },
+        {
+            label: t("compare.row.maxVolumetricSpeed"),
+            get: (f) => f.maxVolumetricSpeed != null ? `${f.maxVolumetricSpeed} mm³/s` : "—",
+        },
+        {
+            label: t("compare.row.dryingTemperature"),
+            get: (f) => (f.dryingTemperature != null ? `${f.dryingTemperature}°C` : "—"),
+        },
+        {
+            label: t("compare.row.dryingTime"),
+            // dryingTime is stored in MINUTES (see Filament.ts canonical-unit
+            // comment). Render as Xh Ym, the same shape NfcReadDialog uses.
+            get: (f) => {
+                if (f.dryingTime == null)
+                    return "—";
+                const h = Math.floor(f.dryingTime / 60);
+                const m = f.dryingTime % 60;
+                if (h === 0)
+                    return `${m}m`;
+                if (m === 0)
+                    return `${h}h`;
+                return `${h}h ${m}m`;
+            },
+        },
+        {
+            label: t("compare.row.glassTemp"),
+            get: (f) => f.glassTempTransition != null ? `${f.glassTempTransition}°C` : "—",
+        },
+        {
+            label: t("compare.row.hdt"),
+            get: (f) => (f.heatDeflectionTemp != null ? `${f.heatDeflectionTemp}°C` : "—"),
+        },
+        {
+            label: t("compare.row.shore"),
+            get: (f) => {
+                const parts = [];
+                if (f.shoreHardnessA != null)
+                    parts.push(`A${f.shoreHardnessA}`);
+                if (f.shoreHardnessD != null)
+                    parts.push(`D${f.shoreHardnessD}`);
+                return parts.length > 0 ? parts.join(" / ") : "—";
+            },
+        },
+        {
+            label: t("compare.row.printSpeed"),
+            get: (f) => {
+                if (f.minPrintSpeed != null && f.maxPrintSpeed != null)
+                    return `${f.minPrintSpeed}–${f.maxPrintSpeed} mm/s`;
+                if (f.maxPrintSpeed != null)
+                    return `≤ ${f.maxPrintSpeed} mm/s`;
+                if (f.minPrintSpeed != null)
+                    return `≥ ${f.minPrintSpeed} mm/s`;
+                return "—";
+            },
+        },
+        {
+            label: t("compare.row.onHand"),
+            get: (_f, i) => (totalGrams[i] > 0 ? `${formatGrams(totalGrams[i])} g` : "—"),
+        },
+    ];
+    return (<main id="main-content" className="w-full px-4 py-8">
+      <h1 className="text-3xl font-bold mb-2">{t("compare.title")}</h1>
+      <p className="text-sm text-gray-500 mb-6">{t("compare.subtitle")}</p>
+
+      {/* Selector */}
+      <section className="mb-8">
+        <h2 className="text-sm font-medium mb-2">
+          {t("compare.selectPrompt", { count: selectedIds.length, max: 8 })}
+        </h2>
+        <FilamentPicker filaments={allFilaments} selectedIds={selectedIdSet} onToggle={toggleFilament} maxSelections={8} ariaLabel={t("compare.pickerAriaLabel")}/>
+      </section>
+
+      {/* Comparison grid */}
+      {loading && selectedIds.length > 0 && (<p className="text-sm text-gray-500">{t("common.loading")}</p>)}
+      {!loading && comparison.length === 0 && selectedIds.length === 0 && (<p className="text-sm text-gray-500">{t("compare.emptyState")}</p>)}
+
+      {comparison.length > 0 && (<div className="overflow-x-auto">
+          <table className="w-full text-sm border-collapse">
+            <thead>
+              <tr className="border-b border-border dark:border-border">
+                <th scope="col" className="text-left py-2 px-2 font-medium text-gray-500 sticky left-0 bg-white dark:bg-gray-950 z-10">
+                  {t("compare.col.property")}
+                </th>
+                {comparison.map((f) => (<th key={f._id} className="text-left py-2 px-3 font-medium min-w-[160px]">
+                    <Link href={`/filaments/${f._id}`} className="text-foreground hover:underline flex items-center gap-2">
+                      <span className="inline-block w-4 h-4 rounded-full border border-border flex-shrink-0" style={{ backgroundColor: f.color }} aria-hidden="true"/>
+                      <span className="truncate">{f.name}</span>
+                    </Link>
+                  </th>))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (<tr key={row.label} className="border-b border-gray-100 dark:border-border">
+                  <td className="py-2 px-2 text-gray-500 sticky left-0 bg-white dark:bg-gray-950 z-10">
+                    {row.label}
+                  </td>
+                  {comparison.map((f, i) => (<td key={f._id} className="py-2 px-3 text-gray-900 dark:text-gray-100">
+                      {row.get(f, i)}
+                    </td>))}
+                </tr>))}
+            </tbody>
+          </table>
+        </div>)}
+    </main>);
+}

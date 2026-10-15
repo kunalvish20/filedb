@@ -1,0 +1,192 @@
+"use client";
+import { useEffect, useState, useCallback } from "react";
+import Link from "next/link";
+import { useToast } from "@/components/Toast";
+import { useConfirm } from "@/components/ConfirmDialog";
+import { useTranslation } from "@/i18n/TranslationProvider";
+export default function BedTypesPage() {
+    const [bedTypes, setBedTypes] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [selected, setSelected] = useState(new Set());
+    const [bulkDeleting, setBulkDeleting] = useState(false);
+    const { toast } = useToast();
+    const confirm = useConfirm();
+    const { t } = useTranslation();
+    const fetchBedTypes = useCallback(async (signal) => {
+        setLoading(true);
+        try {
+            const res = await fetch("/api/bed-types", { signal });
+            if (!res.ok) {
+                toast(t("bedTypes.loadError"), "error");
+                setLoading(false);
+                return;
+            }
+            const data = await res.json();
+            setBedTypes(data);
+            setSelected(new Set());
+            setLoading(false);
+        }
+        catch (err) {
+            if (err instanceof DOMException && err.name === "AbortError")
+                return;
+            toast(t("bedTypes.loadError"), "error");
+            setLoading(false);
+        }
+    }, [toast, t]);
+    useEffect(() => {
+        const ac = new AbortController();
+        fetchBedTypes(ac.signal); // eslint-disable-line react-hooks/set-state-in-effect -- data fetching on mount
+        return () => ac.abort();
+    }, [fetchBedTypes]);
+    const toggleSelect = (id) => {
+        setSelected((prev) => {
+            const next = new Set(prev);
+            if (next.has(id))
+                next.delete(id);
+            else
+                next.add(id);
+            return next;
+        });
+    };
+    const toggleAll = () => {
+        if (selected.size === bedTypes.length) {
+            setSelected(new Set());
+        }
+        else {
+            setSelected(new Set(bedTypes.map((b) => b._id)));
+        }
+    };
+    const handleDelete = async (id, name) => {
+        if (!(await confirm({ message: t("bedTypes.deleteConfirm", { name }), destructive: true, confirmLabel: t("common.delete") })))
+            return;
+        // GH #1080: a network-level fetch rejection used to escape the handler
+        // with no toast at all — the row just silently stayed.
+        try {
+            const res = await fetch(`/api/bed-types/${id}`, { method: "DELETE" });
+            if (!res.ok) {
+                const body = await res.json().catch(() => null);
+                toast(body?.error || t("bedTypes.deleteError"), "error");
+                return;
+            }
+            toast(t("bedTypes.deleted", { name }));
+            fetchBedTypes();
+        }
+        catch {
+            toast(t("bedTypes.deleteError"), "error");
+        }
+    };
+    const handleBulkDelete = async () => {
+        const count = selected.size;
+        if (!(await confirm({ message: t("bedTypes.bulkDeleteConfirm", { count }), destructive: true, confirmLabel: t("common.delete") })))
+            return;
+        setBulkDeleting(true);
+        let deleted = 0;
+        const errors = [];
+        try {
+            for (const id of selected) {
+                // GH #1080: a mid-loop network failure used to throw out of the
+                // handler, leaving the delete button disabled forever and skipping
+                // the refetch. Record the failure and keep going (GH #640 pattern).
+                try {
+                    const res = await fetch(`/api/bed-types/${id}`, { method: "DELETE" });
+                    if (res.ok) {
+                        deleted++;
+                    }
+                    else {
+                        const body = await res.json().catch(() => null);
+                        const name = bedTypes.find((b) => b._id === id)?.name ?? id;
+                        errors.push(body?.error || t("bedTypes.deleteErrorNamed", { name }));
+                    }
+                }
+                catch {
+                    const name = bedTypes.find((b) => b._id === id)?.name ?? id;
+                    errors.push(t("bedTypes.deleteErrorNamed", { name }));
+                }
+            }
+            if (deleted > 0)
+                toast(t("bedTypes.bulkDeleted", { count: deleted }));
+            if (errors.length > 0)
+                toast(errors.join("; "), "error");
+        }
+        finally {
+            setBulkDeleting(false);
+            fetchBedTypes();
+        }
+    };
+    return (<main id="main-content" className="max-w-4xl mx-auto px-4 py-8">
+      <div className="flex items-start justify-between mb-6">
+        <div>
+          <h1 className="text-3xl font-bold">{t("bedTypes.title")}</h1>
+          <div className="flex gap-3">
+            <Link href="/settings" className="text-foreground hover:underline text-sm">
+              &larr; {t("bedTypes.backToSettings")}
+            </Link>
+          </div>
+        </div>
+        <Link href="/bed-types/new" className="px-4 py-2 ui-primary text-white rounded hover:opacity-90 text-sm">
+          {t("bedTypes.addNew")}
+        </Link>
+      </div>
+
+      {selected.size > 0 && (<div className="mb-4 flex items-center gap-3 px-3 py-2 bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 rounded-lg">
+          <span className="text-sm text-red-600 dark:text-red-300">{t("bedTypes.selected", { count: selected.size })}</span>
+          <button onClick={handleBulkDelete} disabled={bulkDeleting} className="px-3 py-1 bg-red-700 text-white rounded text-sm hover:bg-red-600 disabled:opacity-50">
+            {bulkDeleting ? t("bedTypes.deleting") : t("bedTypes.deleteCount", { count: selected.size })}
+          </button>
+          <button onClick={() => setSelected(new Set())} className="text-sm text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200">
+            {t("bedTypes.clear")}
+          </button>
+        </div>)}
+
+      {loading ? (<p className="text-gray-500">{t("bedTypes.loading")}</p>) : bedTypes.length === 0 ? (<div className="text-center py-12">
+          <p className="text-gray-500 mb-4">{t("bedTypes.empty")}</p>
+          <Link href="/bed-types/new" className="px-4 py-2 ui-primary text-white rounded hover:opacity-90 text-sm">
+            {t("bedTypes.addFirst")}
+          </Link>
+        </div>) : (<div className="overflow-x-auto">
+          <table className="w-full text-sm border-collapse">
+            <thead>
+              <tr className="border-b border-border">
+                <th scope="col" className="py-3 px-2 w-8">
+                  <input type="checkbox" checked={selected.size === bedTypes.length && bedTypes.length > 0} onChange={toggleAll} aria-label={t("bedTypes.bulk.selectAll") || "Select all"} className="accent-red-600"/>
+                </th>
+                <th scope="col" className="text-left py-3 px-2">{t("bedTypes.table.name")}</th>
+                <th scope="col" className="text-left py-3 px-2">{t("bedTypes.table.material")}</th>
+                <th scope="col" className="text-left py-3 px-2">{t("bedTypes.table.availableOn")}</th>
+                <th scope="col" className="text-left py-3 px-2">{t("bedTypes.table.notes")}</th>
+                <th scope="col" className="text-right py-3 px-2">{t("bedTypes.table.actions")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {bedTypes.map((b) => (<tr key={b._id} className={`border-b border-border hover:bg-gray-50 dark:hover:bg-gray-900 ${selected.has(b._id) ? "bg-red-50 dark:bg-red-950/20" : ""}`}>
+                  <td className="py-2 px-2">
+                    <input type="checkbox" checked={selected.has(b._id)} onChange={() => toggleSelect(b._id)} aria-label={b.name || t("common.select")} className="accent-red-600"/>
+                  </td>
+                  <td className="py-2 px-2 font-medium">{b.name}</td>
+                  <td className="py-2 px-2">
+                    <span className="px-2 py-0.5 bg-gray-200 dark:bg-gray-800 rounded text-xs">
+                      {b.material}
+                    </span>
+                  </td>
+                  <td className="py-2 px-2">
+                    {b.printers && b.printers.length > 0 ? (<div className="flex flex-wrap gap-1">
+                        {b.printers.map((p) => (<span key={p._id} className="px-1.5 py-0.5 bg-indigo-100 dark:bg-indigo-900/50 text-indigo-800 dark:text-indigo-200 rounded text-xs">
+                            {p.name}
+                          </span>))}
+                      </div>) : (<span className="text-gray-400 text-xs">&mdash;</span>)}
+                  </td>
+                  <td className="py-2 px-2 text-gray-500 text-xs">{b.notes || "\u2014"}</td>
+                  <td className="py-2 px-2 text-right">
+                    <Link href={`/bed-types/${b._id}/edit`} className="text-foreground hover:underline mr-3 text-xs">
+                      {t("bedTypes.table.edit")}
+                    </Link>
+                    <button onClick={() => handleDelete(b._id, b.name)} className="text-red-600 hover:underline text-xs">
+                      {t("bedTypes.table.delete")}
+                    </button>
+                  </td>
+                </tr>))}
+            </tbody>
+          </table>
+        </div>)}
+    </main>);
+}

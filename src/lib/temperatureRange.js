@@ -1,0 +1,130 @@
+/**
+ * Cross-field validation for filament temperature ranges.
+ *
+ * The Add/Edit Filament form and the filament API both silently accepted an
+ * inverted nozzle range — e.g. Nozzle Range Min 300 with Max 200 — even
+ * though min/max each have their own 0–600 bounds. A min greater than the
+ * max is physically nonsense, so reject it (#574).
+ */
+/** Coerce a raw request value to a finite number, or null if it isn't one.
+ * Mirrors the cast Mongoose applies to the Number schema paths so the guard
+ * validates the value that would actually be persisted. */
+function toFiniteNumber(v) {
+    if (typeof v === "number")
+        return Number.isFinite(v) ? v : null;
+    if (typeof v === "string" && v.trim() !== "") {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
+    }
+    return null;
+}
+/**
+ * True only when BOTH ends of the nozzle range resolve to finite numbers and
+ * min > max. A lone min or max, a null/blank end, or a non-numeric value is
+ * not "inverted" — partial ranges are legitimate. Numeric strings are coerced
+ * first so the common JSON-as-string input shape is still caught.
+ */
+export function isInvertedNozzleRange(t) {
+    if (!t)
+        return false;
+    const min = toFiniteNumber(t.nozzleRangeMin);
+    const max = toFiniteNumber(t.nozzleRangeMax);
+    return min !== null && max !== null && min > max;
+}
+/**
+ * Compute the nozzle range that a PUT body will actually persist, so a
+ * partial update can't sneak an inverted range past the guard (Codex P2 on
+ * PR #577).
+ *
+ * Two update shapes reach `findOneAndUpdate`:
+ *   - a full `temperatures` object, which REPLACES the whole subdocument —
+ *     so the effective range is exactly what the body carries (a partial
+ *     object drops the other endpoint, which can't be inverted); and
+ *   - dotted paths (`temperatures.nozzleRangeMin` / `…Max`), which MERGE
+ *     into the stored subdocument — so the effective range is the incoming
+ *     endpoint combined with the stored other endpoint.
+ *
+ * Either shape can also arrive wrapped in a Mongo `$set` operator
+ * (`{"$set":{"temperatures.nozzleRangeMin":300}}`), which the route forwards
+ * to `findOneAndUpdate` verbatim — so both the top level and `$set` are
+ * scanned (Codex P2 on PR #577, round 2).
+ *
+ * Returns null when the update touches neither nozzle-range endpoint (no
+ * range change to validate).
+ */
+export function effectiveNozzleRangeForUpdate(body, storedTemps) {
+    // The endpoints can live at the top level or inside `$set`; scan both.
+    const sources = [body];
+    if (body && typeof body.$set === "object" && body.$set !== null) {
+        sources.push(body.$set);
+    }
+    // A full `temperatures` object (top-level or under $set) replaces the
+    // subdoc, so it fully determines the effective range.
+    for (const src of sources) {
+        if (src.temperatures && typeof src.temperatures === "object") {
+            return src.temperatures;
+        }
+    }
+    // Dotted-path endpoints merge into the stored subdoc; take whichever
+    // endpoints the update specifies, falling back to stored for the rest.
+    let hasMin = false;
+    let hasMax = false;
+    let min;
+    let max;
+    for (const src of sources) {
+        if (Object.prototype.hasOwnProperty.call(src, "temperatures.nozzleRangeMin")) {
+            hasMin = true;
+            min = src["temperatures.nozzleRangeMin"];
+        }
+        if (Object.prototype.hasOwnProperty.call(src, "temperatures.nozzleRangeMax")) {
+            hasMax = true;
+            max = src["temperatures.nozzleRangeMax"];
+        }
+    }
+    if (!hasMin && !hasMax)
+        return null;
+    return {
+        nozzleRangeMin: hasMin ? min : storedTemps?.nozzleRangeMin,
+        nozzleRangeMax: hasMax ? max : storedTemps?.nozzleRangeMax,
+    };
+}
+/**
+ * Resolve a variant's effective nozzle range the way resolveFilament does —
+ * each endpoint falls back to the parent's when the variant's own is
+ * null/undefined (`variant ?? parent`). A variant that sets only one endpoint
+ * inherits the other, which can yield an inverted EFFECTIVE range (e.g. own
+ * min 300 + inherited parent max 200) the variant renders/exports even though
+ * its own body looked like a harmless partial range (Codex P2 r3 on #577).
+ *
+ * Pass the variant's own (post-update) range as `own` and the parent's range
+ * as `parent`; for a standalone (no parent) pass `parent = null` and the own
+ * range is returned unchanged.
+ */
+export function inheritNozzleRangeFromParent(own, parent) {
+    if (!own && !parent)
+        return null;
+    const o = own ?? {};
+    return {
+        nozzleRangeMin: o.nozzleRangeMin ?? parent?.nozzleRangeMin ?? null,
+        nozzleRangeMax: o.nozzleRangeMax ?? parent?.nozzleRangeMax ?? null,
+    };
+}
+/**
+ * GH #892: the full inverted-range guard the slicer-sync routes run, in one
+ * pure call so the three paths (OrcaSlicer sync + both Bambu import routes)
+ * can't drift. Combines the three steps:
+ *   1. compute the update's EFFECTIVE own range (`effectiveNozzleRangeForUpdate`);
+ *   2. inherit any endpoint the variant leaves null from its parent
+ *      (`inheritNozzleRangeFromParent` — pass `parentTemps = null/undefined`
+ *      for a standalone or non-variant);
+ *   3. test for inversion (`isInvertedNozzleRange`).
+ * Returns false when the update touches neither endpoint, so pre-existing bad
+ * data on an unrelated sync can't trip it. The caller loads the parent's
+ * temperatures (or passes null); this stays DB-free.
+ */
+export function isUpdateNozzleRangeInverted(body, storedTemps, parentTemps) {
+    const own = effectiveNozzleRangeForUpdate(body, storedTemps);
+    if (own === null)
+        return false;
+    return isInvertedNozzleRange(inheritNozzleRangeFromParent(own, parentTemps));
+}

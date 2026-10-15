@@ -1,0 +1,166 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # KEEP IN SYNC WITH ci-gate.yml (#852): these `test` + `smoke` jobs are the
+  # canonical gate and stay INLINE here (rather than calling ci-gate.yml)
+  # because a reusable-workflow call would rename the status checks to
+  # `gate / test (20)` etc., which would no longer satisfy main's branch
+  # protection (required contexts `test (20)` / `test (22)` / `smoke`).
+  # ci-gate.yml mirrors these jobs so release.yml + docker.yml run the SAME gate
+  # before publishing — change the gate in BOTH files.
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [20, 22]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: Install PC/SC development headers (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run tests with coverage
+        run: npm run test:coverage
+
+      # GH #253: this step previously ended in `|| true`, which swallowed
+      # the audit exit code so moderate+ advisories never failed CI. The
+      # audit is a real gate: a new moderate+ advisory fails the workflow.
+      # #1021-era follow-up: npm audit has no exception mechanism, so the
+      # gate runs through scripts/audit-gate.mjs — it fails on any
+      # moderate+ advisory NOT in .audit-allowlist.json (currently only
+      # the unfixable immutable@3 pair pinned by swagger-ui-react, which
+      # only ever renders our own committed openapi.json). Allowlist
+      # entries carry a justification + reviewBy date.
+      - name: Security audit
+        run: node scripts/audit-gate.mjs
+
+      - name: Build
+        run: npm run build
+
+      - name: Upload coverage report
+        if: matrix.node-version == 22
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+
+  smoke:
+    # Boot the production standalone build and curl a handful of routes so a
+    # bad next.config / standalone-output regression is caught before release.
+    # `npm run build` already runs on the test matrix above; we rebuild here
+    # because workflow jobs don't share build artifacts and copying them
+    # across jobs costs more time than just rebuilding.
+    runs-on: ubuntu-latest
+    needs: test
+
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok' | grep -q 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Standalone server reads MONGODB_URI from env at request time.
+      MONGODB_URI: mongodb://localhost:27017/spilofila-smoke
+      # Bind to 3456 (the project's canonical dev/desktop port) so the curl
+      # URLs match what a developer would hit locally.
+      PORT: "3456"
+      HOSTNAME: "127.0.0.1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install PC/SC development headers (Linux)
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (standalone)
+        run: npm run build
+
+      - name: Stage standalone runtime (public + static)
+        # `output: "standalone"` copies node_modules + server.js but not
+        # public/ or .next/static — Next's docs say to copy those in
+        # manually so the production server can serve assets and routes
+        # like /api/openapi (which reads public/openapi.json).
+        run: |
+          cp -R public .next/standalone/public
+          mkdir -p .next/standalone/.next
+          cp -R .next/static .next/standalone/.next/static
+
+      - name: Start standalone server
+        run: |
+          npm start &
+          echo "$!" > .smoke-server.pid
+          # Wait until the server is accepting connections (max ~60s).
+          for i in $(seq 1 60); do
+            if curl -sS -o /dev/null "http://127.0.0.1:${PORT}/api/openapi"; then
+              echo "server is up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "server failed to start within 60s" >&2
+          exit 1
+
+      - name: Smoke check core routes
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            local path="$1"
+            local code
+            code=$(curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}${path}")
+            if [ "$code" = "200" ]; then
+              echo "  ok  $path → $code"
+            else
+              echo "  FAIL $path → $code" >&2
+              fail=1
+            fi
+          }
+          check /
+          check /dashboard
+          check /api-docs
+          check /api/openapi
+          check /api/filaments
+          exit $fail
+
+      - name: Stop standalone server
+        if: always()
+        run: |
+          if [ -f .smoke-server.pid ]; then
+            kill "$(cat .smoke-server.pid)" 2>/dev/null || true
+          fi

@@ -1,0 +1,205 @@
+name: CI Gate
+
+# GH #852 — the full CI gate (lint, root + Electron typecheck, coverage tests,
+# `npm audit`, build, standalone smoke) that must pass before code ships as a
+# release/Docker artifact. Invoked via `uses: ./.github/workflows/ci-gate.yml`
+# by release.yml (before the desktop installer matrix) and docker.yml (before
+# building + pushing GHCR images). Previously those tag-triggered workflows
+# re-implemented only a partial gate (lint + `npm test`), so a `v*` tag could
+# publish from a commit branch CI would reject (missing the typechecks,
+# coverage, audit, and smoke). The gate runs ONCE per release/docker run.
+#
+# KEEP IN SYNC WITH test.yml: these two jobs MIRROR test.yml's `test` + `smoke`
+# jobs. test.yml deliberately stays inline (not a caller of this file) because a
+# reusable-workflow call renames its status checks to `gate / test (20)` etc.,
+# which would no longer satisfy main's branch protection (required contexts
+# `test (20)` / `test (22)` / `smoke`). If you change the gate, change it in
+# BOTH files.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  # GH #1037: a `v*` tag whose version doesn't match package.json builds a
+  # fully GREEN release whose artifacts and update feeds carry the OLD
+  # version — electron-updater then offers existing users nothing (the feed
+  # advertises the version they already run): silent, total auto-update
+  # failure. electron-builder derives artifactName and every feed's
+  # `version:` from package.json ALONE (electron-builder.yml), and no other
+  # step cross-checks the pushed tag. This job closes that hole once per
+  # release/docker run. Tag-only: the `github` context inside a called
+  # workflow is the CALLER's, so release.yml / docker.yml tag pushes see the
+  # tag ref here; branch, PR, and BRANCH-ref dispatch runs skip (a skipped
+  # job does not fail the calling gate). A TAG-ref dispatch — docker.yml's
+  # #845 re-publish path, `gh workflow run docker.yml --ref vX.Y.Z` — sees
+  # github.ref = refs/tags/vX.Y.Z and re-runs the check: intended, so a
+  # historical tag whose commit mismatches can't be silently re-published
+  # either. Deliberately NOT mirrored into test.yml
+  # despite the keep-in-sync rule above — test.yml never runs on a tag, so
+  # the job would be permanently dead there.
+  tag-version:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches package.json version
+        run: |
+          PKG="v$(node -p "require('./package.json').version")"
+          if [ "$PKG" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package.json ($PKG). Bump the version before tagging — see CLAUDE.md 'Release Process'."
+            exit 1
+          fi
+          echo "Tag $GITHUB_REF_NAME matches package.json ($PKG)."
+
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [20, 22]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: Install PC/SC development headers (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run tests with coverage
+        run: npm run test:coverage
+
+      # GH #253: this step previously ended in `|| true`, which swallowed
+      # the audit exit code so moderate+ advisories never failed CI. The
+      # audit is a real gate: a new moderate+ advisory fails the workflow.
+      # #1021-era follow-up: npm audit has no exception mechanism, so the
+      # gate runs through scripts/audit-gate.mjs — it fails on any
+      # moderate+ advisory NOT in .audit-allowlist.json (currently only
+      # the unfixable immutable@3 pair pinned by swagger-ui-react, which
+      # only ever renders our own committed openapi.json). Allowlist
+      # entries carry a justification + reviewBy date.
+      - name: Security audit
+        run: node scripts/audit-gate.mjs
+
+      - name: Build
+        run: npm run build
+
+      - name: Upload coverage report
+        if: matrix.node-version == 22
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+
+  smoke:
+    # Boot the production standalone build and curl a handful of routes so a
+    # bad next.config / standalone-output regression is caught before release.
+    # `npm run build` already runs on the test matrix above; we rebuild here
+    # because workflow jobs don't share build artifacts and copying them
+    # across jobs costs more time than just rebuilding.
+    runs-on: ubuntu-latest
+    needs: test
+
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok' | grep -q 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Standalone server reads MONGODB_URI from env at request time.
+      MONGODB_URI: mongodb://localhost:27017/spilofila-smoke
+      # Bind to 3456 (the project's canonical dev/desktop port) so the curl
+      # URLs match what a developer would hit locally.
+      PORT: "3456"
+      HOSTNAME: "127.0.0.1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install PC/SC development headers (Linux)
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (standalone)
+        run: npm run build
+
+      - name: Stage standalone runtime (public + static)
+        # `output: "standalone"` copies node_modules + server.js but not
+        # public/ or .next/static — Next's docs say to copy those in
+        # manually so the production server can serve assets and routes
+        # like /api/openapi (which reads public/openapi.json).
+        run: |
+          cp -R public .next/standalone/public
+          mkdir -p .next/standalone/.next
+          cp -R .next/static .next/standalone/.next/static
+
+      - name: Start standalone server
+        run: |
+          npm start &
+          echo "$!" > .smoke-server.pid
+          # Wait until the server is accepting connections (max ~60s).
+          for i in $(seq 1 60); do
+            if curl -sS -o /dev/null "http://127.0.0.1:${PORT}/api/openapi"; then
+              echo "server is up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "server failed to start within 60s" >&2
+          exit 1
+
+      - name: Smoke check core routes
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            local path="$1"
+            local code
+            code=$(curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}${path}")
+            if [ "$code" = "200" ]; then
+              echo "  ok  $path → $code"
+            else
+              echo "  FAIL $path → $code" >&2
+              fail=1
+            fi
+          }
+          check /
+          check /dashboard
+          check /api-docs
+          check /api/openapi
+          check /api/filaments
+          exit $fail
+
+      - name: Stop standalone server
+        if: always()
+        run: |
+          if [ -f .smoke-server.pid ]; then
+            kill "$(cat .smoke-server.pid)" 2>/dev/null || true
+          fi

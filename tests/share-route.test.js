@@ -1,0 +1,362 @@
+import { describe, it, expect, beforeEach } from "vitest";
+import mongoose from "mongoose";
+import { NextRequest } from "next/server";
+import { GET as listShares, POST as createShare } from "@/app/api/share/route";
+import { GET as getShare, DELETE as deleteShare, } from "@/app/api/share/[slug]/route";
+/**
+ * /api/share publishes a static snapshot of selected filaments along with
+ * the referenced nozzles/printers/bedTypes. /api/share/{slug} serves that
+ * snapshot publicly and bumps a view counter.
+ *
+ * These tests cover both the publishing side (POST /api/share) and the
+ * public fetch (GET /api/share/{slug}), plus the atomic-increment fix
+ * added in the v1.11 review round.
+ */
+describe("/api/share", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let SharedCatalog;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let Filament;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let Nozzle;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let Printer;
+    beforeEach(async () => {
+        const sharedMod = await import("@/models/SharedCatalog");
+        const filamentMod = await import("@/models/Filament");
+        const nozzleMod = await import("@/models/Nozzle");
+        const printerMod = await import("@/models/Printer");
+        const bedTypeMod = await import("@/models/BedType");
+        if (!mongoose.models.SharedCatalog) {
+            mongoose.model("SharedCatalog", sharedMod.default.schema);
+        }
+        if (!mongoose.models.Filament) {
+            mongoose.model("Filament", filamentMod.default.schema);
+        }
+        if (!mongoose.models.Nozzle) {
+            mongoose.model("Nozzle", nozzleMod.default.schema);
+        }
+        if (!mongoose.models.Printer) {
+            mongoose.model("Printer", printerMod.default.schema);
+        }
+        if (!mongoose.models.BedType) {
+            mongoose.model("BedType", bedTypeMod.default.schema);
+        }
+        SharedCatalog = mongoose.models.SharedCatalog;
+        Filament = mongoose.models.Filament;
+        Nozzle = mongoose.models.Nozzle;
+        Printer = mongoose.models.Printer;
+    });
+    describe("POST /api/share", () => {
+        async function makeFilamentWithRefs() {
+            const nozzle = await Nozzle.create({ name: "0.4 Brass", diameter: 0.4, type: "brass" });
+            const printer = await Printer.create({
+                name: "Core One",
+                manufacturer: "Prusa",
+                printerModel: "CORE One",
+            });
+            const filament = await Filament.create({
+                name: "Test PLA",
+                vendor: "TestCo",
+                type: "PLA",
+                compatibleNozzles: [nozzle._id],
+                calibrations: [{ nozzle: nozzle._id, printer: printer._id, extrusionMultiplier: 0.95 }],
+            });
+            return { filament, nozzle, printer };
+        }
+        function postReq(body) {
+            return new NextRequest("http://localhost/api/share", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify(body),
+            });
+        }
+        it("publishes selected filaments and denormalises referenced entities", async () => {
+            const { filament, nozzle, printer } = await makeFilamentWithRefs();
+            const res = await createShare(postReq({
+                title: "My favourites",
+                filamentIds: [String(filament._id)],
+            }));
+            expect(res.status).toBe(201);
+            const body = await res.json();
+            expect(body.slug).toBeDefined();
+            const saved = await SharedCatalog.findOne({ slug: body.slug });
+            expect(saved.payload.filaments).toHaveLength(1);
+            expect(saved.payload.nozzles.map((n) => String(n._id))).toContain(String(nozzle._id));
+            expect(saved.payload.printers.map((p) => String(p._id))).toContain(String(printer._id));
+        });
+        it("returns 400 when title is missing", async () => {
+            const { filament } = await makeFilamentWithRefs();
+            const res = await createShare(postReq({ filamentIds: [String(filament._id)] }));
+            expect(res.status).toBe(400);
+        });
+        it("returns 400 when title exceeds 200 chars (length-bounds guard)", async () => {
+            const { filament } = await makeFilamentWithRefs();
+            const res = await createShare(postReq({
+                title: "a".repeat(201),
+                filamentIds: [String(filament._id)],
+            }));
+            expect(res.status).toBe(400);
+        });
+        it("returns 400 when expiresAt is a malformed date string (GH #426)", async () => {
+            // Pre-fix: `new Date("not a date")` is an Invalid Date — got
+            // persisted with a NaN timestamp, and downstream `$gt: now`
+            // comparisons against NaN are false, so the catalog was
+            // effectively immortal.
+            const { filament } = await makeFilamentWithRefs();
+            const res = await createShare(postReq({
+                title: "Bad date",
+                filamentIds: [String(filament._id)],
+                expiresAt: "not a date",
+            }));
+            expect(res.status).toBe(400);
+            const body = await res.json();
+            expect(body.error).toMatch(/expiresAt/i);
+        });
+        it("returns 404 when none of the requested filaments exist", async () => {
+            const res = await createShare(postReq({
+                title: "Nothing",
+                filamentIds: [new mongoose.Types.ObjectId().toString()],
+            }));
+            expect(res.status).toBe(404);
+        });
+        it("returns 400 (not 500) when a filamentIds entry is not an ObjectId (#630)", async () => {
+            // Pre-fix: the raw string was cast inside the `$in` query, the
+            // CastError fell into the catch, and the caller saw a 500
+            // "Failed to publish shared catalog".
+            const { filament } = await makeFilamentWithRefs();
+            const res = await createShare(postReq({
+                title: "Bad ids",
+                filamentIds: [String(filament._id), "zzz"],
+            }));
+            expect(res.status).toBe(400);
+            const body = await res.json();
+            expect(body.error).toMatch(/invalid filament id/i);
+            expect(body.error).toMatch(/zzz/);
+        });
+        it("returns 400 when a filamentIds entry is not a string (#630)", async () => {
+            const res = await createShare(postReq({
+                title: "Non-string id",
+                filamentIds: [{ $ne: null }],
+            }));
+            expect(res.status).toBe(400);
+        });
+        it("strips spool inventory + PII fields from the published payload", async () => {
+            // Regression: previously the full Filament.find().lean() result was
+            // stored in payload, exposing lot numbers, purchase/open dates,
+            // photos, location ids, dry cycle + usage history, and
+            // lowStockThreshold to anyone with the share link.
+            const nozzle = await Nozzle.create({ name: "0.4 Brass", diameter: 0.4, type: "brass" });
+            const filament = await Filament.create({
+                name: "Privacy PLA",
+                vendor: "TestCo",
+                type: "PLA",
+                compatibleNozzles: [nozzle._id],
+                lowStockThreshold: 250,
+                totalWeight: 1000,
+                instanceId: "abc-123",
+                spools: [
+                    {
+                        label: "private",
+                        totalWeight: 800,
+                        lotNumber: "SECRET-LOT-42",
+                        purchaseDate: new Date("2025-01-01"),
+                        openedDate: new Date("2025-02-01"),
+                        // #732 Phase 5: the per-spool id is private inventory state and
+                        // must never reach a public share (it identifies a physical roll
+                        // and is what NFC/QR scans resolve against).
+                        instanceId: "secret-spool-id-99",
+                    },
+                ],
+            });
+            const res = await createShare(postReq({
+                title: "Shareable",
+                filamentIds: [String(filament._id)],
+            }));
+            expect(res.status).toBe(201);
+            const body = await res.json();
+            const saved = await SharedCatalog.findOne({ slug: body.slug });
+            const shared = saved.payload.filaments[0];
+            // Profile data still present.
+            expect(shared.name).toBe("Privacy PLA");
+            expect(shared.vendor).toBe("TestCo");
+            // Inventory + PII stripped.
+            expect(shared.spools).toBeUndefined();
+            expect(shared.lowStockThreshold).toBeUndefined();
+            expect(shared.instanceId).toBeUndefined();
+            expect(shared.totalWeight).toBeUndefined();
+            // Serialised payload as a string must not contain the secret lot number
+            // or the per-spool instanceId (guards against re-adding a leaky field
+            // by another name, and against a future change projecting spool
+            // subfields back onto the shared profile — #732 Phase 5).
+            const serialized = JSON.stringify(saved.payload);
+            expect(serialized).not.toContain("SECRET-LOT-42");
+            expect(serialized).not.toContain("secret-spool-id-99");
+        });
+    });
+    describe("GET /api/share/[slug]", () => {
+        async function seed(payload = {}, expiresAt) {
+            const catalog = await SharedCatalog.create({
+                title: "Seed",
+                description: "",
+                payload: {
+                    version: 1,
+                    createdAt: new Date().toISOString(),
+                    filaments: [],
+                    nozzles: [],
+                    printers: [],
+                    bedTypes: [],
+                    ...payload,
+                },
+                expiresAt: expiresAt ?? null,
+            });
+            return catalog;
+        }
+        it("returns the payload and bumps viewCount atomically", async () => {
+            const catalog = await seed();
+            const r1 = await getShare(new NextRequest(`http://localhost/api/share/${catalog.slug}`), { params: Promise.resolve({ slug: catalog.slug }) });
+            const b1 = await r1.json();
+            expect(b1.viewCount).toBe(1);
+            const r2 = await getShare(new NextRequest(`http://localhost/api/share/${catalog.slug}`), { params: Promise.resolve({ slug: catalog.slug }) });
+            const b2 = await r2.json();
+            expect(b2.viewCount).toBe(2);
+        });
+        it("increments viewCount WITHOUT advancing updatedAt (GH #1004 F5)", async () => {
+            const catalog = await seed();
+            // Pin updatedAt to a known past instant, bypassing Mongoose timestamps,
+            // so a regression (updatedAt bumped to ~now) is unambiguously detectable.
+            const past = new Date("2020-01-01T00:00:00.000Z");
+            await SharedCatalog.collection.updateOne({ _id: catalog._id }, { $set: { updatedAt: past } });
+            const res = await getShare(new NextRequest(`http://localhost/api/share/${catalog.slug}`), { params: Promise.resolve({ slug: catalog.slug }) });
+            const body = await res.json();
+            expect(body.viewCount).toBe(1); // the $inc still ran
+            // timestamps:false on the viewCount update — a read-path counter must
+            // NOT bump updatedAt, or the hybrid sync engine treats a mere view on a
+            // still-live peer as a newer write and resurrects a revoked share.
+            const fresh = await SharedCatalog.collection.findOne({ _id: catalog._id });
+            expect(new Date(fresh.updatedAt).getTime()).toBe(past.getTime());
+            expect(fresh.viewCount).toBe(1);
+        });
+        it("handles concurrent requests without losing increments (atomic $inc)", async () => {
+            // The pre-fix code did findOne + save() which races: both reads see
+            // count=0, both increment to 1. The fix uses findOneAndUpdate($inc).
+            const catalog = await seed();
+            await Promise.all(Array.from({ length: 10 }, () => getShare(new NextRequest(`http://localhost/api/share/${catalog.slug}`), { params: Promise.resolve({ slug: catalog.slug }) })));
+            const fresh = await SharedCatalog.findOne({ slug: catalog.slug });
+            expect(fresh.viewCount).toBe(10);
+        });
+        it("returns 404 for an unknown slug", async () => {
+            const res = await getShare(new NextRequest("http://localhost/api/share/nope"), { params: Promise.resolve({ slug: "nope" }) });
+            expect(res.status).toBe(404);
+        });
+        it("returns 410 when a catalog has expired", async () => {
+            const catalog = await seed({}, new Date(Date.now() - 1000));
+            const res = await getShare(new NextRequest(`http://localhost/api/share/${catalog.slug}`), { params: Promise.resolve({ slug: catalog.slug }) });
+            expect(res.status).toBe(410);
+        });
+    });
+    describe("GET /api/share", () => {
+        it("lists every published catalog newest-first", async () => {
+            await SharedCatalog.create({
+                title: "Old",
+                payload: {
+                    version: 1,
+                    createdAt: new Date().toISOString(),
+                    filaments: [],
+                    nozzles: [],
+                    printers: [],
+                    bedTypes: [],
+                },
+                createdAt: new Date("2026-01-01"),
+            });
+            await SharedCatalog.create({
+                title: "New",
+                payload: {
+                    version: 1,
+                    createdAt: new Date().toISOString(),
+                    filaments: [],
+                    nozzles: [],
+                    printers: [],
+                    bedTypes: [],
+                },
+            });
+            const res = await listShares();
+            const body = await res.json();
+            expect(body.map((c) => c.title)).toEqual(["New", "Old"]);
+        });
+    });
+    describe("DELETE /api/share/[slug]", () => {
+        it("unpublishes a catalog (soft-delete sets _deletedAt)", async () => {
+            const catalog = await SharedCatalog.create({
+                title: "Doomed",
+                payload: {
+                    version: 1,
+                    createdAt: new Date().toISOString(),
+                    filaments: [],
+                    nozzles: [],
+                    printers: [],
+                    bedTypes: [],
+                },
+            });
+            const res = await deleteShare(new NextRequest(`http://localhost/api/share/${catalog.slug}`), { params: Promise.resolve({ slug: catalog.slug }) });
+            expect(res.status).toBe(200);
+            // Soft-delete: row stays in collection so peer sync can propagate
+            // the unpublish via _deletedAt rather than resurrecting on the
+            // next pull. The slug-active query (used by the public GET) must
+            // miss it so the link returns 404.
+            const active = await SharedCatalog.findOne({ slug: catalog.slug, _deletedAt: null });
+            expect(active).toBeNull();
+            const tombstone = await SharedCatalog.findOne({ slug: catalog.slug });
+            expect(tombstone).not.toBeNull();
+            expect(tombstone?._deletedAt).toBeInstanceOf(Date);
+        });
+        it("returns 404 when deleting an already-soft-deleted catalog", async () => {
+            const catalog = await SharedCatalog.create({
+                title: "Already gone",
+                payload: { version: 1, createdAt: new Date().toISOString(), filaments: [], nozzles: [], printers: [], bedTypes: [] },
+                _deletedAt: new Date(),
+            });
+            const res = await deleteShare(new NextRequest(`http://localhost/api/share/${catalog.slug}`), { params: Promise.resolve({ slug: catalog.slug }) });
+            expect(res.status).toBe(404);
+        });
+        it("public GET hides a soft-deleted catalog", async () => {
+            const catalog = await SharedCatalog.create({
+                title: "Hidden",
+                payload: { version: 1, createdAt: new Date().toISOString(), filaments: [], nozzles: [], printers: [], bedTypes: [] },
+                _deletedAt: new Date(),
+            });
+            const res = await getShare(new NextRequest(`http://localhost/api/share/${catalog.slug}`), { params: Promise.resolve({ slug: catalog.slug }) });
+            expect(res.status).toBe(404);
+        });
+        // GH #524.5: ?permanent=true sets _purged on an already-unpublished
+        // catalog (mirrors Filament's trash→purge gate).
+        it("permanent delete sets _purged on an unpublished catalog; rejects an active one", async () => {
+            const catalog = await SharedCatalog.create({
+                title: "Purge Me",
+                payload: { version: 1, createdAt: new Date().toISOString(), filaments: [], nozzles: [], printers: [], bedTypes: [] },
+            });
+            const purgeReq = (slug) => new NextRequest(`http://localhost/api/share/${slug}?permanent=true`, { method: "DELETE" });
+            // Active (not unpublished) → refused.
+            const early = await deleteShare(purgeReq(catalog.slug), {
+                params: Promise.resolve({ slug: catalog.slug }),
+            });
+            expect(early.status).toBe(404);
+            // Unpublish, then purge.
+            await deleteShare(new NextRequest(`http://localhost/api/share/${catalog.slug}`), {
+                params: Promise.resolve({ slug: catalog.slug }),
+            });
+            const purge = await deleteShare(purgeReq(catalog.slug), {
+                params: Promise.resolve({ slug: catalog.slug }),
+            });
+            expect(purge.status).toBe(200);
+            const purged = await SharedCatalog.findOne({ slug: catalog.slug });
+            expect(purged?._purged).toBe(true);
+            expect(purged?._deletedAt).toBeInstanceOf(Date);
+            // Idempotent.
+            const again = await deleteShare(purgeReq(catalog.slug), {
+                params: Promise.resolve({ slug: catalog.slug }),
+            });
+            expect(again.status).toBe(404);
+        });
+    });
+});

@@ -1,0 +1,410 @@
+/**
+ * OpenPrintTag CBOR decoder
+ *
+ * Decodes binary payloads conforming to the OpenPrintTag NFC specification.
+ * This is the inverse of generateOpenPrintTagBinary() in openprinttag.ts.
+ *
+ * The payload consists of two consecutive CBOR maps:
+ *   1. Meta map — definite map with region offsets
+ *   2. Main map — indefinite map with filament fields
+ */
+import { OPT_KEY, MATERIAL_TYPE, OPT_TAG_TO_NAME, decodeCBORFloat16 } from "./openprinttag";
+// Reverse lookup: CBOR key number → field name
+// Meta and main maps share key numbers 0-3 with different meanings,
+// so we build separate lookup tables.
+const META_KEYS = new Set(["MAIN_REGION_OFFSET", "MAIN_REGION_SIZE", "AUX_REGION_OFFSET", "AUX_REGION_SIZE"]);
+const AUX_KEYS = new Set(["AUX_CONSUMED_WEIGHT"]);
+const META_KEY_TO_NAME = {};
+const MAIN_KEY_TO_NAME = {};
+for (const [name, key] of Object.entries(OPT_KEY)) {
+    if (META_KEYS.has(name)) {
+        META_KEY_TO_NAME[key] = name;
+    }
+    else if (AUX_KEYS.has(name)) {
+        // Aux keys occupy a separate key space (auxiliary CBOR region);
+        // skip them to avoid overwriting main/identity keys in MAIN_KEY_TO_NAME.
+    }
+    else {
+        MAIN_KEY_TO_NAME[key] = name;
+    }
+}
+// Reverse lookup: material type number → abbreviation
+const MATERIAL_TYPE_TO_NAME = {};
+for (const [name, key] of Object.entries(MATERIAL_TYPE)) {
+    MATERIAL_TYPE_TO_NAME[key] = name;
+}
+// ── CBOR decoding primitives ────────────────────────────────────────
+/** Read a CBOR item from data at offset. Returns [value, newOffset]. */
+function decodeCBORItem(data, offset) {
+    if (offset >= data.length) {
+        throw new Error(`CBOR decode: unexpected end of data at offset ${offset}`);
+    }
+    const initial = data[offset++];
+    const majorType = (initial >> 5) & 0x07;
+    const additional = initial & 0x1f;
+    // Read the argument (length/value)
+    let argument;
+    if (additional < 24) {
+        argument = additional;
+    }
+    else if (additional === 24) {
+        if (offset >= data.length)
+            throw new Error("CBOR decode: unexpected end of data reading 1-byte argument");
+        argument = data[offset++];
+    }
+    else if (additional === 25) {
+        if (offset + 2 > data.length)
+            throw new Error("CBOR decode: unexpected end of data reading 2-byte argument");
+        argument = (data[offset] << 8) | data[offset + 1];
+        offset += 2;
+    }
+    else if (additional === 26) {
+        if (offset + 4 > data.length)
+            throw new Error("CBOR decode: unexpected end of data reading 4-byte argument");
+        // GH #275: the `|` chain is signed 32-bit arithmetic — a value with
+        // the high bit set would otherwise come out negative (a negative
+        // array/map count silently decodes an empty container; a negative
+        // uint returns a wrong value). The trailing `>>> 0` coerces the
+        // whole assembly back to an unsigned 32-bit integer.
+        argument =
+            (((data[offset] << 24) >>> 0) |
+                (data[offset + 1] << 16) |
+                (data[offset + 2] << 8) |
+                data[offset + 3]) >>>
+                0;
+        offset += 4;
+    }
+    else if (additional === 27) {
+        if (offset + 8 > data.length)
+            throw new Error("CBOR decode: unexpected end of data reading 8-byte argument");
+        // 64-bit - read as two 32-bit values. GH #275: each half is coerced
+        // unsigned (`>>> 0`) for the same signed-arithmetic reason as the
+        // 4-byte case above.
+        const hi = (((data[offset] << 24) >>> 0) |
+            (data[offset + 1] << 16) |
+            (data[offset + 2] << 8) |
+            data[offset + 3]) >>>
+            0;
+        offset += 4;
+        const lo = (((data[offset] << 24) >>> 0) |
+            (data[offset + 1] << 16) |
+            (data[offset + 2] << 8) |
+            data[offset + 3]) >>>
+            0;
+        offset += 4;
+        argument = hi * 0x100000000 + lo;
+    }
+    else if (additional === 31) {
+        // Indefinite length — handled per major type below
+        argument = -1;
+    }
+    else {
+        throw new Error(`CBOR decode: reserved additional value ${additional}`);
+    }
+    switch (majorType) {
+        case 0: // Unsigned integer
+            return [argument, offset];
+        case 1: // Negative integer
+            return [-(argument + 1), offset];
+        case 2: {
+            // Byte string
+            if (argument < 0)
+                throw new Error("CBOR: indefinite byte strings not supported");
+            if (offset + argument > data.length)
+                throw new Error(`CBOR decode: byte string length ${argument} exceeds available data`);
+            const bytes = data.slice(offset, offset + argument);
+            offset += argument;
+            return [bytes, offset];
+        }
+        case 3: {
+            // Text string
+            if (argument < 0)
+                throw new Error("CBOR: indefinite text strings not supported");
+            if (offset + argument > data.length)
+                throw new Error(`CBOR decode: text string length ${argument} exceeds available data`);
+            const textBytes = data.slice(offset, offset + argument);
+            offset += argument;
+            const text = new TextDecoder().decode(textBytes);
+            return [text, offset];
+        }
+        case 4: {
+            // Array
+            const arr = [];
+            if (argument < 0) {
+                // Indefinite array
+                while (offset < data.length && data[offset] !== 0xff) {
+                    const [item, newOffset] = decodeCBORItem(data, offset);
+                    arr.push(item);
+                    offset = newOffset;
+                }
+                if (offset >= data.length)
+                    throw new Error("CBOR decode: missing break byte for indefinite array");
+                offset++; // skip break byte
+            }
+            else {
+                for (let i = 0; i < argument; i++) {
+                    const [item, newOffset] = decodeCBORItem(data, offset);
+                    arr.push(item);
+                    offset = newOffset;
+                }
+            }
+            return [arr, offset];
+        }
+        case 5: {
+            // Map
+            const map = {};
+            if (argument < 0) {
+                // Indefinite map
+                while (offset < data.length && data[offset] !== 0xff) {
+                    const [key, keyOffset] = decodeCBORItem(data, offset);
+                    const [value, valOffset] = decodeCBORItem(data, keyOffset);
+                    map[String(key)] = value;
+                    offset = valOffset;
+                }
+                if (offset >= data.length)
+                    throw new Error("CBOR decode: missing break byte for indefinite map");
+                offset++; // skip break byte
+            }
+            else {
+                for (let i = 0; i < argument; i++) {
+                    const [key, keyOffset] = decodeCBORItem(data, offset);
+                    const [value, valOffset] = decodeCBORItem(data, keyOffset);
+                    map[String(key)] = value;
+                    offset = valOffset;
+                }
+            }
+            return [map, offset];
+        }
+        case 6: {
+            // Tagged value — skip tag, decode inner
+            const [value, newOffset] = decodeCBORItem(data, offset);
+            return [value, newOffset];
+        }
+        case 7: {
+            // Simple values and floats
+            if (additional === 20)
+                return [false, offset];
+            if (additional === 21)
+                return [true, offset];
+            if (additional === 22)
+                return [null, offset];
+            if (additional === 23)
+                return [undefined, offset];
+            if (additional === 25) {
+                // Float16 — argument was already read as 2 bytes
+                const f16bits = argument;
+                return [decodeCBORFloat16(f16bits), offset];
+            }
+            if (additional === 26) {
+                // Float32 — argument was read as 4 bytes uint, reinterpret
+                const ab = new ArrayBuffer(4);
+                const dv = new DataView(ab);
+                dv.setUint32(0, argument);
+                return [dv.getFloat32(0), offset];
+            }
+            if (additional === 27) {
+                // Float64
+                // argument is already the 64-bit value but JS loses precision
+                // Re-read from the original data
+                const f64Offset = offset - 8;
+                const dv2 = new DataView(data.buffer, data.byteOffset + f64Offset, 8);
+                return [dv2.getFloat64(0), offset];
+            }
+            if (additional === 31) {
+                // Break — should not appear here as standalone
+                return [undefined, offset];
+            }
+            // Simple value
+            return [argument, offset];
+        }
+        default:
+            throw new Error(`CBOR decode: unknown major type ${majorType}`);
+    }
+}
+// ── High-level decoder ──────────────────────────────────────────────
+/**
+ * Decode an OpenPrintTag CBOR payload (meta + main maps).
+ *
+ * @param data - The CBOR payload bytes (from NDEF record payload or .bin file export)
+ * @returns Decoded tag data with named fields
+ */
+export function decodeOpenPrintTagBinary(data) {
+    // Decode meta map
+    const [metaRaw, mainOffset] = decodeCBORItem(data, 0);
+    const metaMap = metaRaw;
+    const meta = {};
+    for (const [k, v] of Object.entries(metaMap)) {
+        const keyNum = parseInt(k, 10);
+        const name = META_KEY_TO_NAME[keyNum] ?? `unknown_${k}`;
+        meta[name] = v;
+    }
+    // Decode main map
+    const [mainRaw] = decodeCBORItem(data, mainOffset);
+    const mainMap = mainRaw;
+    const main = {};
+    for (const [k, v] of Object.entries(mainMap)) {
+        const keyNum = parseInt(k, 10);
+        const name = MAIN_KEY_TO_NAME[keyNum] ?? `key_${k}`;
+        main[name] = v;
+    }
+    // Build convenience fields
+    const result = { meta, main, tagSource: "openprinttag" };
+    if (main.MATERIAL_NAME !== undefined) {
+        result.materialName = main.MATERIAL_NAME;
+    }
+    if (main.BRAND_NAME !== undefined) {
+        result.brandName = main.BRAND_NAME;
+    }
+    if (main.MATERIAL_TYPE !== undefined) {
+        const typeNum = main.MATERIAL_TYPE;
+        result.materialTypeRaw = typeNum;
+        result.materialType = MATERIAL_TYPE_TO_NAME[typeNum] ?? `Unknown(${typeNum})`;
+    }
+    if (main.PRIMARY_COLOR !== undefined) {
+        // GH #477: spec `color_rgba` is RGB or RGBA. We always emit RGB on
+        // the DB side and document the alpha gap; truncate any incoming
+        // 4-byte color to its first 3 bytes so a tag with alpha doesn't
+        // produce an 8-char hex the Filament schema would reject.
+        const colorHex = bytesToRgbHex(main.PRIMARY_COLOR);
+        if (colorHex)
+            result.color = colorHex;
+    }
+    // GH #477: spec keys 20–24, parsed in slot order. Skipping null/missing
+    // slots; the resulting array is dense, so a tag with only
+    // SECONDARY_COLOR_2 set produces a one-entry array (callers can
+    // re-spread to specific slots if needed — Filament storage treats them
+    // as a positional list anyway).
+    const secondaryHexes = [];
+    const SECONDARY_NAMES = [
+        "SECONDARY_COLOR_0",
+        "SECONDARY_COLOR_1",
+        "SECONDARY_COLOR_2",
+        "SECONDARY_COLOR_3",
+        "SECONDARY_COLOR_4",
+    ];
+    for (const name of SECONDARY_NAMES) {
+        const raw = main[name];
+        if (raw === undefined)
+            continue;
+        const hex = bytesToRgbHex(raw);
+        if (hex)
+            secondaryHexes.push(hex);
+    }
+    if (secondaryHexes.length > 0) {
+        result.secondaryColors = secondaryHexes;
+    }
+    if (main.DENSITY !== undefined) {
+        result.density = main.DENSITY;
+    }
+    if (main.FILAMENT_DIAMETER !== undefined) {
+        result.diameter = main.FILAMENT_DIAMETER;
+    }
+    else {
+        result.diameter = 1.75; // spec default
+    }
+    if (main.MAX_PRINT_TEMPERATURE !== undefined) {
+        result.nozzleTemp = main.MAX_PRINT_TEMPERATURE;
+    }
+    if (main.MIN_PRINT_TEMPERATURE !== undefined) {
+        result.nozzleTempMin = main.MIN_PRINT_TEMPERATURE;
+    }
+    if (main.PREHEAT_TEMPERATURE !== undefined) {
+        result.preheatTemp = main.PREHEAT_TEMPERATURE;
+    }
+    if (main.MAX_BED_TEMPERATURE !== undefined) {
+        result.bedTemp = main.MAX_BED_TEMPERATURE;
+    }
+    if (main.MIN_BED_TEMPERATURE !== undefined) {
+        result.bedTempMin = main.MIN_BED_TEMPERATURE;
+    }
+    if (main.CHAMBER_TEMPERATURE !== undefined) {
+        result.chamberTemp = main.CHAMBER_TEMPERATURE;
+    }
+    if (main.NOMINAL_NETTO_FULL_WEIGHT !== undefined) {
+        result.weightGrams = main.NOMINAL_NETTO_FULL_WEIGHT;
+    }
+    if (main.ACTUAL_NETTO_FULL_WEIGHT !== undefined) {
+        result.actualWeightGrams = main.ACTUAL_NETTO_FULL_WEIGHT;
+    }
+    if (main.EMPTY_CONTAINER_WEIGHT !== undefined) {
+        result.emptySpoolWeight = main.EMPTY_CONTAINER_WEIGHT;
+    }
+    if (main.MATERIAL_ABBREVIATION !== undefined) {
+        result.materialAbbreviation = main.MATERIAL_ABBREVIATION;
+    }
+    if (main.COUNTRY_OF_ORIGIN !== undefined) {
+        result.countryOfOrigin = main.COUNTRY_OF_ORIGIN;
+    }
+    // brand_specific_instance_id – spool/instance identifier string
+    if (main.BRAND_SPECIFIC_INSTANCE_ID !== undefined) {
+        result.spoolUid = main.BRAND_SPECIFIC_INSTANCE_ID;
+    }
+    if (main.DRYING_TEMPERATURE !== undefined) {
+        result.dryingTemperature = main.DRYING_TEMPERATURE;
+    }
+    if (main.DRYING_TIME !== undefined) {
+        result.dryingTime = main.DRYING_TIME;
+    }
+    if (main.TRANSMISSION_DISTANCE !== undefined) {
+        result.transmissionDistance = main.TRANSMISSION_DISTANCE;
+    }
+    if (main.SHORE_HARDNESS_A !== undefined) {
+        result.shoreHardnessA = main.SHORE_HARDNESS_A;
+    }
+    if (main.SHORE_HARDNESS_D !== undefined) {
+        result.shoreHardnessD = main.SHORE_HARDNESS_D;
+    }
+    if (main.TAGS !== undefined && Array.isArray(main.TAGS)) {
+        result.tags = main.TAGS;
+        result.tagNames = result.tags
+            .map((t) => OPT_TAG_TO_NAME[t])
+            .filter(Boolean);
+    }
+    // Decode auxiliary region if present. GH #311: AUX_REGION_OFFSET comes
+    // from untrusted tag bytes — require a non-negative integer strictly
+    // inside the buffer, otherwise decodeCBORItem would read at a negative
+    // index (→ undefined → silently-wrong decode instead of a clean skip).
+    if (meta.AUX_REGION_OFFSET != null &&
+        Number.isInteger(meta.AUX_REGION_OFFSET) &&
+        meta.AUX_REGION_OFFSET >= 0 &&
+        meta.AUX_REGION_OFFSET < data.length) {
+        try {
+            const [auxRaw] = decodeCBORItem(data, meta.AUX_REGION_OFFSET);
+            const auxMap = auxRaw;
+            result.aux = {};
+            for (const [k, v] of Object.entries(auxMap)) {
+                result.aux[`aux_${k}`] = v;
+            }
+            // consumed_weight is aux key 0
+            if (auxMap["0"] !== undefined) {
+                result.consumedWeight = auxMap["0"];
+            }
+        }
+        catch {
+            // Aux region may not be present or may be empty — that's OK
+        }
+    }
+    return result;
+}
+/**
+ * GH #477: Convert OpenPrintTag CBOR color bytes to a `#RRGGBB` hex
+ * string. Spec `color_rgba` may be 3 bytes (RGB) or 4 bytes (RGBA);
+ * we always emit RGB, dropping any 4th alpha byte. Returns null for
+ * malformed input (wrong byte length, not a Uint8Array, etc.) so
+ * callers can skip the slot rather than crashing.
+ *
+ * Centralised here because both the primary color path and the new
+ * secondary-color loop call it.
+ */
+function bytesToRgbHex(bytes) {
+    if (!bytes || !(bytes instanceof Uint8Array))
+        return null;
+    if (bytes.length < 3)
+        return null;
+    // Lowercase hex to match the existing decoder convention; the schema
+    // validator accepts both cases.
+    const r = bytes[0].toString(16).padStart(2, "0");
+    const g = bytes[1].toString(16).padStart(2, "0");
+    const b = bytes[2].toString(16).padStart(2, "0");
+    return `#${r}${g}${b}`;
+}

@@ -1,0 +1,298 @@
+import { describe, it, expect, beforeEach } from "vitest";
+import mongoose from "mongoose";
+import { NextRequest } from "next/server";
+import { GET as listLocations, POST as createLocation } from "@/app/api/locations/route";
+import { GET as getLocation, PUT as updateLocation, DELETE as deleteLocation, } from "@/app/api/locations/[id]/route";
+/**
+ * Route-level tests for the v1.11 Locations feature. Locations are a
+ * brand-new concept in this release — every spool-location assignment,
+ * the inventory dashboard, and the "reassign before delete" guardrail
+ * live here. No existing test exercised this surface.
+ */
+describe("/api/locations", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let Location;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let Filament;
+    beforeEach(async () => {
+        // Re-register models after setup.ts's afterEach wipes mongoose.models.
+        // Route handlers do .populate() and aggregation against the registry
+        // by model name, so ESM-cached modules aren't enough on their own.
+        const locationMod = await import("@/models/Location");
+        const filamentMod = await import("@/models/Filament");
+        if (!mongoose.models.Location) {
+            mongoose.model("Location", locationMod.default.schema);
+        }
+        if (!mongoose.models.Filament) {
+            mongoose.model("Filament", filamentMod.default.schema);
+        }
+        Location = mongoose.models.Location;
+        Filament = mongoose.models.Filament;
+        // Sync indexes so the partial-unique name index exists for the
+        // duplicate-name test; without this mongoose-memory-server skips
+        // index creation and 11000 errors never surface.
+        await Location.syncIndexes();
+    });
+    function jsonReq(url, body) {
+        return new NextRequest(url, {
+            method: body ? "POST" : "GET",
+            headers: { "content-type": "application/json" },
+            body: body ? JSON.stringify(body) : undefined,
+        });
+    }
+    describe("POST /api/locations", () => {
+        it("creates a location with the given fields", async () => {
+            const res = await createLocation(jsonReq("http://localhost/api/locations", {
+                name: "Main shelf",
+                kind: "shelf",
+                notes: "near the workbench",
+            }));
+            expect(res.status).toBe(201);
+            const body = await res.json();
+            expect(body.name).toBe("Main shelf");
+            expect(body.kind).toBe("shelf");
+            expect(body._id).toBeDefined();
+        });
+        it("returns 409 on duplicate name", async () => {
+            await createLocation(jsonReq("http://localhost/api/locations", { name: "Dry box", kind: "drybox" }));
+            const res = await createLocation(jsonReq("http://localhost/api/locations", { name: "Dry box", kind: "drybox" }));
+            expect(res.status).toBe(409);
+        });
+        it("strips server-managed fields from the body", async () => {
+            const fakeId = new mongoose.Types.ObjectId().toString();
+            const res = await createLocation(jsonReq("http://localhost/api/locations", {
+                _id: fakeId,
+                name: "Trust-no-client",
+                kind: "bin",
+            }));
+            expect(res.status).toBe(201);
+            const body = await res.json();
+            // _id should be server-generated, not the one the client sent.
+            expect(body._id).not.toBe(fakeId);
+        });
+    });
+    describe("GET /api/locations", () => {
+        it("lists only non-deleted locations sorted by name", async () => {
+            await Location.create({ name: "Zebra", kind: "shelf" });
+            await Location.create({ name: "Alpha", kind: "shelf" });
+            const res = await listLocations(jsonReq("http://localhost/api/locations"));
+            const body = await res.json();
+            expect(body.map((l) => l.name)).toEqual(["Alpha", "Zebra"]);
+        });
+        it("filters by kind when ?kind= is passed", async () => {
+            await Location.create({ name: "Shelf A", kind: "shelf" });
+            await Location.create({ name: "Box 1", kind: "drybox" });
+            const res = await listLocations(jsonReq("http://localhost/api/locations?kind=drybox"));
+            const body = await res.json();
+            expect(body).toHaveLength(1);
+            expect(body[0].kind).toBe("drybox");
+        });
+        it("attaches spoolCount/totalGrams when ?stats=true", async () => {
+            const loc = await Location.create({ name: "Cabinet", kind: "shelf" });
+            await Filament.create({
+                name: "Stats Test",
+                vendor: "Test",
+                type: "PLA",
+                spools: [
+                    { label: "", totalWeight: 500, locationId: loc._id, retired: false },
+                    { label: "", totalWeight: 300, locationId: loc._id, retired: false },
+                    { label: "", totalWeight: 999, locationId: loc._id, retired: true }, // excluded
+                ],
+            });
+            const res = await listLocations(jsonReq("http://localhost/api/locations?stats=true"));
+            const body = await res.json();
+            const stats = body.find((l) => l.name === "Cabinet");
+            expect(stats.spoolCount).toBe(2);
+            expect(stats.totalGrams).toBe(800);
+        });
+        it("totalGrams subtracts the parent filament's spoolWeight per spool (GH #182)", async () => {
+            // Same gross weights as the test above but with spoolWeight=250 set on
+            // the filament. Expected remaining = (500-250) + (300-250) = 300.
+            // Pre-fix the aggregation summed the raw scale value (800), which
+            // over-reported by N × empty-spool mass per location.
+            const loc = await Location.create({ name: "Drybox A", kind: "drybox" });
+            await Filament.create({
+                name: "Per-spool-mass Test",
+                vendor: "Test",
+                type: "PLA",
+                spoolWeight: 250,
+                netFilamentWeight: 1000,
+                spools: [
+                    { label: "", totalWeight: 500, locationId: loc._id, retired: false },
+                    { label: "", totalWeight: 300, locationId: loc._id, retired: false },
+                ],
+            });
+            const res = await listLocations(jsonReq("http://localhost/api/locations?stats=true"));
+            const body = await res.json();
+            const stats = body.find((l) => l.name === "Drybox A");
+            expect(stats.spoolCount).toBe(2);
+            expect(stats.totalGrams).toBe(300);
+        });
+        it("spool below empty-spool weight clamps at 0 — no negative grams (GH #182)", async () => {
+            const loc = await Location.create({ name: "Drybox B", kind: "drybox" });
+            await Filament.create({
+                name: "Underweight Test",
+                vendor: "Test",
+                type: "PLA",
+                spoolWeight: 250,
+                netFilamentWeight: 1000,
+                spools: [
+                    // 200 < 250 ⇒ contributes 0, not -50
+                    { label: "", totalWeight: 200, locationId: loc._id, retired: false },
+                    // 1000 - 250 = 750
+                    { label: "", totalWeight: 1000, locationId: loc._id, retired: false },
+                ],
+            });
+            const res = await listLocations(jsonReq("http://localhost/api/locations?stats=true"));
+            const body = await res.json();
+            const stats = body.find((l) => l.name === "Drybox B");
+            expect(stats.totalGrams).toBe(750);
+        });
+        it("variant inherits spoolWeight from parent in the location aggregation (Codex P2 PR #190)", async () => {
+            // Parent spoolWeight=250; variant inherits. Spool on the variant
+            // assigned to a location. Pre-Codex-fix the $lookup was missing
+            // and the variant's null spoolWeight fell through to 0, leaving
+            // the over-reporting bug intact for variant spools.
+            const loc = await Location.create({ name: "Drybox C", kind: "drybox" });
+            const parent = await Filament.create({
+                name: "Inherit Parent",
+                vendor: "Test",
+                type: "PLA",
+                spoolWeight: 250,
+            });
+            await Filament.create({
+                name: "Inherit Variant",
+                vendor: "Test",
+                type: "PLA",
+                color: "#aabbcc",
+                parentId: parent._id,
+                // spoolWeight intentionally omitted — inherit.
+                spools: [
+                    // 1000 - 250 = 750 expected (NOT 1000).
+                    { label: "", totalWeight: 1000, locationId: loc._id, retired: false },
+                ],
+            });
+            const res = await listLocations(jsonReq("http://localhost/api/locations?stats=true"));
+            const body = await res.json();
+            const stats = body.find((l) => l.name === "Drybox C");
+            expect(stats.spoolCount).toBe(1);
+            expect(stats.totalGrams).toBe(750);
+        });
+    });
+    describe("GET /api/locations/[id]", () => {
+        it("fetches a single location by id", async () => {
+            const loc = await Location.create({ name: "X", kind: "shelf" });
+            const res = await getLocation(jsonReq(`http://localhost/api/locations/${loc._id}`), { params: Promise.resolve({ id: String(loc._id) }) });
+            const body = await res.json();
+            expect(body.name).toBe("X");
+        });
+        it("returns 404 for a missing id", async () => {
+            const fakeId = new mongoose.Types.ObjectId().toString();
+            const res = await getLocation(jsonReq(`http://localhost/api/locations/${fakeId}`), { params: Promise.resolve({ id: fakeId }) });
+            expect(res.status).toBe(404);
+        });
+    });
+    describe("PUT /api/locations/[id]", () => {
+        it("updates mutable fields", async () => {
+            const loc = await Location.create({ name: "Old", kind: "shelf" });
+            const res = await updateLocation(new NextRequest(`http://localhost/api/locations/${loc._id}`, {
+                method: "PUT",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ name: "New", notes: "updated" }),
+            }), { params: Promise.resolve({ id: String(loc._id) }) });
+            const body = await res.json();
+            expect(body.name).toBe("New");
+            expect(body.notes).toBe("updated");
+        });
+        it("persists desiccantChangedAt and accepts null to clear it", async () => {
+            const loc = await Location.create({ name: "Drybox 1", kind: "drybox" });
+            const put = (payload) => updateLocation(new NextRequest(`http://localhost/api/locations/${loc._id}`, {
+                method: "PUT",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify(payload),
+            }), { params: Promise.resolve({ id: String(loc._id) }) });
+            const set = await put({ desiccantChangedAt: "2026-07-12" });
+            expect(new Date((await set.json()).desiccantChangedAt).toISOString()).toBe("2026-07-12T00:00:00.000Z");
+            const cleared = await put({ desiccantChangedAt: null });
+            expect((await cleared.json()).desiccantChangedAt).toBeNull();
+        });
+        it("rejects an ISO-shaped but impossible desiccantChangedAt", async () => {
+            // Mongoose ROLLS OVER an impossible date rather than rejecting it, so
+            // "2026-02-30" would silently persist as March 2nd. Same trap the spool
+            // date fields hit in GH #372 — validate the string before it casts.
+            const loc = await Location.create({ name: "Drybox 2", kind: "drybox" });
+            for (const bad of ["2026-02-30", "2026-13-01", "2026-04-31", "not-a-date", 12345]) {
+                const res = await updateLocation(new NextRequest(`http://localhost/api/locations/${loc._id}`, {
+                    method: "PUT",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ desiccantChangedAt: bad }),
+                }), { params: Promise.resolve({ id: String(loc._id) }) });
+                expect(res.status).toBe(400);
+            }
+            const after = await Location.findById(loc._id).lean();
+            expect(after.desiccantChangedAt).toBeNull();
+        });
+    });
+    describe("DELETE /api/locations/[id]", () => {
+        it("soft-deletes an unreferenced location", async () => {
+            const loc = await Location.create({ name: "Gone", kind: "shelf" });
+            const res = await deleteLocation(jsonReq(`http://localhost/api/locations/${loc._id}`), { params: Promise.resolve({ id: String(loc._id) }) });
+            expect(res.status).toBe(200);
+            // Should no longer be listed
+            const list = await listLocations(jsonReq("http://localhost/api/locations"));
+            const body = await list.json();
+            expect(body.find((l) => String(l._id) === String(loc._id))).toBeUndefined();
+        });
+        it("refuses to delete a location referenced by a spool", async () => {
+            const loc = await Location.create({ name: "In use", kind: "shelf" });
+            await Filament.create({
+                name: "Has Location",
+                vendor: "Test",
+                type: "PLA",
+                spools: [{ label: "", totalWeight: 500, locationId: loc._id }],
+            });
+            const res = await deleteLocation(jsonReq(`http://localhost/api/locations/${loc._id}`), { params: Promise.resolve({ id: String(loc._id) }) });
+            expect(res.status).toBe(400);
+            const body = await res.json();
+            expect(body.error).toMatch(/referenced by spools/i);
+            // Location still exists.
+            const fresh = await Location.findById(loc._id);
+            expect(fresh._deletedAt).toBeNull();
+        });
+        it("refuses to delete a location referenced only by a TRASHED filament's spool (#629)", async () => {
+            // A trashed filament can be restored — deleting the location while
+            // the filament sits in the trash would resurrect a dangling
+            // locationId ref on restore (populate silently drops it and
+            // /api/spools/by-location renders a nameless group).
+            const loc = await Location.create({ name: "Trash-referenced", kind: "shelf" });
+            await Filament.create({
+                name: "Trashed With Location",
+                vendor: "Test",
+                type: "PLA",
+                spools: [{ label: "", totalWeight: 500, locationId: loc._id }],
+                _deletedAt: new Date(),
+            });
+            const res = await deleteLocation(jsonReq(`http://localhost/api/locations/${loc._id}`), { params: Promise.resolve({ id: String(loc._id) }) });
+            expect(res.status).toBe(400);
+            const body = await res.json();
+            expect(body.error).toMatch(/trash/i);
+            const fresh = await Location.findById(loc._id);
+            expect(fresh._deletedAt).toBeNull();
+        });
+        it("ignores _purged filament tombstones when checking refs (#629)", async () => {
+            // Purged rows are gone forever (kept only so the sync engine doesn't
+            // resurrect them) — they must NOT block the delete.
+            const loc = await Location.create({ name: "Purged-referenced", kind: "shelf" });
+            await Filament.create({
+                name: "Purged With Location",
+                vendor: "Test",
+                type: "PLA",
+                spools: [{ label: "", totalWeight: 500, locationId: loc._id }],
+                _deletedAt: new Date(),
+                _purged: true,
+            });
+            const res = await deleteLocation(jsonReq(`http://localhost/api/locations/${loc._id}`), { params: Promise.resolve({ id: String(loc._id) }) });
+            expect(res.status).toBe(200);
+        });
+    });
+});

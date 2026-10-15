@@ -1,0 +1,1305 @@
+import { describe, it, expect, beforeEach } from "vitest";
+import mongoose from "mongoose";
+import { getRemainingGrams } from "@/lib/inventoryStats";
+describe("Filament Model", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let Filament;
+    beforeEach(async () => {
+        // Clear cached model and re-import to get coverage on the actual file
+        delete mongoose.models.Filament;
+        const schemas = mongoose.modelSchemas;
+        if (schemas)
+            delete schemas.Filament;
+        // Dynamic import to re-evaluate the module
+        const mod = await import("@/models/Filament");
+        Filament = mod.default;
+        await Filament.syncIndexes();
+    });
+    it("creates a filament with required fields", async () => {
+        const filament = await Filament.create({
+            name: "Test PLA",
+            vendor: "TestBrand",
+            type: "PLA",
+        });
+        expect(filament.name).toBe("Test PLA");
+        expect(filament.vendor).toBe("TestBrand");
+        expect(filament.type).toBe("PLA");
+        expect(filament._id).toBeDefined();
+    });
+    it("applies default values", async () => {
+        const filament = await Filament.create({
+            name: "Defaults Test",
+            vendor: "Test",
+            type: "PLA",
+        });
+        expect(filament.color).toBe("#808080");
+        expect(filament.diameter).toBe(1.75);
+        expect(filament.cost).toBeNull();
+        expect(filament.density).toBeNull();
+        expect(filament.maxVolumetricSpeed).toBeNull();
+        expect(filament.inherits).toBeNull();
+        expect(filament.compatibleNozzles).toEqual([]);
+        expect(filament.calibrations).toEqual([]);
+    });
+    it("fails without required name", async () => {
+        await expect(Filament.create({ vendor: "Test", type: "PLA" })).rejects.toThrow();
+    });
+    it("fails without required vendor", async () => {
+        await expect(Filament.create({ name: "NoVendor", type: "PLA" })).rejects.toThrow();
+    });
+    it("fails without required type", async () => {
+        await expect(Filament.create({ name: "NoType", vendor: "Test" })).rejects.toThrow();
+    });
+    it("enforces unique name", async () => {
+        await Filament.create({ name: "Unique", vendor: "A", type: "PLA" });
+        await expect(Filament.create({ name: "Unique", vendor: "B", type: "PETG" })).rejects.toThrow();
+    });
+    it("stores temperature values", async () => {
+        const filament = await Filament.create({
+            name: "Temp Test",
+            vendor: "Test",
+            type: "PLA",
+            temperatures: {
+                nozzle: 210,
+                nozzleFirstLayer: 215,
+                bed: 60,
+                bedFirstLayer: 65,
+            },
+        });
+        expect(filament.temperatures.nozzle).toBe(210);
+        expect(filament.temperatures.nozzleFirstLayer).toBe(215);
+        expect(filament.temperatures.bed).toBe(60);
+        expect(filament.temperatures.bedFirstLayer).toBe(65);
+    });
+    it("stores calibrations with nozzle reference", async () => {
+        const nozzleId = new mongoose.Types.ObjectId();
+        const filament = await Filament.create({
+            name: "Calibration Test",
+            vendor: "Test",
+            type: "PLA",
+            calibrations: [
+                {
+                    nozzle: nozzleId,
+                    extrusionMultiplier: 0.96,
+                    maxVolumetricSpeed: 10,
+                    pressureAdvance: 0.053,
+                    retractLength: 0.8,
+                    retractSpeed: 40,
+                    retractLift: 0.15,
+                },
+            ],
+        });
+        expect(filament.calibrations).toHaveLength(1);
+        expect(filament.calibrations[0].nozzle.toString()).toBe(nozzleId.toString());
+        expect(filament.calibrations[0].extrusionMultiplier).toBe(0.96);
+        expect(filament.calibrations[0].maxVolumetricSpeed).toBe(10);
+        expect(filament.calibrations[0].pressureAdvance).toBe(0.053);
+    });
+    it("stores expanded calibration fields (bedType, temps, fans)", async () => {
+        const nozzleId = new mongoose.Types.ObjectId();
+        const printerId = new mongoose.Types.ObjectId();
+        const bedTypeId = new mongoose.Types.ObjectId();
+        const filament = await Filament.create({
+            name: "Expanded Cal Test",
+            vendor: "Test",
+            type: "PLA",
+            calibrations: [
+                {
+                    nozzle: nozzleId,
+                    printer: printerId,
+                    bedType: bedTypeId,
+                    extrusionMultiplier: 0.95,
+                    pressureAdvance: 0.04,
+                    nozzleTemp: 210,
+                    nozzleTempFirstLayer: 215,
+                    bedTemp: 60,
+                    bedTempFirstLayer: 65,
+                    chamberTemp: 35,
+                    fanMinSpeed: 20,
+                    fanMaxSpeed: 100,
+                    fanBridgeSpeed: 100,
+                },
+            ],
+        });
+        expect(filament.calibrations).toHaveLength(1);
+        const cal = filament.calibrations[0];
+        expect(cal.bedType.toString()).toBe(bedTypeId.toString());
+        expect(cal.printer.toString()).toBe(printerId.toString());
+        expect(cal.nozzleTemp).toBe(210);
+        expect(cal.nozzleTempFirstLayer).toBe(215);
+        expect(cal.bedTemp).toBe(60);
+        expect(cal.bedTempFirstLayer).toBe(65);
+        expect(cal.chamberTemp).toBe(35);
+        expect(cal.fanMinSpeed).toBe(20);
+        expect(cal.fanMaxSpeed).toBe(100);
+        expect(cal.fanBridgeSpeed).toBe(100);
+    });
+    it("defaults new calibration fields to null", async () => {
+        const nozzleId = new mongoose.Types.ObjectId();
+        const filament = await Filament.create({
+            name: "Cal Defaults Test",
+            vendor: "Test",
+            type: "PLA",
+            calibrations: [{ nozzle: nozzleId }],
+        });
+        const cal = filament.calibrations[0];
+        expect(cal.bedType).toBeNull();
+        expect(cal.nozzleTemp).toBeNull();
+        expect(cal.bedTemp).toBeNull();
+        expect(cal.chamberTemp).toBeNull();
+        expect(cal.fanMinSpeed).toBeNull();
+        expect(cal.fanMaxSpeed).toBeNull();
+        expect(cal.fanBridgeSpeed).toBeNull();
+    });
+    it("stores settings as mixed type", async () => {
+        const filament = await Filament.create({
+            name: "Settings Test",
+            vendor: "Test",
+            type: "PLA",
+            settings: { custom_key: "value", nil_key: null },
+        });
+        const found = await Filament.findById(filament._id).lean();
+        expect(found.settings).toMatchObject({
+            custom_key: "value",
+            nil_key: null,
+        });
+    });
+    it("stores compatibleNozzles as ObjectId array", async () => {
+        const id1 = new mongoose.Types.ObjectId();
+        const filament = await Filament.create({
+            name: "Nozzle Ref",
+            vendor: "Test",
+            type: "PLA",
+            compatibleNozzles: [id1],
+        });
+        expect(filament.compatibleNozzles).toHaveLength(1);
+        expect(filament.compatibleNozzles[0].toString()).toBe(id1.toString());
+    });
+    it("includes timestamps", async () => {
+        const filament = await Filament.create({
+            name: "Timestamp Test",
+            vendor: "Test",
+            type: "PLA",
+        });
+        expect(filament.createdAt).toBeDefined();
+        expect(filament.updatedAt).toBeDefined();
+    });
+    it("creates a filament with spools", async () => {
+        const filament = await Filament.create({
+            name: "Spool Test",
+            vendor: "Test",
+            type: "PLA",
+            spoolWeight: 200,
+            netFilamentWeight: 1000,
+            spools: [
+                { label: "Printer 1", totalWeight: 800 },
+                { label: "Backup", totalWeight: 1150 },
+            ],
+        });
+        expect(filament.spools).toHaveLength(2);
+        expect(filament.spools[0].label).toBe("Printer 1");
+        expect(filament.spools[0].totalWeight).toBe(800);
+        expect(filament.spools[0]._id).toBeDefined();
+        expect(filament.spools[0].createdAt).toBeDefined();
+        expect(filament.spools[1].label).toBe("Backup");
+        expect(filament.spools[1].totalWeight).toBe(1150);
+    });
+    it("defaults spools to empty array", async () => {
+        const filament = await Filament.create({
+            name: "No Spools",
+            vendor: "Test",
+            type: "PLA",
+        });
+        expect(filament.spools).toEqual([]);
+    });
+    it("adds a spool via push and save", async () => {
+        const filament = await Filament.create({
+            name: "Push Spool",
+            vendor: "Test",
+            type: "PLA",
+            spoolWeight: 200,
+            netFilamentWeight: 1000,
+        });
+        filament.spools.push({ label: "", totalWeight: 950 });
+        await filament.save();
+        const found = await Filament.findById(filament._id);
+        expect(found.spools).toHaveLength(1);
+        expect(found.spools[0].totalWeight).toBe(950);
+        expect(found.spools[0].label).toBe("");
+    });
+    it("removes a spool via pull", async () => {
+        const filament = await Filament.create({
+            name: "Remove Spool",
+            vendor: "Test",
+            type: "PLA",
+            spools: [
+                { label: "A", totalWeight: 500 },
+                { label: "B", totalWeight: 600 },
+            ],
+        });
+        const spoolId = filament.spools[0]._id;
+        await Filament.findByIdAndUpdate(filament._id, {
+            $pull: { spools: { _id: spoolId } },
+        });
+        const found = await Filament.findById(filament._id);
+        expect(found.spools).toHaveLength(1);
+        expect(found.spools[0].label).toBe("B");
+    });
+    it("updates a spool weight via positional operator", async () => {
+        const filament = await Filament.create({
+            name: "Update Spool",
+            vendor: "Test",
+            type: "PLA",
+            spools: [{ label: "Main", totalWeight: 900 }],
+        });
+        const spoolId = filament.spools[0]._id;
+        await Filament.findOneAndUpdate({ _id: filament._id, "spools._id": spoolId }, { $set: { "spools.$.totalWeight": 750 } });
+        const found = await Filament.findById(filament._id);
+        expect(found.spools[0].totalWeight).toBe(750);
+    });
+    it("stores spool weight fields", async () => {
+        const filament = await Filament.create({
+            name: "Weight Fields",
+            vendor: "Test",
+            type: "PLA",
+            spoolWeight: 190,
+            netFilamentWeight: 1000,
+            totalWeight: 850,
+        });
+        expect(filament.spoolWeight).toBe(190);
+        expect(filament.netFilamentWeight).toBe(1000);
+        expect(filament.totalWeight).toBe(850);
+    });
+    it("soft-deletes by setting _deletedAt", async () => {
+        const filament = await Filament.create({
+            name: "SoftDel Test",
+            vendor: "Test",
+            type: "PLA",
+        });
+        await Filament.findByIdAndUpdate(filament._id, { _deletedAt: new Date() });
+        // Should be excluded by _deletedAt: null filter
+        const found = await Filament.findOne({ _id: filament._id, _deletedAt: null });
+        expect(found).toBeNull();
+        // But still exists in the database
+        const raw = await Filament.findById(filament._id);
+        expect(raw).not.toBeNull();
+        expect(raw._deletedAt).toBeInstanceOf(Date);
+    });
+    it("_deletedAt defaults to null", async () => {
+        const filament = await Filament.create({
+            name: "DeletedAt Default",
+            vendor: "Test",
+            type: "PLA",
+        });
+        expect(filament._deletedAt).toBeNull();
+        // Findable with _deletedAt: null filter
+        const found = await Filament.findOne({ _id: filament._id, _deletedAt: null });
+        expect(found).not.toBeNull();
+    });
+    it("auto-generates instanceId on save via pre-save hook", async () => {
+        const filament = await Filament.create({
+            name: "InstanceId Test",
+            vendor: "Test",
+            type: "PLA",
+        });
+        expect(filament.instanceId).toBeDefined();
+        expect(typeof filament.instanceId).toBe("string");
+        expect(filament.instanceId.length).toBeGreaterThan(0);
+    });
+    it("regenerates instanceId via pre-save hook when cleared", async () => {
+        const filament = await Filament.create({
+            name: "Regen InstanceId",
+            vendor: "Test",
+            type: "PLA",
+        });
+        const originalId = filament.instanceId;
+        expect(originalId).toBeDefined();
+        // Clear instanceId and save — hook should regenerate it
+        filament.instanceId = "";
+        await filament.save();
+        expect(filament.instanceId).toBeDefined();
+        expect(filament.instanceId.length).toBeGreaterThan(0);
+        expect(filament.instanceId).not.toBe(originalId);
+    });
+    it("does not overwrite existing instanceId on save", async () => {
+        const filament = await Filament.create({
+            name: "Keep InstanceId",
+            vendor: "Test",
+            type: "PLA",
+            instanceId: "custom-id-123",
+        });
+        expect(filament.instanceId).toBe("custom-id-123");
+        filament.vendor = "Updated";
+        await filament.save();
+        expect(filament.instanceId).toBe("custom-id-123");
+    });
+    it("supports parentId for variant relationships", async () => {
+        const parent = await Filament.create({
+            name: "Parent PLA",
+            vendor: "Test",
+            type: "PLA",
+        });
+        const variant = await Filament.create({
+            name: "Variant PLA - Red",
+            vendor: "Test",
+            type: "PLA",
+            parentId: parent._id,
+        });
+        expect(variant.parentId.toString()).toBe(parent._id.toString());
+    });
+    it("can query variants by parentId", async () => {
+        const parent = await Filament.create({
+            name: "Parent PETG",
+            vendor: "Test",
+            type: "PETG",
+        });
+        await Filament.create({
+            name: "Variant PETG - Blue",
+            vendor: "Test",
+            type: "PETG",
+            parentId: parent._id,
+        });
+        await Filament.create({
+            name: "Variant PETG - Green",
+            vendor: "Test",
+            type: "PETG",
+            parentId: parent._id,
+        });
+        const variants = await Filament.find({ parentId: parent._id, _deletedAt: null });
+        expect(variants).toHaveLength(2);
+    });
+    it("countDocuments returns variant count for a parent", async () => {
+        const parent = await Filament.create({
+            name: "Parent ASA",
+            vendor: "Test",
+            type: "ASA",
+        });
+        await Filament.create({
+            name: "Variant ASA - Black",
+            vendor: "Test",
+            type: "ASA",
+            parentId: parent._id,
+        });
+        const variantCount = await Filament.countDocuments({ parentId: parent._id, _deletedAt: null });
+        expect(variantCount).toBe(1);
+        // Soft-delete the variant
+        await Filament.findOneAndUpdate({ name: "Variant ASA - Black" }, { _deletedAt: new Date() });
+        const activeCount = await Filament.countDocuments({ parentId: parent._id, _deletedAt: null });
+        expect(activeCount).toBe(0);
+    });
+});
+/**
+ * GH #293: this block used to re-implement the remaining-weight maths
+ * inline and assert on its own arithmetic (e.g. `expect(spool.totalWeight
+ * - filament.spoolWeight).toBe(-90)` — a tautology over test-authored
+ * literals), so a broken helper stayed green. The real remaining-weight
+ * logic lives in `src/lib/inventoryStats.ts` and is unit-tested by
+ * `inventoryStats.test.ts`. What's worth covering *here* is that the
+ * `spools` subdocument array round-trips through Mongoose and that the
+ * shared helper accepts a real persisted Filament document.
+ */
+describe("Spool subdocument persistence", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let Filament;
+    beforeEach(async () => {
+        delete mongoose.models.Filament;
+        const schemas = mongoose.modelSchemas;
+        if (schemas)
+            delete schemas.Filament;
+        const mod = await import("@/models/Filament");
+        Filament = mod.default;
+        await Filament.syncIndexes();
+    });
+    it("round-trips a multi-spool array and feeds the real getRemainingGrams helper", async () => {
+        const filament = await Filament.create({
+            name: "Multi-Spool PLA",
+            vendor: "Test",
+            type: "PLA",
+            spoolWeight: 190,
+            netFilamentWeight: 1000,
+            spools: [
+                { label: "Printer A", totalWeight: 850 },
+                { label: "Printer B", totalWeight: 600 },
+            ],
+        });
+        const found = await Filament.findById(filament._id);
+        expect(found.spools).toHaveLength(2);
+        expect(found.spools[0].label).toBe("Printer A");
+        expect(found.spools[0].totalWeight).toBe(850);
+        expect(found.spools[1].label).toBe("Printer B");
+        expect(found.spools[1].totalWeight).toBe(600);
+        // Exercise the actual helper against the persisted document:
+        // (850-190) + (600-190) = 1070.
+        expect(getRemainingGrams(found)).toBe(1070);
+    });
+    it("getRemainingGrams uses a 0g tare for a persisted filament with no spoolWeight (#954)", async () => {
+        // GH #954: aligned with by-location/dashboard/locations — a missing tare
+        // falls back to 0g (gross weight) rather than suppressing the figure, so
+        // the home-list low-stock badge can fire.
+        const filament = await Filament.create({
+            name: "Null SpoolWeight PLA",
+            vendor: "Test",
+            type: "PLA",
+            spoolWeight: null,
+            spools: [{ label: "Spool B", totalWeight: 850 }],
+        });
+        expect(getRemainingGrams(filament)).toBe(850);
+    });
+    it("getRemainingGrams clamps a near-empty persisted spool at zero", async () => {
+        const filament = await Filament.create({
+            name: "Low Weight PLA",
+            vendor: "Test",
+            type: "PLA",
+            spoolWeight: 190,
+            netFilamentWeight: 1000,
+            // totalWeight (100) below spoolWeight (190) — would be -90 unclamped.
+            spools: [{ label: "Nearly empty", totalWeight: 100 }],
+        });
+        expect(getRemainingGrams(filament)).toBe(0);
+    });
+    // #732: each spool gets its own 5-byte hex id, auto-generated by the schema
+    // default — independent per spool, 10 lowercase hex chars.
+    it("auto-generates a per-spool instanceId via the schema default", async () => {
+        const filament = await Filament.create({
+            name: "Per-Spool ID PLA",
+            vendor: "Test",
+            type: "PLA",
+            spools: [{ label: "A" }, { label: "B" }],
+        });
+        const [a, b] = filament.spools;
+        expect(a.instanceId).toMatch(/^[0-9a-f]{10}$/);
+        expect(b.instanceId).toMatch(/^[0-9a-f]{10}$/);
+        expect(a.instanceId).not.toBe(b.instanceId);
+    });
+});
+describe("Calibration sub-document updates", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let Filament;
+    beforeEach(async () => {
+        delete mongoose.models.Filament;
+        const schemas = mongoose.modelSchemas;
+        if (schemas)
+            delete schemas.Filament;
+        const mod = await import("@/models/Filament");
+        Filament = mod.default;
+        await Filament.syncIndexes();
+    });
+    it("updates a calibration entry via Object.assign on a cloned array", async () => {
+        const nozzleId = new mongoose.Types.ObjectId();
+        const filament = await Filament.create({
+            name: "Calibration Update Test",
+            vendor: "Test",
+            type: "PLA",
+            calibrations: [
+                {
+                    nozzle: nozzleId,
+                    extrusionMultiplier: 1.049,
+                    maxVolumetricSpeed: 12,
+                    pressureAdvance: 0.04,
+                    retractLength: 0.8,
+                    retractSpeed: 40,
+                    retractLift: 0.15,
+                },
+            ],
+        });
+        expect(filament.calibrations[0].extrusionMultiplier).toBe(1.049);
+        // Clone the calibrations array (as the API route does)
+        const updatedCals = filament.calibrations.map(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (c) => (c.toObject ? c.toObject() : { ...c }));
+        // Find the matching entry and Object.assign new values
+        const match = updatedCals.find(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (c) => c.nozzle.toString() === nozzleId.toString());
+        expect(match).toBeDefined();
+        Object.assign(match, { extrusionMultiplier: 1.05 });
+        // Save the filament with the updated calibrations
+        filament.calibrations = updatedCals;
+        await filament.save();
+        // Re-fetch and verify
+        const found = await Filament.findById(filament._id);
+        expect(found.calibrations).toHaveLength(1);
+        expect(found.calibrations[0].extrusionMultiplier).toBe(1.05);
+        // Other fields should remain unchanged
+        expect(found.calibrations[0].maxVolumetricSpeed).toBe(12);
+        expect(found.calibrations[0].pressureAdvance).toBe(0.04);
+        expect(found.calibrations[0].retractLength).toBe(0.8);
+    });
+    it("preserves other calibration entries when updating one", async () => {
+        const nozzleA = new mongoose.Types.ObjectId();
+        const nozzleB = new mongoose.Types.ObjectId();
+        const filament = await Filament.create({
+            name: "Multi-Cal Update",
+            vendor: "Test",
+            type: "PLA",
+            calibrations: [
+                { nozzle: nozzleA, extrusionMultiplier: 0.95 },
+                { nozzle: nozzleB, extrusionMultiplier: 1.0 },
+            ],
+        });
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const updatedCals = filament.calibrations.map((c) => c.toObject ? c.toObject() : { ...c });
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const matchA = updatedCals.find((c) => c.nozzle.toString() === nozzleA.toString());
+        Object.assign(matchA, { extrusionMultiplier: 0.97 });
+        filament.calibrations = updatedCals;
+        await filament.save();
+        const found = await Filament.findById(filament._id);
+        expect(found.calibrations).toHaveLength(2);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const calA = found.calibrations.find((c) => c.nozzle.toString() === nozzleA.toString());
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const calB = found.calibrations.find((c) => c.nozzle.toString() === nozzleB.toString());
+        expect(calA.extrusionMultiplier).toBe(0.97);
+        expect(calB.extrusionMultiplier).toBe(1.0);
+    });
+});
+describe("backfillInstanceIds", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let Filament;
+    let backfillInstanceIds;
+    beforeEach(async () => {
+        delete mongoose.models.Filament;
+        const schemas = mongoose.modelSchemas;
+        if (schemas)
+            delete schemas.Filament;
+        const mod = await import("@/models/Filament");
+        Filament = mod.default;
+        backfillInstanceIds = mod.backfillInstanceIds;
+        await Filament.syncIndexes();
+    });
+    it("backfills instanceId for filaments missing it", async () => {
+        // Insert directly to bypass pre-save hook
+        await Filament.collection.insertOne({
+            name: "No Instance",
+            vendor: "Test",
+            type: "PLA",
+            color: "#808080",
+            diameter: 1.75,
+        });
+        const count = await backfillInstanceIds();
+        expect(count).toBe(1);
+        const doc = await Filament.findOne({ name: "No Instance" });
+        expect(doc.instanceId).toBeDefined();
+        expect(doc.instanceId.length).toBeGreaterThan(0);
+    });
+    it("returns 0 when all filaments have instanceId", async () => {
+        await Filament.create({ name: "Has ID", vendor: "Test", type: "PLA" });
+        const count = await backfillInstanceIds();
+        expect(count).toBe(0);
+    });
+});
+describe("backfillSpoolInstanceIds (#732)", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let Filament;
+    let backfillSpoolInstanceIds;
+    beforeEach(async () => {
+        delete mongoose.models.Filament;
+        const schemas = mongoose.modelSchemas;
+        if (schemas)
+            delete schemas.Filament;
+        const mod = await import("@/models/Filament");
+        Filament = mod.default;
+        backfillSpoolInstanceIds = mod.backfillSpoolInstanceIds;
+        await Filament.syncIndexes();
+    });
+    // Raw insert bypasses the schema default so we can simulate pre-#732 data
+    // (spools with no instanceId). A spool's `instanceId` is OMITTED when the
+    // field is left undefined, but an explicit `null` / `""` is written as-is so
+    // the $in:[null,""] query branch can be exercised.
+    const insertLegacy = (name, filamentInstanceId, spools, extra = {}) => Filament.collection.insertOne({
+        name,
+        vendor: "Test",
+        type: "PLA",
+        color: "#808080",
+        diameter: 1.75,
+        ...(filamentInstanceId ? { instanceId: filamentInstanceId } : {}),
+        ...extra,
+        spools: spools.map((s) => ({
+            _id: new mongoose.Types.ObjectId(),
+            label: s.label,
+            totalWeight: 1000,
+            ...(s.instanceId !== undefined ? { instanceId: s.instanceId } : {}),
+        })),
+    });
+    it("single-spool filament: its spool adopts the filament's instanceId", async () => {
+        await insertLegacy("Single", "filabc1234", [{ label: "A" }]);
+        const count = await backfillSpoolInstanceIds();
+        expect(count).toBe(1);
+        const doc = await Filament.findOne({ name: "Single" });
+        expect(doc.spools[0].instanceId).toBe("filabc1234");
+    });
+    it("multi-spool: first spool inherits filament id, rest get fresh ids", async () => {
+        await insertLegacy("Multi", "filxyz6789", [
+            { label: "A" },
+            { label: "B" },
+            { label: "C" },
+        ]);
+        const count = await backfillSpoolInstanceIds();
+        expect(count).toBe(3);
+        const doc = await Filament.findOne({ name: "Multi" });
+        const ids = doc.spools.map((s) => s.instanceId);
+        expect(ids[0]).toBe("filxyz6789");
+        expect(ids[1]).toMatch(/^[0-9a-f]{10}$/);
+        expect(ids[2]).toMatch(/^[0-9a-f]{10}$/);
+        // All three distinct; the fresh ones don't collide with the filament id.
+        expect(new Set(ids).size).toBe(3);
+    });
+    it("does not reuse the filament id if a spool already holds it", async () => {
+        await insertLegacy("AlreadyTaken", "fildup0000", [
+            { label: "A", instanceId: "fildup0000" }, // already carries the filament id
+            { label: "B" }, // missing — must get a FRESH id, not the dup
+        ]);
+        const count = await backfillSpoolInstanceIds();
+        expect(count).toBe(1);
+        const doc = await Filament.findOne({ name: "AlreadyTaken" });
+        expect(doc.spools[0].instanceId).toBe("fildup0000");
+        expect(doc.spools[1].instanceId).toMatch(/^[0-9a-f]{10}$/);
+        expect(doc.spools[1].instanceId).not.toBe("fildup0000");
+    });
+    it("only fills missing ids — existing spool ids are left untouched", async () => {
+        await insertLegacy("Mixed", "filmix1111", [
+            { label: "A", instanceId: "keepme0001" },
+            { label: "B" },
+        ]);
+        const count = await backfillSpoolInstanceIds();
+        expect(count).toBe(1);
+        const doc = await Filament.findOne({ name: "Mixed" });
+        expect(doc.spools[0].instanceId).toBe("keepme0001");
+        // Filament id wasn't taken, so spool B carries it over.
+        expect(doc.spools[1].instanceId).toBe("filmix1111");
+    });
+    it("legacy filament with no instanceId: every spool gets a fresh id", async () => {
+        // In the full dbConnect() pipeline the spool backfill runs BEFORE the
+        // filament backfill, so a no-id filament's spools all get fresh ids (the
+        // filament id is minted afterwards). That ordering is pinned by the
+        // "spool backfill runs before the filament backfill" test in mongodb.test.ts.
+        await insertLegacy("NoFilamentId", undefined, [
+            { label: "A" },
+            { label: "B" },
+        ]);
+        const count = await backfillSpoolInstanceIds();
+        expect(count).toBe(2);
+        const doc = await Filament.findOne({ name: "NoFilamentId" });
+        const ids = doc.spools.map((s) => s.instanceId);
+        expect(ids[0]).toMatch(/^[0-9a-f]{10}$/);
+        expect(ids[1]).toMatch(/^[0-9a-f]{10}$/);
+        expect(ids[0]).not.toBe(ids[1]);
+    });
+    it("fills spools whose instanceId is explicitly null or empty string", async () => {
+        // Exercises the $in:[null,""] $elemMatch branch + the empty-string skip.
+        await insertLegacy("NullEmpty", "filne00000", [
+            { label: "A", instanceId: null },
+            { label: "B", instanceId: "" },
+        ]);
+        const count = await backfillSpoolInstanceIds();
+        expect(count).toBe(2);
+        const doc = await Filament.findOne({ name: "NullEmpty" });
+        // First id-less spool carries over the filament id; second gets a fresh id.
+        expect(doc.spools[0].instanceId).toBe("filne00000");
+        expect(doc.spools[1].instanceId).toMatch(/^[0-9a-f]{10}$/);
+        expect(doc.spools[1].instanceId).not.toBe("filne00000");
+    });
+    it("does not reuse the filament id when a LATER spool holds it (order-independent)", async () => {
+        // filamentIdTaken scans ALL spools up-front, so the id-less spool coming
+        // FIRST must still get a fresh id, not a duplicate of the filament id.
+        await insertLegacy("TakenLater", "fillate000", [
+            { label: "A" }, // id-less, FIRST
+            { label: "B", instanceId: "fillate000" }, // holds the filament id, second
+        ]);
+        const count = await backfillSpoolInstanceIds();
+        expect(count).toBe(1);
+        const doc = await Filament.findOne({ name: "TakenLater" });
+        expect(doc.spools[0].instanceId).toMatch(/^[0-9a-f]{10}$/);
+        expect(doc.spools[0].instanceId).not.toBe("fillate000");
+        expect(doc.spools[1].instanceId).toBe("fillate000");
+    });
+    it("backfills spools on soft-deleted filaments — identity persists through trash", async () => {
+        // The query intentionally has no _deletedAt filter so a trashed filament's
+        // spool id survives a later restore. Pin that so a future _deletedAt:null
+        // filter is caught.
+        await insertLegacy("Trashed", "filtrash01", [{ label: "A" }], { _deletedAt: new Date() });
+        const count = await backfillSpoolInstanceIds();
+        expect(count).toBe(1);
+        const doc = await Filament.findOne({ name: "Trashed" });
+        expect(doc.spools[0].instanceId).toBe("filtrash01");
+    });
+    it("ignores a filament with an explicitly-empty spools array", async () => {
+        await Filament.collection.insertOne({
+            name: "EmptyArr",
+            vendor: "Test",
+            type: "PLA",
+            color: "#808080",
+            diameter: 1.75,
+            spools: [],
+        });
+        const count = await backfillSpoolInstanceIds();
+        expect(count).toBe(0);
+    });
+    it("is idempotent — returns 0 when every spool already has an id", async () => {
+        await Filament.create({
+            name: "AllSet",
+            vendor: "Test",
+            type: "PLA",
+            spools: [{ label: "A" }, { label: "B" }],
+        });
+        const count = await backfillSpoolInstanceIds();
+        expect(count).toBe(0);
+    });
+    it("returns 0 when there are no spools to fill at all", async () => {
+        await Filament.create({ name: "Spoolless", vendor: "Test", type: "PLA" });
+        const count = await backfillSpoolInstanceIds();
+        expect(count).toBe(0);
+    });
+});
+describe("isSpoolInstanceIdTaken (#732 Phase 4)", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let Filament;
+    let isSpoolInstanceIdTaken;
+    beforeEach(async () => {
+        delete mongoose.models.Filament;
+        const schemas = mongoose.modelSchemas;
+        if (schemas)
+            delete schemas.Filament;
+        const mod = await import("@/models/Filament");
+        Filament = mod.default;
+        isSpoolInstanceIdTaken = mod.isSpoolInstanceIdTaken;
+        await Filament.syncIndexes();
+    });
+    it("returns false for an id held by no spool and no filament", async () => {
+        await Filament.create({ name: "Some Fil", vendor: "Test", type: "PLA" });
+        expect(await isSpoolInstanceIdTaken("neverused01")).toBe(false);
+    });
+    it("reports a collision with another spool's instanceId", async () => {
+        await Filament.create({
+            name: "Has Spool Id",
+            vendor: "Test",
+            type: "PLA",
+            spools: [{ label: "A", instanceId: "spoolaaa01" }],
+        });
+        expect(await isSpoolInstanceIdTaken("spoolaaa01")).toBe(true);
+    });
+    it("excludeSpoolId lets a spool keep its own id on edit", async () => {
+        const f = await Filament.create({
+            name: "Edit Own Spool",
+            vendor: "Test",
+            type: "PLA",
+            spools: [{ label: "A", instanceId: "spoolbbb01" }],
+        });
+        const spoolId = f.spools[0]._id.toString();
+        // Same spool re-checking its own id → not a collision.
+        expect(await isSpoolInstanceIdTaken("spoolbbb01", spoolId)).toBe(false);
+        // A different spool would still collide (no exclusion).
+        expect(await isSpoolInstanceIdTaken("spoolbbb01")).toBe(true);
+    });
+    it("reports a collision with ANOTHER filament's top-level instanceId", async () => {
+        // matchFilament resolves spool ids before the filament-level fallback,
+        // so a spool id equal to another filament's top-level id must be rejected.
+        await Filament.create({
+            name: "Owns Top Id",
+            vendor: "Test",
+            type: "PLA",
+            instanceId: "toplevel001",
+        });
+        expect(await isSpoolInstanceIdTaken("toplevel001")).toBe(true);
+    });
+    it("ownFilamentId permits the carry-over where a spool id equals ITS OWN filament's top-level id", async () => {
+        const own = await Filament.create({
+            name: "Carry Over",
+            vendor: "Test",
+            type: "PLA",
+            instanceId: "carryover01",
+        });
+        // Without ownFilamentId the filament's own top-level id reads as taken.
+        expect(await isSpoolInstanceIdTaken("carryover01")).toBe(true);
+        // Passing the filament's own id excludes it → the legitimate carry-over.
+        expect(await isSpoolInstanceIdTaken("carryover01", undefined, own._id.toString())).toBe(false);
+    });
+    it("ownFilamentId does NOT excuse a collision with a DIFFERENT filament's top-level id", async () => {
+        await Filament.create({
+            name: "Other Owner",
+            vendor: "Test",
+            type: "PLA",
+            instanceId: "sharedtop01",
+        });
+        const mine = await Filament.create({
+            name: "My Filament",
+            vendor: "Test",
+            type: "PLA",
+        });
+        // The id belongs to a different filament; excluding my own id doesn't help.
+        expect(await isSpoolInstanceIdTaken("sharedtop01", undefined, mine._id.toString())).toBe(true);
+    });
+    it("ignores a trashed filament's ids (scoped to _deletedAt: null)", async () => {
+        const f = await Filament.create({
+            name: "Trashed Owner",
+            vendor: "Test",
+            type: "PLA",
+            instanceId: "trashedtop1",
+            spools: [{ label: "A", instanceId: "trashedspl1" }],
+        });
+        await Filament.updateOne({ _id: f._id }, { $set: { _deletedAt: new Date() } });
+        // Both the spool id and the top-level id belong to a soft-deleted row,
+        // so neither counts as taken — the id may be reused by a live filament.
+        expect(await isSpoolInstanceIdTaken("trashedtop1")).toBe(false);
+        expect(await isSpoolInstanceIdTaken("trashedspl1")).toBe(false);
+    });
+});
+describe("Filament Model — v1.11 spool fields", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let Filament;
+    beforeEach(async () => {
+        delete mongoose.models.Filament;
+        const schemas = mongoose.modelSchemas;
+        if (schemas)
+            delete schemas.Filament;
+        const mod = await import("@/models/Filament");
+        Filament = mod.default;
+    });
+    // v1.11 introduced several spool-level fields (location, photo, retired,
+    // dryCycles, usageHistory) plus filament-level lowStockThreshold. The
+    // rest of the app (analytics, low-stock chips, dry-reminder banner)
+    // relies on the exact shape; cover them at the model layer so a schema
+    // regression fails loudly rather than silently breaking downstream code.
+    it("persists spool location/photo/retired fields", async () => {
+        const filament = await Filament.create({
+            name: "Cabinet Spool",
+            vendor: "Test",
+            type: "PLA",
+            spools: [
+                {
+                    label: "In cabinet",
+                    totalWeight: 800,
+                    locationId: new mongoose.Types.ObjectId(),
+                    photoDataUrl: "data:image/jpeg;base64,/9j/4AAQ",
+                    retired: true,
+                },
+            ],
+        });
+        const fresh = await Filament.findById(filament._id);
+        expect(fresh.spools[0].locationId).toBeDefined();
+        expect(fresh.spools[0].photoDataUrl).toBe("data:image/jpeg;base64,/9j/4AAQ");
+        expect(fresh.spools[0].retired).toBe(true);
+    });
+    it("defaults retired=false, photoDataUrl=null, locationId=null", async () => {
+        const filament = await Filament.create({
+            name: "v1.11 Defaults",
+            vendor: "Test",
+            type: "PLA",
+            spools: [{ label: "", totalWeight: 1000 }],
+        });
+        expect(filament.spools[0].retired).toBe(false);
+        expect(filament.spools[0].photoDataUrl).toBeNull();
+        expect(filament.spools[0].locationId).toBeNull();
+    });
+    it("appends dryCycles subdocuments", async () => {
+        const filament = await Filament.create({
+            name: "Dry Cycles",
+            vendor: "Test",
+            type: "PETG",
+            spools: [
+                {
+                    label: "",
+                    totalWeight: 900,
+                    dryCycles: [
+                        { date: new Date("2026-03-01"), tempC: 65, durationMin: 240, notes: "pre-print" },
+                        { date: new Date("2026-03-15"), tempC: 65, durationMin: 240, notes: "" },
+                    ],
+                },
+            ],
+        });
+        const fresh = await Filament.findById(filament._id);
+        expect(fresh.spools[0].dryCycles).toHaveLength(2);
+        expect(fresh.spools[0].dryCycles[0].tempC).toBe(65);
+        expect(fresh.spools[0].dryCycles[0].durationMin).toBe(240);
+        expect(fresh.spools[0].dryCycles[0].notes).toBe("pre-print");
+    });
+    it("appends usageHistory with all enum source values", async () => {
+        const filament = await Filament.create({
+            name: "Usage History",
+            vendor: "Test",
+            type: "PLA",
+            spools: [
+                {
+                    label: "",
+                    totalWeight: 800,
+                    usageHistory: [
+                        { grams: 50, jobLabel: "benchy", date: new Date(), source: "manual" },
+                        { grams: 30, jobLabel: "calibration", date: new Date(), source: "slicer" },
+                        { grams: 20, jobLabel: "via-history", date: new Date(), source: "job" },
+                        { grams: 10, jobLabel: "nfc-scan", date: new Date(), source: "nfc" },
+                    ],
+                },
+            ],
+        });
+        const fresh = await Filament.findById(filament._id);
+        expect(fresh.spools[0].usageHistory).toHaveLength(4);
+        expect(fresh.spools[0].usageHistory.map((u) => u.source)).toEqual([
+            "manual", "slicer", "job", "nfc",
+        ]);
+    });
+    it("defaults usageHistory.debitedGrams to null and persists a provided value (#1074)", async () => {
+        const filament = await Filament.create({
+            name: "Debited Grams",
+            vendor: "Test",
+            type: "PLA",
+            spools: [
+                {
+                    label: "",
+                    totalWeight: 800,
+                    usageHistory: [
+                        // Legacy shape: no debitedGrams → schema default null (the
+                        // refund's full-grams fallback keys on exactly this).
+                        { grams: 50, jobLabel: "legacy", date: new Date(), source: "job" },
+                        // Clamped-debit shape written by POST /api/print-history.
+                        { grams: 100, jobLabel: "clamped", date: new Date(), source: "job", debitedGrams: 40 },
+                    ],
+                },
+            ],
+        });
+        const fresh = await Filament.findById(filament._id);
+        expect(fresh.spools[0].usageHistory[0].debitedGrams).toBeNull();
+        expect(fresh.spools[0].usageHistory[1].debitedGrams).toBe(40);
+    });
+    it("rejects usageHistory.source values outside the enum", async () => {
+        await expect(Filament.create({
+            name: "Bad Source",
+            vendor: "Test",
+            type: "PLA",
+            spools: [
+                {
+                    totalWeight: 500,
+                    usageHistory: [
+                        { grams: 10, jobLabel: "x", date: new Date(), source: "bogus" },
+                    ],
+                },
+            ],
+        })).rejects.toThrow();
+    });
+    it("accepts http(s) tdsUrl values and rejects non-http schemes", async () => {
+        const ok = await Filament.create({
+            name: "TDS HTTPS",
+            vendor: "Test",
+            type: "PLA",
+            tdsUrl: "https://example.com/tds.pdf",
+        });
+        expect(ok.tdsUrl).toBe("https://example.com/tds.pdf");
+        // null and empty string are still allowed (field is optional)
+        const empty = await Filament.create({
+            name: "TDS Empty",
+            vendor: "Test",
+            type: "PLA",
+            tdsUrl: "",
+        });
+        expect(empty.tdsUrl).toBe("");
+        for (const bad of [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,<script>",
+            "ftp://example.com",
+            "not a url",
+        ]) {
+            await expect(Filament.create({
+                name: `Bad TDS ${bad}`,
+                vendor: "Test",
+                type: "PLA",
+                tdsUrl: bad,
+            })).rejects.toThrow(/tdsUrl/);
+        }
+    });
+    it("rejects disallowed tdsUrl schemes on update queries (not just create)", async () => {
+        // Mongoose skips schema validators on bare updateOne / findOneAndUpdate
+        // unless `runValidators: true` is passed. The CSV import path in
+        // src/lib/importFilaments.ts doesn't pass it, so we wired pre-update
+        // hooks instead — verify they fire across the three Mongoose update
+        // entry points and that the original value isn't overwritten on reject.
+        const f = await Filament.create({
+            name: "TDS Update Test",
+            vendor: "Test",
+            type: "PLA",
+            tdsUrl: "https://example.com/ok",
+        });
+        await expect(Filament.updateOne({ _id: f._id }, { $set: { tdsUrl: "javascript:alert(1)" } })).rejects.toThrow(/tdsUrl/);
+        await expect(Filament.findOneAndUpdate({ _id: f._id }, { $set: { tdsUrl: "file:///etc/passwd" } })).rejects.toThrow(/tdsUrl/);
+        await expect(Filament.updateMany({}, { $set: { tdsUrl: "ftp://example.com" } })).rejects.toThrow(/tdsUrl/);
+        // Original value untouched after the rejected updates
+        const reread = await Filament.findById(f._id).lean();
+        expect(reread.tdsUrl).toBe("https://example.com/ok");
+        // http(s) updates still pass through; empty/null are allowed clears
+        await Filament.updateOne({ _id: f._id }, { $set: { tdsUrl: "https://other.example.com/new" } });
+        expect((await Filament.findById(f._id).lean()).tdsUrl).toBe("https://other.example.com/new");
+        await Filament.updateOne({ _id: f._id }, { $set: { tdsUrl: "" } });
+        await Filament.updateOne({ _id: f._id }, { $set: { tdsUrl: null } });
+    });
+    it("rejects invalid color / secondaryColors on update queries (not just create)", async () => {
+        // GH #632: the GH #503 hex validators only ran on save()/create() —
+        // bare update queries (the OPT import's conditional-set path) could
+        // persist a malformed hex. Pre-update hooks now mirror the tdsUrl
+        // treatment across the three Mongoose update entry points.
+        const f = await Filament.create({
+            name: "Color Update Test",
+            vendor: "Test",
+            type: "PLA",
+            color: "#112233",
+            secondaryColors: ["#445566"],
+        });
+        await expect(Filament.updateOne({ _id: f._id }, { $set: { color: "#zzzzzz" } })).rejects.toThrow(/color/);
+        await expect(Filament.findOneAndUpdate({ _id: f._id }, { $set: { color: "not-a-color" } })).rejects.toThrow(/color/);
+        await expect(Filament.updateMany({}, { $set: { color: "#12345" } })).rejects.toThrow(/color/);
+        await expect(Filament.updateOne({ _id: f._id }, { $set: { secondaryColors: ["#GGGGGG"] } })).rejects.toThrow(/secondaryColors/);
+        await expect(Filament.findOneAndUpdate({ _id: f._id }, {
+            $set: {
+                secondaryColors: ["#111111", "#222222", "#333333", "#444444", "#555555", "#666666"],
+            },
+        })).rejects.toThrow(/secondaryColors/);
+        // Original values untouched after the rejected updates
+        const reread = await Filament.findById(f._id).lean();
+        expect(reread.color).toBe("#112233");
+        expect(reread.secondaryColors).toEqual(["#445566"]);
+        // Valid hex updates still pass; null primary (coextruded) and an
+        // empty secondaryColors array are legitimate writes
+        await Filament.updateOne({ _id: f._id }, { $set: { color: "#AaBbCc" } });
+        expect((await Filament.findById(f._id).lean()).color).toBe("#AaBbCc");
+        await Filament.updateOne({ _id: f._id }, { $set: { color: null, secondaryColors: ["#111111", "#222222"] } });
+        const coex = await Filament.findById(f._id).lean();
+        expect(coex.color).toBeNull();
+        expect(coex.secondaryColors).toEqual(["#111111", "#222222"]);
+        await Filament.updateOne({ _id: f._id }, { $set: { secondaryColors: [] } });
+    });
+    it("validates tdsUrl passed as a TOP-LEVEL update key (not under $set)", async () => {
+        // The hook checks BOTH `update.tdsUrl` (replacement-style, top-level) and
+        // `$set.tdsUrl`. The existing suite only exercises the $set path; this
+        // covers the top-level candidate + the `$set ?? {}` fallback when no $set
+        // is present.
+        const f = await Filament.create({
+            name: "TDS TopLevel",
+            vendor: "Test",
+            type: "PLA",
+            tdsUrl: "https://example.com/ok",
+        });
+        await expect(Filament.updateOne({ _id: f._id }, { tdsUrl: "javascript:alert(1)" })).rejects.toThrow(/tdsUrl/);
+        await expect(Filament.findOneAndUpdate({ _id: f._id }, { tdsUrl: "file:///etc/passwd" })).rejects.toThrow(/tdsUrl/);
+        // Original value survives the rejected updates.
+        expect((await Filament.findById(f._id).lean()).tdsUrl).toBe("https://example.com/ok");
+        // A valid top-level http(s) update still applies.
+        await Filament.updateOne({ _id: f._id }, { $set: { tdsUrl: "https://ok.example/x" } });
+        expect((await Filament.findById(f._id).lean()).tdsUrl).toBe("https://ok.example/x");
+    });
+    it("validates color / secondaryColors passed as TOP-LEVEL update keys (not under $set)", async () => {
+        // Mirrors the tdsUrl top-level case for the GH #632 color hook: covers
+        // `update.color` / `update.secondaryColors` (replacement-style) and the
+        // `$set ?? {}` fallback.
+        const f = await Filament.create({
+            name: "Color TopLevel",
+            vendor: "Test",
+            type: "PLA",
+            color: "#112233",
+            secondaryColors: ["#445566"],
+        });
+        await expect(Filament.updateOne({ _id: f._id }, { color: "#nothex" })).rejects.toThrow(/color/);
+        await expect(Filament.updateOne({ _id: f._id }, { secondaryColors: ["#GGGGGG"] })).rejects.toThrow(/secondaryColors/);
+        // Untouched after rejects.
+        const reread = await Filament.findById(f._id).lean();
+        expect(reread.color).toBe("#112233");
+        expect(reread.secondaryColors).toEqual(["#445566"]);
+    });
+    it("rejects a non-array secondaryColors on update queries", async () => {
+        // The `!Array.isArray(candidate)` branch: a scalar / object slipped into
+        // secondaryColors on a bare update (e.g. a malformed import) is rejected
+        // with a distinct message before the length / per-entry checks run.
+        const f = await Filament.create({
+            name: "Secondary NonArray",
+            vendor: "Test",
+            type: "PLA",
+            secondaryColors: ["#123456"],
+        });
+        await expect(Filament.updateOne({ _id: f._id }, { $set: { secondaryColors: "not-an-array" } })).rejects.toThrow(/must be an array/);
+        await expect(Filament.findOneAndUpdate({ _id: f._id }, { secondaryColors: 42 })).rejects.toThrow(/must be an array/);
+        // Value untouched after the rejected writes.
+        expect((await Filament.findById(f._id).lean()).secondaryColors).toEqual(["#123456"]);
+    });
+    it("sanitizes negative and fractional optTags entries on write (GH #634)", async () => {
+        const ok = await Filament.create({
+            name: "Tags OK",
+            vendor: "Test",
+            type: "PLA",
+            optTags: [4, 16, 71],
+        });
+        expect(ok.optTags).toEqual([4, 16, 71]);
+        // Invalid entries are dropped on assignment, valid ones survive — the
+        // setter sanitizes rather than rejecting, so a write never fails.
+        // Includes a value above the encoder's 2^32-1 ceiling (#650), which
+        // would otherwise truncate to a different tag id on the wire.
+        const mixed = await Filament.create({
+            name: "Tags Mixed",
+            vendor: "Test",
+            type: "PLA",
+            optTags: [-1, 1.5, 2 ** 32 + 16, 4, 16],
+        });
+        expect(mixed.optTags).toEqual([4, 16]);
+    });
+    it("sanitizes a non-array optTags value to an empty array (GH #634)", async () => {
+        // The setter's `!Array.isArray(arr)` guard: a non-array write (a stray
+        // string / object from a malformed import or client) is coerced to [] on
+        // assignment rather than throwing or persisting garbage.
+        const f = await Filament.create({
+            name: "Tags NonArray",
+            vendor: "Test",
+            type: "PLA",
+            optTags: "not-an-array",
+        });
+        expect(f.optTags).toEqual([]);
+        // Also holds when assigning after construction.
+        f.optTags = 42;
+        await f.save();
+        const reread = await Filament.findById(f._id).lean();
+        expect(reread.optTags).toEqual([]);
+    });
+    // Codex P2 on PR #650: a rejecting validator would block ANY save() on a
+    // legacy doc that already carries a bad optTags value — even when the
+    // save only mutates spools/usageHistory. The setter approach must let
+    // such a save through (and clean the bad value on the next optTags write).
+    it("lets a doc with a legacy bad optTags value save unrelated changes (GH #634, #650)", async () => {
+        const f = await Filament.create({
+            name: "Legacy Tags",
+            vendor: "Test",
+            type: "PLA",
+        });
+        // Plant a bad value directly, bypassing the setter (mirrors legacy data
+        // written before the sanitizer existed).
+        await Filament.collection.updateOne({ _id: f._id }, { $set: { optTags: [-1, 2.5] } });
+        const reloaded = await Filament.findById(f._id);
+        reloaded.spools.push({ totalWeight: 1000 });
+        await expect(reloaded.save()).resolves.toBeTruthy();
+    });
+    it("caps dryingTime at 10080 minutes (GH #634)", async () => {
+        const ok = await Filament.create({
+            name: "Drying OK",
+            vendor: "Test",
+            type: "PLA",
+            dryingTime: 600,
+        });
+        expect(ok.dryingTime).toBe(600);
+        await expect(Filament.create({
+            name: "Drying Too Long",
+            vendor: "Test",
+            type: "PLA",
+            dryingTime: 2 ** 32,
+        })).rejects.toThrow(/dryingTime/);
+    });
+    it("stores lowStockThreshold and rejects negatives", async () => {
+        const filament = await Filament.create({
+            name: "Low Stock",
+            vendor: "Test",
+            type: "PLA",
+            lowStockThreshold: 150,
+        });
+        expect(filament.lowStockThreshold).toBe(150);
+        await expect(Filament.create({
+            name: "Negative Threshold",
+            vendor: "Test",
+            type: "PLA",
+            lowStockThreshold: -5,
+        })).rejects.toThrow();
+    });
+    // GH #477: multi-color filament schema. Mirrors OpenPrintTag spec
+    // (primary key 19 may be null; up to 5 secondary slots in keys 20–24).
+    describe("multi-color support (#477)", () => {
+        it("defaults secondaryColors to an empty array", async () => {
+            const f = await Filament.create({
+                name: "Default Secondary Colors",
+                vendor: "Test",
+                type: "PLA",
+            });
+            expect(Array.isArray(f.secondaryColors)).toBe(true);
+            expect(f.secondaryColors).toHaveLength(0);
+        });
+        it("accepts null color (OpenPrintTag spec — coextruded filament)", async () => {
+            // Spec key 19: "If a material doesn't have a single primary
+            // color (for example rainbow or coextruded filaments), this
+            // field can be null."
+            const f = await Filament.create({
+                name: "Coextruded Tri",
+                vendor: "Test",
+                type: "PLA",
+                color: null,
+                secondaryColors: ["#FF0000", "#00FF00", "#0000FF"],
+            });
+            expect(f.color).toBeNull();
+            expect(f.secondaryColors).toEqual(["#FF0000", "#00FF00", "#0000FF"]);
+        });
+        it("stores up to 5 secondaryColors", async () => {
+            const f = await Filament.create({
+                name: "Max Secondary",
+                vendor: "Test",
+                type: "PLA",
+                color: "#FF0000",
+                secondaryColors: ["#FF8800", "#FFFF00", "#00FF00", "#0000FF", "#8800FF"],
+            });
+            expect(f.secondaryColors).toHaveLength(5);
+        });
+        it("rejects more than 5 secondaryColors (OpenPrintTag spec ceiling)", async () => {
+            await expect(Filament.create({
+                name: "Too Many Secondary",
+                vendor: "Test",
+                type: "PLA",
+                secondaryColors: [
+                    "#FF0000", "#FF8800", "#FFFF00", "#00FF00", "#0000FF", "#8800FF",
+                ],
+            })).rejects.toThrow(/may not exceed 5/);
+        });
+        it("rejects invalid hex strings in secondaryColors", async () => {
+            await expect(Filament.create({
+                name: "Bad Hex",
+                vendor: "Test",
+                type: "PLA",
+                secondaryColors: ["red", "#GGG"],
+            })).rejects.toThrow(/#RRGGBB hex string/);
+        });
+        it("rejects 8-char hex (alpha channel) in secondaryColors — not yet supported", async () => {
+            // OpenPrintTag spec's color_rgba can be 3 or 4 bytes. We don't
+            // carry alpha (translucency is handled by finish tags); reject
+            // alpha hex strings explicitly rather than silently dropping
+            // the alpha byte. Documented gap in CLAUDE.md.
+            await expect(Filament.create({
+                name: "Alpha Hex",
+                vendor: "Test",
+                type: "PLA",
+                secondaryColors: ["#FF000080"],
+            })).rejects.toThrow(/#RRGGBB hex string/);
+        });
+        it("preserves existing single-color behavior — color default is gray, secondaryColors is empty", async () => {
+            const f = await Filament.create({
+                name: "Plain Single Color",
+                vendor: "Test",
+                type: "PLA",
+            });
+            expect(f.color).toBe("#808080");
+            expect(f.secondaryColors).toEqual([]);
+        });
+    });
+    describe("#905 — spool-mutation save() validates modified paths only", () => {
+        it("a spool debit via save({validateModifiedOnly:true}) succeeds despite a legacy out-of-range field", async () => {
+            const f = await Filament.create({
+                name: "Legacy PLA",
+                vendor: "Test",
+                type: "PLA",
+                spools: [{ totalWeight: 1000 }],
+            });
+            // Inject a value that predates the numeric validators, bypassing Mongoose.
+            await Filament.collection.updateOne({ _id: f._id }, { $set: { "temperatures.nozzle": 999 } });
+            const reloaded = await Filament.findById(f._id);
+            reloaded.spools[0].totalWeight = 800; // the print-history debit shape
+            // Without the option this throws on the legacy 999; with it, only the
+            // modified spool path is validated (the route-scoped #905 fix).
+            await expect(reloaded.save({ validateModifiedOnly: true })).resolves.toBeTruthy();
+            const fresh = await Filament.findById(f._id);
+            expect(fresh.spools[0].totalWeight).toBe(800);
+        });
+        it("still rejects a MODIFIED out-of-range field even with validateModifiedOnly", async () => {
+            const f = await Filament.create({ name: "Edit Me", vendor: "Test", type: "PLA" });
+            f.temperatures.nozzle = 999; // this path IS modified → must still throw
+            await expect(f.save({ validateModifiedOnly: true })).rejects.toThrow();
+        });
+    });
+});

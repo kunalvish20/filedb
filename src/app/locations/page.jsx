@@ -1,0 +1,221 @@
+"use client";
+import { useEffect, useState, useCallback } from "react";
+import Link from "next/link";
+import { useToast } from "@/components/Toast";
+import { useConfirm } from "@/components/ConfirmDialog";
+import { useTranslation } from "@/i18n/TranslationProvider";
+import { useNumberFormat } from "@/hooks/useNumberFormat";
+import { isKnownLocationKind } from "@/lib/locationKind";
+import dynamic from "next/dynamic";
+// Loaded on demand — the dialog pulls in the TSPL emitter + qrcode preview,
+// which the locations list doesn't need until a print is requested.
+const PrintDryBoxLabelDialog = dynamic(() => import("@/components/PrintDryBoxLabelDialog"), { ssr: false });
+export default function LocationsPage() {
+    const [locations, setLocations] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [selected, setSelected] = useState(new Set());
+    const [bulkDeleting, setBulkDeleting] = useState(false);
+    const { toast } = useToast();
+    const confirm = useConfirm();
+    const { t } = useTranslation();
+    const { formatGrams } = useNumberFormat();
+    // Dry-box label printing. This page lists EVERY location — including
+    // empty and freshly created dryboxes, which /inventory cannot show (its
+    // groups are built from spools), so this is the entry point that makes a
+    // box printable at exactly the moment you most want to label it: before
+    // it has contents (PR #1043 round 4). The dialog fetches its own
+    // manifest; an empty box prints "(empty)".
+    const [printLocation, setPrintLocation] = useState(null);
+    const fetchLocations = useCallback(async (signal) => {
+        setLoading(true);
+        try {
+            const res = await fetch("/api/locations?stats=true", { signal });
+            if (!res.ok) {
+                toast(t("locations.loadError"), "error");
+                setLoading(false);
+                return;
+            }
+            const data = await res.json();
+            setLocations(data);
+            setSelected(new Set());
+            setLoading(false);
+        }
+        catch (err) {
+            if (err instanceof DOMException && err.name === "AbortError")
+                return;
+            toast(t("locations.loadError"), "error");
+            setLoading(false);
+        }
+    }, [toast, t]);
+    useEffect(() => {
+        const ac = new AbortController();
+        fetchLocations(ac.signal); // eslint-disable-line react-hooks/set-state-in-effect -- data fetching on mount
+        return () => ac.abort();
+    }, [fetchLocations]);
+    const toggleSelect = (id) => {
+        setSelected((prev) => {
+            const next = new Set(prev);
+            if (next.has(id))
+                next.delete(id);
+            else
+                next.add(id);
+            return next;
+        });
+    };
+    const toggleAll = () => {
+        if (selected.size === locations.length)
+            setSelected(new Set());
+        else
+            setSelected(new Set(locations.map((l) => l._id)));
+    };
+    const handleDelete = async (id, name) => {
+        if (!(await confirm({ message: t("locations.deleteConfirm", { name }), destructive: true, confirmLabel: t("common.delete") })))
+            return;
+        // GH #1080: a network-level fetch rejection used to escape the handler
+        // with no toast at all — the row just silently stayed.
+        try {
+            const res = await fetch(`/api/locations/${id}`, { method: "DELETE" });
+            if (!res.ok) {
+                const body = await res.json().catch(() => null);
+                toast(body?.error || t("locations.deleteError"), "error");
+                return;
+            }
+            toast(t("locations.deleted", { name }));
+            fetchLocations();
+        }
+        catch {
+            toast(t("locations.deleteError"), "error");
+        }
+    };
+    const handleBulkDelete = async () => {
+        const count = selected.size;
+        if (!(await confirm({ message: t("locations.bulkDeleteConfirm", { count }), destructive: true, confirmLabel: t("common.delete") })))
+            return;
+        setBulkDeleting(true);
+        let deleted = 0;
+        const errors = [];
+        try {
+            for (const id of selected) {
+                // GH #1080: a mid-loop network failure used to throw out of the
+                // handler, leaving the delete button disabled forever and skipping
+                // the refetch. Record the failure and keep going (GH #640 pattern).
+                try {
+                    const res = await fetch(`/api/locations/${id}`, { method: "DELETE" });
+                    if (res.ok) {
+                        deleted++;
+                    }
+                    else {
+                        const body = await res.json().catch(() => null);
+                        const name = locations.find((l) => l._id === id)?.name ?? id;
+                        errors.push(body?.error || t("locations.deleteErrorNamed", { name }));
+                    }
+                }
+                catch {
+                    const name = locations.find((l) => l._id === id)?.name ?? id;
+                    errors.push(t("locations.deleteErrorNamed", { name }));
+                }
+            }
+            if (deleted > 0)
+                toast(t("locations.bulkDeleted", { count: deleted }));
+            if (errors.length > 0)
+                toast(errors.join("; "), "error");
+        }
+        finally {
+            setBulkDeleting(false);
+            fetchLocations();
+        }
+    };
+    return (<main id="main-content" className="w-full px-4 py-8">
+      <div className="flex items-start justify-between mb-6">
+        <div>
+          <h1 className="text-3xl font-bold">{t("locations.title")}</h1>
+          <div className="flex gap-3">
+            <Link href="/settings" className="text-foreground hover:underline text-sm">
+              &larr; {t("locations.backToSettings")}
+            </Link>
+          </div>
+        </div>
+        <Link href="/locations/new" className="px-4 py-2 ui-primary text-white rounded hover:opacity-90 text-sm">
+          {t("locations.addNew")}
+        </Link>
+      </div>
+
+      {selected.size > 0 && (<div className="mb-4 flex items-center gap-3 px-3 py-2 bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 rounded-lg">
+          <span className="text-sm text-red-600 dark:text-red-300">
+            {t("locations.selected", { count: selected.size })}
+          </span>
+          <button onClick={handleBulkDelete} disabled={bulkDeleting} className="px-3 py-1 bg-red-700 text-white rounded text-sm hover:bg-red-600 disabled:opacity-50">
+            {bulkDeleting
+                ? t("locations.deleting")
+                : t("locations.deleteCount", { count: selected.size })}
+          </button>
+          <button onClick={() => setSelected(new Set())} className="text-sm text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200">
+            {t("locations.clear")}
+          </button>
+        </div>)}
+
+      {loading ? (<p className="text-gray-500">{t("locations.loading")}</p>) : locations.length === 0 ? (<div className="text-center py-12">
+          <p className="text-gray-500 mb-4">{t("locations.empty")}</p>
+          <Link href="/locations/new" className="px-4 py-2 ui-primary text-white rounded hover:opacity-90 text-sm">
+            {t("locations.addFirst")}
+          </Link>
+        </div>) : (<div className="overflow-x-auto">
+          <table className="w-full text-sm border-collapse">
+            <thead>
+              <tr className="border-b border-border">
+                <th scope="col" className="py-3 px-2 w-8">
+                  <input type="checkbox" checked={selected.size === locations.length && locations.length > 0} onChange={toggleAll} aria-label={t("locations.bulk.selectAll") || "Select all"} className="accent-red-600"/>
+                </th>
+                <th scope="col" className="text-left py-3 px-2">{t("locations.table.name")}</th>
+                <th scope="col" className="text-left py-3 px-2">{t("locations.table.kind")}</th>
+                <th scope="col" className="text-right py-3 px-2">
+                  {t("locations.table.humidity")}
+                </th>
+                <th scope="col" className="text-right py-3 px-2">
+                  {t("locations.table.spools")}
+                </th>
+                <th scope="col" className="text-right py-3 px-2">
+                  {t("locations.table.weight")}
+                </th>
+                <th scope="col" className="text-left py-3 px-2">{t("locations.table.notes")}</th>
+                <th scope="col" className="text-right py-3 px-2">{t("locations.table.actions")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {locations.map((l) => (<tr key={l._id} className={`border-b border-border hover:bg-gray-50 dark:hover:bg-gray-900 ${selected.has(l._id) ? "bg-red-950/20" : ""}`}>
+                  <td className="py-2 px-2">
+                    <input type="checkbox" checked={selected.has(l._id)} onChange={() => toggleSelect(l._id)} aria-label={l.name || t("common.select")} className="accent-red-600"/>
+                  </td>
+                  <td className="py-2 px-2 font-medium">{l.name}</td>
+                  <td className="py-2 px-2">
+                    <span className="px-2 py-0.5 bg-gray-200 dark:bg-gray-800 rounded text-xs">
+                      {isKnownLocationKind(l.kind) ? t(`locations.kind.${l.kind}`) : l.kind}
+                    </span>
+                  </td>
+                  <td className="py-2 px-2 text-right text-xs">
+                    {l.humidity != null ? `${l.humidity}%` : "—"}
+                  </td>
+                  <td className="py-2 px-2 text-right text-xs">{l.spoolCount}</td>
+                  <td className="py-2 px-2 text-right text-xs text-gray-500">
+                    {l.totalGrams > 0 ? `${formatGrams(l.totalGrams)}g` : "—"}
+                  </td>
+                  <td className="py-2 px-2 text-gray-500 text-xs">{l.notes || "—"}</td>
+                  <td className="py-2 px-2 text-right">
+                    {l.kind === "drybox" && (<button onClick={() => setPrintLocation(l)} title={t("inventory.printDryBox")} className="text-foreground hover:underline mr-3 text-xs">
+                        {t("locations.table.printLabel")}
+                      </button>)}
+                    <Link href={`/locations/${l._id}/edit`} className="text-foreground hover:underline mr-3 text-xs">
+                      {t("locations.table.edit")}
+                    </Link>
+                    <button onClick={() => handleDelete(l._id, l.name)} className="text-red-600 hover:underline text-xs">
+                      {t("locations.table.delete")}
+                    </button>
+                  </td>
+                </tr>))}
+            </tbody>
+          </table>
+        </div>)}
+
+      {printLocation && (<PrintDryBoxLabelDialog open onClose={() => setPrintLocation(null)} location={printLocation}/>)}
+    </main>);
+}

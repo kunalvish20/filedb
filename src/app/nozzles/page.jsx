@@ -1,0 +1,207 @@
+"use client";
+import { useEffect, useState, useCallback } from "react";
+import Link from "next/link";
+import { useToast } from "@/components/Toast";
+import { useConfirm } from "@/components/ConfirmDialog";
+import { useTranslation } from "@/i18n/TranslationProvider";
+import { nozzleTypeLabel } from "@/lib/nozzleTypes";
+export default function NozzlesPage() {
+    const [nozzles, setNozzles] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [selected, setSelected] = useState(new Set());
+    const [bulkDeleting, setBulkDeleting] = useState(false);
+    const { toast } = useToast();
+    const confirm = useConfirm();
+    const { t } = useTranslation();
+    const fetchNozzles = useCallback(async (signal) => {
+        setLoading(true);
+        try {
+            const res = await fetch("/api/nozzles", { signal });
+            if (!res.ok) {
+                toast(t("nozzles.loadError"), "error");
+                setLoading(false);
+                return;
+            }
+            const data = await res.json();
+            setNozzles(data);
+            setSelected(new Set());
+            setLoading(false);
+        }
+        catch (err) {
+            if (err instanceof DOMException && err.name === "AbortError")
+                return;
+            toast(t("nozzles.loadError"), "error");
+            setLoading(false);
+        }
+    }, [toast, t]);
+    useEffect(() => {
+        const ac = new AbortController();
+        fetchNozzles(ac.signal); // eslint-disable-line react-hooks/set-state-in-effect -- data fetching on mount
+        return () => ac.abort();
+    }, [fetchNozzles]);
+    const toggleSelect = (id) => {
+        setSelected((prev) => {
+            const next = new Set(prev);
+            if (next.has(id))
+                next.delete(id);
+            else
+                next.add(id);
+            return next;
+        });
+    };
+    const toggleAll = () => {
+        if (selected.size === nozzles.length) {
+            setSelected(new Set());
+        }
+        else {
+            setSelected(new Set(nozzles.map((n) => n._id)));
+        }
+    };
+    const handleDelete = async (id, name) => {
+        if (!(await confirm({ message: t("nozzles.deleteConfirm", { name }), destructive: true, confirmLabel: t("common.delete") })))
+            return;
+        // GH #1080: a network-level fetch rejection used to escape the handler
+        // with no toast at all — the row just silently stayed.
+        try {
+            const res = await fetch(`/api/nozzles/${id}`, { method: "DELETE" });
+            if (!res.ok) {
+                const body = await res.json().catch(() => null);
+                toast(body?.error || t("nozzles.deleteError"), "error");
+                return;
+            }
+            toast(t("nozzles.deleted", { name }));
+            fetchNozzles();
+        }
+        catch {
+            toast(t("nozzles.deleteError"), "error");
+        }
+    };
+    const handleBulkDelete = async () => {
+        const count = selected.size;
+        if (!(await confirm({ message: t("nozzles.bulkDeleteConfirm", { count }), destructive: true, confirmLabel: t("common.delete") })))
+            return;
+        setBulkDeleting(true);
+        let deleted = 0;
+        const errors = [];
+        try {
+            for (const id of selected) {
+                // GH #1080: a mid-loop network failure used to throw out of the
+                // handler, leaving the delete button disabled forever and skipping
+                // the refetch. Record the failure and keep going (GH #640 pattern).
+                try {
+                    const res = await fetch(`/api/nozzles/${id}`, { method: "DELETE" });
+                    if (res.ok) {
+                        deleted++;
+                    }
+                    else {
+                        const body = await res.json().catch(() => null);
+                        const name = nozzles.find((n) => n._id === id)?.name ?? id;
+                        errors.push(body?.error || t("nozzles.deleteErrorNamed", { name }));
+                    }
+                }
+                catch {
+                    const name = nozzles.find((n) => n._id === id)?.name ?? id;
+                    errors.push(t("nozzles.deleteErrorNamed", { name }));
+                }
+            }
+            if (deleted > 0)
+                toast(t("nozzles.bulkDeleted", { count: deleted }));
+            if (errors.length > 0)
+                toast(errors.join("; "), "error");
+        }
+        finally {
+            setBulkDeleting(false);
+            fetchNozzles();
+        }
+    };
+    return (<main id="main-content" className="w-full px-4 py-8">
+      <div className="flex items-start justify-between mb-6">
+        <div>
+          <h1 className="text-3xl font-bold">{t("nozzles.title")}</h1>
+          <div className="flex gap-3">
+            <Link href="/settings" className="text-foreground hover:underline text-sm">
+              &larr; {t("nozzles.backToSettings")}
+            </Link>
+          </div>
+        </div>
+        <Link href="/nozzles/new" className="px-4 py-2 ui-primary text-white rounded hover:opacity-90 text-sm">
+          {t("nozzles.addNew")}
+        </Link>
+      </div>
+
+      {selected.size > 0 && (<div className="mb-4 flex items-center gap-3 px-3 py-2 bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 rounded-lg">
+          <span className="text-sm text-red-600 dark:text-red-300">{t("nozzles.selected", { count: selected.size })}</span>
+          <button onClick={handleBulkDelete} disabled={bulkDeleting} className="px-3 py-1 bg-red-700 text-white rounded text-sm hover:bg-red-600 disabled:opacity-50">
+            {bulkDeleting ? t("nozzles.deleting") : t("nozzles.deleteCount", { count: selected.size })}
+          </button>
+          <button onClick={() => setSelected(new Set())} className="text-sm text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200">
+            {t("nozzles.clear")}
+          </button>
+        </div>)}
+
+      {loading ? (<p className="text-gray-500">{t("nozzles.loading")}</p>) : nozzles.length === 0 ? (<div className="text-center py-12">
+          <p className="text-gray-500 mb-4">{t("nozzles.empty")}</p>
+          <Link href="/nozzles/new" className="px-4 py-2 ui-primary text-white rounded hover:opacity-90 text-sm">
+            {t("nozzles.addFirst")}
+          </Link>
+        </div>) : (<div className="overflow-x-auto">
+          <table className="w-full text-sm border-collapse">
+            <thead>
+              <tr className="border-b border-border">
+                <th scope="col" className="py-3 px-2 w-8">
+                  <input type="checkbox" checked={selected.size === nozzles.length && nozzles.length > 0} onChange={toggleAll} aria-label={t("nozzles.bulk.selectAll") || "Select all"} className="accent-red-600"/>
+                </th>
+                <th scope="col" className="text-left py-3 px-2">{t("nozzles.table.name")}</th>
+                <th scope="col" className="text-right py-3 px-2">{t("nozzles.table.diameter")}</th>
+                <th scope="col" className="text-left py-3 px-2">{t("nozzles.table.type")}</th>
+                <th scope="col" className="text-center py-3 px-2">{t("nozzles.table.highFlow")}</th>
+                <th scope="col" className="text-center py-3 px-2">{t("nozzles.table.hardened")}</th>
+                <th scope="col" className="text-left py-3 px-2">{t("nozzles.table.installedIn")}</th>
+                <th scope="col" className="text-left py-3 px-2">{t("nozzles.table.notes")}</th>
+                <th scope="col" className="text-right py-3 px-2">{t("nozzles.table.actions")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {nozzles.map((n) => (<tr key={n._id} className={`border-b border-border hover:bg-gray-50 dark:hover:bg-gray-900 ${selected.has(n._id) ? "bg-red-50 dark:bg-red-950/20" : ""}`}>
+                  <td className="py-2 px-2">
+                    <input type="checkbox" checked={selected.has(n._id)} onChange={() => toggleSelect(n._id)} aria-label={n.name || t("common.select")} className="accent-red-600"/>
+                  </td>
+                  <td className="py-2 px-2 font-medium">{n.name}</td>
+                  <td className="py-2 px-2 text-right">{n.diameter}mm</td>
+                  <td className="py-2 px-2">
+                    <span className="px-2 py-0.5 bg-gray-200 dark:bg-gray-800 rounded text-xs">
+                      {nozzleTypeLabel(n.type, t)}
+                    </span>
+                  </td>
+                  <td className="py-2 px-2 text-center">
+                    {n.highFlow ? (<span className="px-2 py-0.5 bg-amber-200 dark:bg-amber-900 text-amber-800 dark:text-amber-200 rounded text-xs">
+                        {t("nozzles.table.hfBadge")}
+                      </span>) : ("—")}
+                  </td>
+                  <td className="py-2 px-2 text-center">
+                    {n.hardened ? (<span className="px-2 py-0.5 bg-blue-200 dark:bg-blue-900 text-blue-800 dark:text-foreground rounded text-xs">
+                        {t("nozzles.table.hBadge")}
+                      </span>) : ("—")}
+                  </td>
+                  <td className="py-2 px-2">
+                    {n.printers && n.printers.length > 0 ? (<div className="flex flex-wrap gap-1">
+                        {n.printers.map((p) => (<span key={p._id} className="px-1.5 py-0.5 bg-indigo-100 dark:bg-indigo-900/50 text-indigo-800 dark:text-indigo-200 rounded text-xs">
+                            {p.name}
+                          </span>))}
+                      </div>) : (<span className="text-gray-400 text-xs">—</span>)}
+                  </td>
+                  <td className="py-2 px-2 text-gray-500 text-xs">{n.notes || "—"}</td>
+                  <td className="py-2 px-2 text-right">
+                    <Link href={`/nozzles/${n._id}/edit`} className="text-foreground hover:underline mr-3 text-xs">
+                      {t("nozzles.table.edit")}
+                    </Link>
+                    <button onClick={() => handleDelete(n._id, n.name)} className="text-red-600 hover:underline text-xs">
+                      {t("nozzles.table.delete")}
+                    </button>
+                  </td>
+                </tr>))}
+            </tbody>
+          </table>
+        </div>)}
+    </main>);
+}

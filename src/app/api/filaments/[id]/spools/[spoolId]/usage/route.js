@@ -1,0 +1,148 @@
+import { NextResponse } from "next/server";
+import dbConnect from "@/lib/mongodb";
+import Filament from "@/models/Filament";
+import { runExclusive, filamentLockKey } from "@/lib/filamentMutex";
+import { errorResponse, errorResponseFromCaught, handleVersionError } from "@/lib/apiErrorHandler";
+import { assertSameOriginRequest } from "@/lib/requestGuard";
+import { capUsageHistory, MAX_SPOOL_HISTORY, MAX_USAGE_GRAMS } from "@/lib/capUsageHistory";
+import { parseSpoolResponseShape, findSpoolById, INVALID_SHAPE_MESSAGE, } from "@/lib/spoolResponseShape";
+/**
+ * POST /api/filaments/{id}/spools/{spoolId}/usage — manually log grams used.
+ *
+ * Body: { grams: number, jobLabel?: string, date?: ISO string }
+ *
+ * Decrements spool.totalWeight by `grams` (clamped at 0) and appends to
+ * spool.usageHistory. This is the "I used 120g on a benchy" manual entry
+ * from issue #92 — complements the slicer-driven /api/print-history route.
+ */
+export async function POST(request, { params }) {
+    const guard = assertSameOriginRequest(request);
+    if (guard)
+        return guard;
+    // GH #1027: ?shape=spool slims the 201 to the affected spool only.
+    const shape = parseSpoolResponseShape(request.nextUrl.searchParams);
+    if (shape === null) {
+        return errorResponse(INVALID_SHAPE_MESSAGE, 400);
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let body;
+    try {
+        body = await request.json();
+    }
+    catch {
+        return errorResponse("Invalid JSON in request body", 400);
+    }
+    if (!body || typeof body !== "object") {
+        return errorResponse("body must be an object", 400);
+    }
+    if (typeof body.grams !== "number" || !Number.isFinite(body.grams) || body.grams <= 0) {
+        return errorResponse("grams must be a positive number", 400);
+    }
+    // GH #1030: bound the MAGNITUDE too. `Number.isFinite` only excludes
+    // Infinity/NaN, so 1e308 passed here, cast, and persisted — and once a day's
+    // analytics sum overflows to Infinity the per-day apportionment yields NaN
+    // for EVERY segment of that day, so unrelated filaments that printed the same
+    // day also serialize as JSON null. See MAX_USAGE_GRAMS for the bound's derivation.
+    if (body.grams > MAX_USAGE_GRAMS) {
+        return errorResponse(`grams must be no greater than ${MAX_USAGE_GRAMS}`, 400);
+    }
+    // Label + notes length bounds keep pathological input from bloating the
+    // subdocument. 200 is generous for any realistic job name.
+    if (typeof body.jobLabel === "string" && body.jobLabel.length > 200) {
+        return errorResponse("jobLabel must be 200 characters or fewer", 400);
+    }
+    const jobLabel = typeof body.jobLabel === "string" ? body.jobLabel : "";
+    const date = body.date ? new Date(body.date) : new Date();
+    // Reject an unparseable date with a clean 400 rather than letting the
+    // Invalid Date reach the subdocument and surface as a raw Mongoose cast
+    // error (#675; matches the print-history POST date guard).
+    if (Number.isNaN(date.getTime())) {
+        return errorResponse("date is not a valid date", 400);
+    }
+    try {
+        await dbConnect();
+        const { id, spoolId } = await params;
+        // GH #605 round 11 (F1): the read-modify-save sequence mutates an
+        // existing spool subdocument, so it runs under the same per-filament
+        // mutex the promotion paths hold. Unserialized, the save could land
+        // between a promotion's snapshot and its clearing write and the
+        // 201-acknowledged debit/ledger entry would exist on neither document.
+        // (The promotion's completing write $incs __v, so an interleaved save
+        // would actually surface as the 409 VersionError below — with the lock
+        // the in-process case can't happen at all; the version guard stays for
+        // out-of-process writers.) In-lock, either this POST runs first (the
+        // fresh snapshot moves the updated spool onto the variant) or the
+        // promotion runs first and the findOne misses — post-promotion
+        // staleness already 404s (round 4); the lock adds mid-promotion
+        // atomicity. Single key, no nested lock inside.
+        return await runExclusive(filamentLockKey(id), async () => {
+            const filament = await Filament.findOne({
+                _id: id,
+                _deletedAt: null,
+                "spools._id": spoolId,
+            });
+            if (!filament) {
+                return errorResponse("Filament or spool not found", 404);
+            }
+            // Array.find keeps the lookup strictly typed against our ISpool[]
+            // interface; Mongoose's runtime DocumentArray also exposes .id() but
+            // that's untyped in the interface and would need a cast to use.
+            const spool = filament.spools.find((s) => String(s._id) === spoolId);
+            if (!spool) {
+                return errorResponse("Spool not found", 404);
+            }
+            if (typeof spool.totalWeight === "number") {
+                spool.totalWeight = Math.max(0, spool.totalWeight - body.grams);
+            }
+            spool.usageHistory = spool.usageHistory || [];
+            spool.usageHistory.push({
+                grams: body.grams,
+                jobLabel,
+                date,
+                source: "manual",
+                // No PrintHistory record backs a direct spool-UI usage log — the
+                // print-history undo path keys off this being null to skip the
+                // entry. Required by the IUsageEntry interface so the field is
+                // explicit at every call site.
+                jobId: null,
+            });
+            // GH #304 / #954 finding #6: roll off the oldest entries once the cap is
+            // reached so the embedded array can't grow the filament document unbounded.
+            // Undo-aware (capUsageHistory) rather than a plain `slice(-N)`: a manual log
+            // must not evict a still-live `source:"job"` entry, whose later
+            // DELETE /api/print-history refund keys off the entry still being present
+            // (GH #621). Manual/nfc entries are evicted first; job/slicer only as a last
+            // resort when the array is entirely undo-relevant.
+            if (spool.usageHistory.length > MAX_SPOOL_HISTORY) {
+                spool.usageHistory = capUsageHistory(spool.usageHistory, MAX_SPOOL_HISTORY);
+            }
+            // GH #905: usage logging only mutates this spool — validate modified paths
+            // only so a legacy out-of-range field elsewhere can't block the log/debit.
+            await filament.save({ validateModifiedOnly: true });
+            // GH #1027: pick the affected spool out of the same toObject()
+            // serialization the default path uses — the in-memory doc reflects the
+            // just-saved state (this route mutates and saves, no re-fetch). The
+            // mobile weight refresh reads `spool.totalWeight` off this — it must
+            // stay the GROSS post-decrement value (tare-inclusive), which it is:
+            // the decrement above writes totalWeight directly. The null guard is
+            // unreachable-in-practice (the subdoc was found above, pre-save).
+            if (shape === "spool") {
+                const spoolObj = findSpoolById(filament.toObject().spools, spoolId);
+                if (!spoolObj) {
+                    return errorResponse("Spool not found", 404);
+                }
+                return NextResponse.json({ spool: spoolObj }, { status: 201 });
+            }
+            return NextResponse.json(filament.toObject(), { status: 201 });
+        });
+    }
+    catch (err) {
+        // GH #504: surface optimistic-concurrency conflicts as 409 with a
+        // retry hint so a SpoolCard logging usage while a slicer concurrently
+        // posts print-history doesn't see a misleading 500.
+        const conflict = handleVersionError(err);
+        if (conflict)
+            return conflict;
+        return errorResponseFromCaught(err, "Failed to log usage");
+    }
+}

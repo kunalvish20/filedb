@@ -1,0 +1,1215 @@
+import { describe, it, expect } from "vitest";
+import { encodeCBORUint, encodeCBORText, encodeCBORBytes, encodeCBORKey, encodeCBORFloat16, encodeCBORFloat32, encodeCBORCompactNumber, decodeCBORFloat16, parseHexColor, resolveMaterialType, deriveMaterialAbbreviation, generateOpenPrintTagBinary, OPT_KEY, OPT_TAG, MATERIAL_CLASS, MATERIAL_TYPE, } from "@/lib/openprinttag";
+// ── CBOR encoding helpers ───────────────────────────────────────────
+describe("encodeCBORUint", () => {
+    it("encodes values 0–23 as a single byte", () => {
+        const buf = [];
+        encodeCBORUint(buf, 0);
+        expect(buf).toEqual([0x00]);
+    });
+    it("encodes value 23 as direct", () => {
+        const buf = [];
+        encodeCBORUint(buf, 23);
+        expect(buf).toEqual([23]);
+    });
+    it("encodes values 24–255 as 0x18 + uint8", () => {
+        const buf = [];
+        encodeCBORUint(buf, 200);
+        expect(buf).toEqual([0x18, 200]);
+    });
+    it("encodes value 24 correctly", () => {
+        const buf = [];
+        encodeCBORUint(buf, 24);
+        expect(buf).toEqual([0x18, 24]);
+    });
+    it("encodes value 255 correctly", () => {
+        const buf = [];
+        encodeCBORUint(buf, 255);
+        expect(buf).toEqual([0x18, 255]);
+    });
+    it("encodes values 256–65535 as 0x19 + uint16", () => {
+        const buf = [];
+        encodeCBORUint(buf, 1000);
+        expect(buf).toEqual([0x19, 0x03, 0xe8]);
+    });
+    it("encodes value 256 as uint16", () => {
+        const buf = [];
+        encodeCBORUint(buf, 256);
+        expect(buf).toEqual([0x19, 0x01, 0x00]);
+    });
+    it("encodes value 65535 as uint16", () => {
+        const buf = [];
+        encodeCBORUint(buf, 65535);
+        expect(buf).toEqual([0x19, 0xff, 0xff]);
+    });
+    it("encodes values 65536+ as 0x1a + uint32", () => {
+        const buf = [];
+        encodeCBORUint(buf, 100000);
+        expect(buf).toEqual([0x1a, 0x00, 0x01, 0x86, 0xa0]);
+    });
+    it("encodes value 65536 as uint32", () => {
+        const buf = [];
+        encodeCBORUint(buf, 65536);
+        expect(buf).toEqual([0x1a, 0x00, 0x01, 0x00, 0x00]);
+    });
+    it("throws for negative values", () => {
+        const buf = [];
+        expect(() => encodeCBORUint(buf, -1)).toThrow("CBOR unsigned int must be >= 0");
+    });
+});
+describe("encodeCBORText", () => {
+    it("encodes short strings (< 24 bytes) with inline length", () => {
+        const buf = [];
+        encodeCBORText(buf, "PLA");
+        // 0x60 + 3 = 0x63, then "PLA" = [0x50, 0x4c, 0x41]
+        expect(buf).toEqual([0x63, 0x50, 0x4c, 0x41]);
+    });
+    it("encodes empty string", () => {
+        const buf = [];
+        encodeCBORText(buf, "");
+        expect(buf).toEqual([0x60]); // text string of length 0
+    });
+    it("encodes 23-byte string with inline length", () => {
+        const buf = [];
+        const text = "A".repeat(23);
+        encodeCBORText(buf, text);
+        expect(buf[0]).toBe(0x60 + 23);
+        expect(buf.length).toBe(1 + 23);
+    });
+    it("encodes 24-byte string with uint8 length prefix", () => {
+        const buf = [];
+        const text = "A".repeat(24);
+        encodeCBORText(buf, text);
+        expect(buf[0]).toBe(0x78);
+        expect(buf[1]).toBe(24);
+        expect(buf.length).toBe(2 + 24);
+    });
+    it("encodes strings 24–255 bytes with 0x78 + uint8 length", () => {
+        const buf = [];
+        const text = "A".repeat(100);
+        encodeCBORText(buf, text);
+        expect(buf[0]).toBe(0x78);
+        expect(buf[1]).toBe(100);
+        expect(buf.length).toBe(2 + 100);
+    });
+    it("encodes strings 256–65535 bytes with 0x79 + uint16 length", () => {
+        const buf = [];
+        const text = "A".repeat(300);
+        encodeCBORText(buf, text);
+        expect(buf[0]).toBe(0x79);
+        expect(buf[1]).toBe(1); // 300 >> 8
+        expect(buf[2]).toBe(44); // 300 & 0xFF
+        expect(buf.length).toBe(3 + 300);
+    });
+    it("throws for strings longer than 65535 bytes", () => {
+        const buf = [];
+        const text = "A".repeat(65536);
+        expect(() => encodeCBORText(buf, text)).toThrow("Text string too long");
+    });
+    it("handles UTF-8 multi-byte characters", () => {
+        const buf = [];
+        encodeCBORText(buf, "\u00e9"); // é = 2 UTF-8 bytes
+        expect(buf[0]).toBe(0x62); // 0x60 + 2
+        expect(buf.length).toBe(3); // header + 2 UTF-8 bytes
+    });
+});
+describe("encodeCBORBytes", () => {
+    it("encodes short byte strings with inline length", () => {
+        const buf = [];
+        encodeCBORBytes(buf, [0xff, 0x00, 0x80, 0xff]);
+        expect(buf).toEqual([0x44, 0xff, 0x00, 0x80, 0xff]);
+    });
+    it("encodes empty byte string", () => {
+        const buf = [];
+        encodeCBORBytes(buf, []);
+        expect(buf).toEqual([0x40]); // byte string of length 0
+    });
+    it("encodes 24+ byte strings with 0x58 + uint8 length", () => {
+        const buf = [];
+        const bytes = Array(30).fill(0xab);
+        encodeCBORBytes(buf, bytes);
+        expect(buf[0]).toBe(0x58);
+        expect(buf[1]).toBe(30);
+        expect(buf.length).toBe(2 + 30);
+    });
+    it("throws for byte strings >= 256 bytes", () => {
+        const buf = [];
+        const bytes = Array(256).fill(0);
+        expect(() => encodeCBORBytes(buf, bytes)).toThrow("Byte string too long");
+    });
+});
+describe("encodeCBORKey", () => {
+    it("encodes keys as unsigned integers", () => {
+        const buf = [];
+        encodeCBORKey(buf, 10);
+        expect(buf).toEqual([0x0a]);
+    });
+    it("encodes large keys with uint8 prefix", () => {
+        const buf = [];
+        encodeCBORKey(buf, 55);
+        expect(buf).toEqual([0x18, 55]);
+    });
+});
+// ── Float encoding ──────────────────────────────────────────────────
+describe("encodeCBORFloat16", () => {
+    it("encodes 1.75 as half-precision float", () => {
+        const buf = [];
+        encodeCBORFloat16(buf, 1.75);
+        // 1.75 in float16: sign=0, exp=15 (biased), frac=0x300
+        // = 0 01111 1100000000 = 0x3F00
+        expect(buf).toEqual([0xf9, 0x3f, 0x00]);
+    });
+    it("encodes 0.0 as half-precision float", () => {
+        const buf = [];
+        encodeCBORFloat16(buf, 0.0);
+        expect(buf).toEqual([0xf9, 0x00, 0x00]);
+    });
+    it("encodes 1.0 as half-precision float", () => {
+        const buf = [];
+        encodeCBORFloat16(buf, 1.0);
+        // 1.0 in float16 = 0x3C00
+        expect(buf).toEqual([0xf9, 0x3c, 0x00]);
+    });
+    it("encodes +Infinity as float16 Inf (0x7C00)", () => {
+        const buf = [];
+        encodeCBORFloat16(buf, Infinity);
+        // exp32 === 0xff, frac32 === 0 → sign 0, 0x7C00, no NaN mantissa bit
+        expect(buf).toEqual([0xf9, 0x7c, 0x00]);
+    });
+    it("encodes -Infinity as float16 -Inf (0xFC00)", () => {
+        const buf = [];
+        encodeCBORFloat16(buf, -Infinity);
+        expect(buf).toEqual([0xf9, 0xfc, 0x00]);
+    });
+    it("encodes NaN as float16 NaN (sets mantissa bit 0x0200)", () => {
+        const buf = [];
+        encodeCBORFloat16(buf, NaN);
+        // exp32 === 0xff with a non-zero fraction → 0x7C00 | 0x0200 = 0x7E00
+        expect(buf).toEqual([0xf9, 0x7e, 0x00]);
+    });
+    it("overflows a too-large finite value to float16 Inf (newExp >= 31)", () => {
+        const buf = [];
+        encodeCBORFloat16(buf, 1e30);
+        // Exponent exceeds float16's max → Inf, not a wrapped value
+        expect(buf).toEqual([0xf9, 0x7c, 0x00]);
+    });
+    it("underflows a far-too-small value to float16 zero (newExp < -10)", () => {
+        const buf = [];
+        // 1e-8 is a normal float32 whose remapped exponent is below -10, so the
+        // encoder flushes it straight to +0 without a subnormal mantissa.
+        encodeCBORFloat16(buf, 1e-8);
+        expect(buf).toEqual([0xf9, 0x00, 0x00]);
+    });
+    it("encodes a subnormal float16 (0 < newExp shift, nonzero mantissa)", () => {
+        const buf = [];
+        encodeCBORFloat16(buf, 1e-5); // inside the float16 subnormal range
+        // Header + a non-zero subnormal mantissa (round-trips to ~1e-5)
+        expect(buf[0]).toBe(0xf9);
+        const bits = (buf[1] << 8) | buf[2];
+        expect(bits).not.toBe(0); // subnormal, not flushed to zero
+        expect(bits & 0x7c00).toBe(0); // exponent field is zero → subnormal
+        expect(decodeCBORFloat16(bits)).toBeCloseTo(1e-5, 6);
+    });
+});
+describe("encodeCBORFloat32", () => {
+    it("encodes as 5-byte CBOR float32 (major type 7, additional 26)", () => {
+        const buf = [];
+        encodeCBORFloat32(buf, 1.24);
+        expect(buf[0]).toBe(0xfa); // CBOR float32 header
+        expect(buf.length).toBe(5);
+    });
+});
+describe("decodeCBORFloat16", () => {
+    it("round-trips 1.75", () => {
+        const decoded = decodeCBORFloat16(0x3f00);
+        expect(decoded).toBe(1.75);
+    });
+    it("round-trips 0.0", () => {
+        const decoded = decodeCBORFloat16(0x0000);
+        expect(decoded).toBe(0.0);
+    });
+    it("round-trips 1.0", () => {
+        const decoded = decodeCBORFloat16(0x3c00);
+        expect(decoded).toBe(1.0);
+    });
+    it("round-trips 2.75", () => {
+        // 2.75 in float16 = 0x4180
+        const buf = [];
+        encodeCBORFloat16(buf, 2.75);
+        const bits = (buf[1] << 8) | buf[2];
+        expect(decodeCBORFloat16(bits)).toBeCloseTo(2.75, 2);
+    });
+    it("decodes a subnormal (exp === 0, nonzero frac)", () => {
+        // 0x0001 = smallest positive float16 subnormal = 2^-24
+        expect(decodeCBORFloat16(0x0001)).toBeCloseTo(Math.pow(2, -24), 12);
+    });
+    it("decodes +Infinity (exp === 31, frac === 0)", () => {
+        expect(decodeCBORFloat16(0x7c00)).toBe(Infinity);
+    });
+    it("decodes NaN (exp === 31, frac !== 0)", () => {
+        expect(decodeCBORFloat16(0x7e00)).toBeNaN();
+    });
+    it("decodes negative values via the sign path (-Inf and -1.0)", () => {
+        expect(decodeCBORFloat16(0xfc00)).toBe(-Infinity);
+        expect(decodeCBORFloat16(0xbc00)).toBe(-1.0);
+    });
+});
+describe("encodeCBORCompactNumber", () => {
+    it("encodes integers as CBOR uint", () => {
+        const buf = [];
+        encodeCBORCompactNumber(buf, 1000);
+        // 1000 as uint16: 0x19 0x03 0xE8
+        expect(buf).toEqual([0x19, 0x03, 0xe8]);
+    });
+    it("encodes 1.75 as float16 (compact)", () => {
+        const buf = [];
+        encodeCBORCompactNumber(buf, 1.75);
+        // 1.75 fits in float16: 0xF9 0x3F 0x00
+        expect(buf).toEqual([0xf9, 0x3f, 0x00]);
+    });
+    it("encodes 1.24 as compact float (float16 if lossless enough)", () => {
+        const buf = [];
+        encodeCBORCompactNumber(buf, 1.24);
+        // 1.24 in float16 is ~1.2402... close enough (within 0.001)
+        // Header is either 0xF9 (float16) or 0xFA (float32)
+        expect([0xf9, 0xfa]).toContain(buf[0]);
+    });
+    it("encodes 0 as a single byte", () => {
+        const buf = [];
+        encodeCBORCompactNumber(buf, 0);
+        expect(buf).toEqual([0x00]);
+    });
+    it("falls back to float32 when float16 loses too much precision", () => {
+        const buf = [];
+        // 1234.5678 can't round-trip through float16 within 0.001, so the
+        // half-float branch is rejected and it emits a 5-byte float32.
+        encodeCBORCompactNumber(buf, 1234.5678);
+        expect(buf[0]).toBe(0xfa); // CBOR float32 header (major type 7, additional 26)
+        expect(buf.length).toBe(5);
+        // Decode the emitted float32 to confirm it carries the value.
+        const dv = new DataView(new Uint8Array(buf.slice(1)).buffer);
+        expect(dv.getFloat32(0)).toBeCloseTo(1234.5678, 3);
+    });
+    it("uses float16 for a value that round-trips within tolerance", () => {
+        const buf = [];
+        encodeCBORCompactNumber(buf, 2.75); // exact in float16
+        expect(buf[0]).toBe(0xf9);
+        expect(buf.length).toBe(3);
+    });
+    it("does not treat negative integers as CBOR uint (falls to float path)", () => {
+        const buf = [];
+        // Number.isInteger(-3) is true but value >= 0 is false, so the uint
+        // shortcut is skipped and it goes through the float encoder.
+        encodeCBORCompactNumber(buf, -3);
+        expect([0xf9, 0xfa]).toContain(buf[0]);
+    });
+});
+// ── Colour parsing ──────────────────────────────────────────────────
+describe("parseHexColor", () => {
+    it("parses 6-digit hex with # (no alpha = 3 bytes)", () => {
+        expect(parseHexColor("#FF8000")).toEqual([255, 128, 0]);
+    });
+    it("parses 6-digit hex without #", () => {
+        expect(parseHexColor("FF8000")).toEqual([255, 128, 0]);
+    });
+    it("parses 8-digit hex with alpha (4 bytes)", () => {
+        expect(parseHexColor("#FF800080")).toEqual([255, 128, 0, 128]);
+    });
+    it("parses lowercase hex", () => {
+        expect(parseHexColor("#ff8000")).toEqual([255, 128, 0]);
+    });
+    it("returns null for invalid hex", () => {
+        expect(parseHexColor("notacolor")).toBeNull();
+    });
+    it("returns null for short hex", () => {
+        expect(parseHexColor("#FFF")).toBeNull();
+    });
+    // GH #634: the old `{6,8}` quantifier also matched a 7-char string and
+    // silently ignored the dangling 7th character.
+    it("rejects 7-char hex (neither RGB nor RGBA)", () => {
+        expect(parseHexColor("#FF80001")).toBeNull();
+        expect(parseHexColor("FF80001")).toBeNull();
+    });
+    it("returns null for empty string", () => {
+        expect(parseHexColor("")).toBeNull();
+    });
+    it("parses black", () => {
+        expect(parseHexColor("#000000")).toEqual([0, 0, 0]);
+    });
+    it("parses white", () => {
+        expect(parseHexColor("#FFFFFF")).toEqual([255, 255, 255]);
+    });
+});
+// ── Material type resolution ────────────────────────────────────────
+describe("resolveMaterialType", () => {
+    it("resolves PLA to 0 (per spec)", () => {
+        expect(resolveMaterialType("PLA")).toBe(0);
+    });
+    it("resolves PETG to 1 (per spec)", () => {
+        expect(resolveMaterialType("PETG")).toBe(1);
+    });
+    it("resolves PCTG to 6 (per spec)", () => {
+        expect(resolveMaterialType("PCTG")).toBe(6);
+    });
+    it("resolves ABS to 3 (per spec)", () => {
+        expect(resolveMaterialType("ABS")).toBe(3);
+    });
+    it("resolves ASA to 4 (per spec)", () => {
+        expect(resolveMaterialType("ASA")).toBe(4);
+    });
+    it("resolves TPU to 2 (per spec)", () => {
+        expect(resolveMaterialType("TPU")).toBe(2);
+    });
+    it("resolves PA / Nylon to PA6 (8)", () => {
+        expect(resolveMaterialType("PA")).toBe(MATERIAL_TYPE.PA6);
+        expect(resolveMaterialType("Nylon")).toBe(MATERIAL_TYPE.PA6);
+    });
+    it("resolves PC to 5 (per spec)", () => {
+        expect(resolveMaterialType("PC")).toBe(5);
+    });
+    it("resolves PVA to 20 (per spec)", () => {
+        expect(resolveMaterialType("PVA")).toBe(20);
+    });
+    it("resolves HIPS to 14 (per spec)", () => {
+        expect(resolveMaterialType("HIPS")).toBe(14);
+    });
+    it("resolves PP to 7 (per spec)", () => {
+        expect(resolveMaterialType("PP")).toBe(7);
+    });
+    it("resolves POM to 34 (per spec)", () => {
+        expect(resolveMaterialType("POM")).toBe(34);
+    });
+    it("resolves PEBA to 28 (per spec)", () => {
+        expect(resolveMaterialType("PEBA")).toBe(28);
+    });
+    it("resolves PPA to 30 (per spec)", () => {
+        expect(resolveMaterialType("PPA")).toBe(30);
+    });
+    it("resolves carbon-filled variants to base type", () => {
+        expect(resolveMaterialType("PLA-CF")).toBe(MATERIAL_TYPE.PLA);
+        expect(resolveMaterialType("PETG-CF")).toBe(MATERIAL_TYPE.PETG);
+        expect(resolveMaterialType("ABS-CF")).toBe(MATERIAL_TYPE.ABS);
+        expect(resolveMaterialType("ASA-CF")).toBe(MATERIAL_TYPE.ASA);
+        expect(resolveMaterialType("PA-CF")).toBe(MATERIAL_TYPE.PA6);
+        expect(resolveMaterialType("PC-CF")).toBe(MATERIAL_TYPE.PC);
+        expect(resolveMaterialType("NYLON-CF")).toBe(MATERIAL_TYPE.PA6);
+    });
+    it("resolves PLA+ to PLA", () => {
+        expect(resolveMaterialType("PLA+")).toBe(MATERIAL_TYPE.PLA);
+    });
+    it("resolves PET-GF to PET", () => {
+        expect(resolveMaterialType("PET-GF")).toBe(MATERIAL_TYPE.PET);
+    });
+    it("is case-insensitive", () => {
+        expect(resolveMaterialType("pla")).toBe(MATERIAL_TYPE.PLA);
+        expect(resolveMaterialType("Petg")).toBe(MATERIAL_TYPE.PETG);
+    });
+    it("ignores whitespace", () => {
+        expect(resolveMaterialType("PLA ")).toBe(MATERIAL_TYPE.PLA);
+        expect(resolveMaterialType(" ABS")).toBe(MATERIAL_TYPE.ABS);
+    });
+    it("returns undefined for unknown types (per spec: can be left unspecified)", () => {
+        expect(resolveMaterialType("SilkPLA")).toBeUndefined();
+        expect(resolveMaterialType("")).toBeUndefined();
+        expect(resolveMaterialType("CustomBlend")).toBeUndefined();
+    });
+});
+// ── Material abbreviation ───────────────────────────────────────────
+describe("deriveMaterialAbbreviation", () => {
+    it("returns short types as-is (uppercased)", () => {
+        expect(deriveMaterialAbbreviation("PLA")).toBe("PLA");
+        expect(deriveMaterialAbbreviation("PETG")).toBe("PETG");
+    });
+    it("truncates to 7 characters", () => {
+        expect(deriveMaterialAbbreviation("LONGMATERIAL")).toBe("LONGMAT");
+    });
+    it("returns exactly 7 chars for 7-char type", () => {
+        expect(deriveMaterialAbbreviation("PETG-CF")).toBe("PETG-CF");
+    });
+    it("uppercases the result", () => {
+        expect(deriveMaterialAbbreviation("pla")).toBe("PLA");
+    });
+    it("strips whitespace", () => {
+        expect(deriveMaterialAbbreviation(" PLA ")).toBe("PLA");
+    });
+});
+// ── Full binary generation ──────────────────────────────────────────
+describe("generateOpenPrintTagBinary", () => {
+    const minimalInput = {
+        materialName: "Test PLA",
+        brandName: "TestBrand",
+        materialType: "PLA",
+    };
+    it("returns a Uint8Array", () => {
+        const result = generateOpenPrintTagBinary(minimalInput);
+        expect(result).toBeInstanceOf(Uint8Array);
+    });
+    it("starts with a definite map (meta section)", () => {
+        const result = generateOpenPrintTagBinary(minimalInput);
+        expect(result[0]).toBe(0xa1); // definite map with 1 pair
+    });
+    it("contains an indefinite map start (0xBF) for the main section", () => {
+        const result = generateOpenPrintTagBinary(minimalInput);
+        const bytes = Array.from(result);
+        expect(bytes).toContain(0xbf);
+    });
+    it("ends with empty aux map (0xA0) after indefinite map break (0xFF)", () => {
+        const result = generateOpenPrintTagBinary(minimalInput);
+        // Last byte: empty aux map, second-to-last: indefinite map break
+        expect(result[result.length - 1]).toBe(0xa0);
+        expect(result[result.length - 2]).toBe(0xff);
+    });
+    it("contains material_class = FFF (0)", () => {
+        const result = generateOpenPrintTagBinary(minimalInput);
+        const bytes = Array.from(result);
+        // key 8 (material_class) followed by value 0
+        const idx = bytes.indexOf(OPT_KEY.MATERIAL_CLASS);
+        expect(idx).toBeGreaterThan(0);
+        expect(bytes[idx + 1]).toBe(MATERIAL_CLASS.FFF);
+    });
+    it("contains material_type for PLA (= 0 per spec)", () => {
+        const result = generateOpenPrintTagBinary(minimalInput);
+        const bytes = Array.from(result);
+        // key 9 (material_type) followed by value 0 (PLA)
+        const idx = bytes.indexOf(OPT_KEY.MATERIAL_TYPE);
+        expect(idx).toBeGreaterThan(0);
+        expect(bytes[idx + 1]).toBe(0); // PLA = 0
+    });
+    it("contains material_type for PCTG (= 6 per spec)", () => {
+        const input = {
+            ...minimalInput,
+            materialType: "PCTG",
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        const idx = bytes.indexOf(OPT_KEY.MATERIAL_TYPE);
+        expect(idx).toBeGreaterThan(0);
+        expect(bytes[idx + 1]).toBe(6); // PCTG = 6
+    });
+    it("omits material_type for unknown types", () => {
+        const input = {
+            ...minimalInput,
+            materialType: "SilkPLA",
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        // material_type key (9) should not appear as a key in the main map
+        // It could appear as a value, so we need to check carefully
+        const bfIdx = bytes.indexOf(0xbf);
+        // After material_class (key 8, value 0), the next key should NOT be 9
+        // if material_type is omitted
+        const classIdx = bytes.indexOf(OPT_KEY.MATERIAL_CLASS, bfIdx);
+        // After key 8 and value 0, next byte should be key 10 (material_name), not 9
+        expect(bytes[classIdx + 2]).toBe(OPT_KEY.MATERIAL_NAME);
+    });
+    it("includes brand_name text", () => {
+        const result = generateOpenPrintTagBinary(minimalInput);
+        const text = new TextDecoder().decode(result);
+        expect(text).toContain("TestBrand");
+    });
+    it("includes material_name text", () => {
+        const result = generateOpenPrintTagBinary(minimalInput);
+        const text = new TextDecoder().decode(result);
+        expect(text).toContain("Test PLA");
+    });
+    it("omits filament_diameter for default 1.75mm (spec: assumed if not present)", () => {
+        const result = generateOpenPrintTagBinary(minimalInput);
+        const bytes = Array.from(result);
+        // Key 30 should NOT be present when diameter is default 1.75
+        const diamKey = findCBORKey(bytes, OPT_KEY.FILAMENT_DIAMETER);
+        expect(diamKey).toBe(-1);
+    });
+    it("includes filament_diameter as float for non-default values", () => {
+        const input = {
+            ...minimalInput,
+            diameter: 2.85,
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        const diamKey = findCBORKey(bytes, OPT_KEY.FILAMENT_DIAMETER);
+        expect(diamKey).toBeGreaterThan(0);
+        // Value should be a CBOR float (f9 for half or fa for single), NOT an integer
+        const valStart = diamKey + 2; // key 30 = 0x18 0x1E
+        expect([0xf9, 0xfa]).toContain(bytes[valStart]);
+    });
+    it("includes material abbreviation", () => {
+        const result = generateOpenPrintTagBinary(minimalInput);
+        const text = new TextDecoder().decode(result);
+        expect(text).toContain("PLA");
+    });
+    it("#952: OMITS country_of_origin when the caller supplies none (no fabricated US)", () => {
+        const bytes = Array.from(generateOpenPrintTagBinary(minimalInput));
+        expect(findCBORKey(bytes, OPT_KEY.COUNTRY_OF_ORIGIN)).toBe(-1);
+    });
+    it("#952: writes a spoolUid that fits (<=16 chars)", () => {
+        const bytes = Array.from(generateOpenPrintTagBinary({ ...minimalInput, spoolUid: "2acc21072a" }));
+        expect(findCBORKey(bytes, OPT_KEY.BRAND_SPECIFIC_INSTANCE_ID)).not.toBe(-1);
+    });
+    it("#952: OMITS an over-length spoolUid (>16) rather than truncating it", () => {
+        const bytes = Array.from(generateOpenPrintTagBinary({ ...minimalInput, spoolUid: "custom-id-01234567890" }));
+        // A truncated id would read back as a DIFFERENT id → omit entirely.
+        expect(findCBORKey(bytes, OPT_KEY.BRAND_SPECIFIC_INSTANCE_ID)).toBe(-1);
+    });
+    it("encodes temperature fields when provided", () => {
+        const input = {
+            ...minimalInput,
+            nozzleTemp: 210,
+            bedTemp: 60,
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        // Should contain min/max print temps and bed temps
+        const minPrintKey = findCBORKey(bytes, OPT_KEY.MIN_PRINT_TEMPERATURE);
+        const maxPrintKey = findCBORKey(bytes, OPT_KEY.MAX_PRINT_TEMPERATURE);
+        const minBedKey = findCBORKey(bytes, OPT_KEY.MIN_BED_TEMPERATURE);
+        const maxBedKey = findCBORKey(bytes, OPT_KEY.MAX_BED_TEMPERATURE);
+        expect(minPrintKey).toBeGreaterThan(0);
+        expect(maxPrintKey).toBeGreaterThan(0);
+        expect(minBedKey).toBeGreaterThan(0);
+        expect(maxBedKey).toBeGreaterThan(0);
+    });
+    it("omits temperature fields when not provided", () => {
+        const result = generateOpenPrintTagBinary(minimalInput);
+        const bytes = Array.from(result);
+        const minPrintKey = findCBORKey(bytes, OPT_KEY.MIN_PRINT_TEMPERATURE);
+        expect(minPrintKey).toBe(-1);
+    });
+    it("includes density as compact float when provided", () => {
+        const input = {
+            ...minimalInput,
+            density: 1.24,
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        const densityKey = findCBORKey(bytes, OPT_KEY.DENSITY);
+        expect(densityKey).toBeGreaterThan(0);
+        // Value should be a CBOR float (f9 or fa), NOT integer 124
+        const valStart = densityKey + 2; // key 29 = 0x18 0x1D
+        expect([0xf9, 0xfa]).toContain(bytes[valStart]);
+    });
+    it("omits density when null", () => {
+        const input = {
+            ...minimalInput,
+            density: null,
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        expect(findCBORKey(bytes, OPT_KEY.DENSITY)).toBe(-1);
+    });
+    it("includes colour as RGB byte string (3 bytes) for 6-digit hex", () => {
+        const input = {
+            ...minimalInput,
+            color: "#FF8000",
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        const colorKey = findCBORKey(bytes, OPT_KEY.PRIMARY_COLOR);
+        expect(colorKey).toBeGreaterThan(0);
+        // Key 19 encodes as single byte (< 24), so value starts at +1
+        // 3-byte RGB: 0x43 (byte string len 3), FF, 80, 00
+        expect(bytes[colorKey + 1]).toBe(0x43);
+        expect(bytes[colorKey + 2]).toBe(0xff);
+        expect(bytes[colorKey + 3]).toBe(0x80);
+        expect(bytes[colorKey + 4]).toBe(0x00);
+    });
+    it("includes colour as RGBA byte string (4 bytes) for 8-digit hex", () => {
+        const input = {
+            ...minimalInput,
+            color: "#FF800080",
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        const colorKey = findCBORKey(bytes, OPT_KEY.PRIMARY_COLOR);
+        expect(colorKey).toBeGreaterThan(0);
+        expect(bytes[colorKey + 1]).toBe(0x44); // byte string len 4
+        expect(bytes[colorKey + 2]).toBe(0xff);
+        expect(bytes[colorKey + 3]).toBe(0x80);
+        expect(bytes[colorKey + 4]).toBe(0x00);
+        expect(bytes[colorKey + 5]).toBe(0x80);
+    });
+    it("omits colour when color string is invalid", () => {
+        const input = {
+            ...minimalInput,
+            color: "notacolor",
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        expect(findCBORKey(bytes, OPT_KEY.PRIMARY_COLOR)).toBe(-1);
+    });
+    it("omits colour when not provided", () => {
+        const result = generateOpenPrintTagBinary(minimalInput);
+        const bytes = Array.from(result);
+        expect(findCBORKey(bytes, OPT_KEY.PRIMARY_COLOR)).toBe(-1);
+    });
+    it("includes weight when provided", () => {
+        const input = {
+            ...minimalInput,
+            weightGrams: 1000,
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        const weightKey = findCBORKey(bytes, OPT_KEY.NOMINAL_NETTO_FULL_WEIGHT);
+        expect(weightKey).toBeGreaterThan(0);
+    });
+    it("omits weight when null", () => {
+        const result = generateOpenPrintTagBinary(minimalInput);
+        const bytes = Array.from(result);
+        expect(findCBORKey(bytes, OPT_KEY.NOMINAL_NETTO_FULL_WEIGHT)).toBe(-1);
+    });
+    it("omits weight when zero", () => {
+        const input = {
+            ...minimalInput,
+            weightGrams: 0,
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        expect(findCBORKey(bytes, OPT_KEY.NOMINAL_NETTO_FULL_WEIGHT)).toBe(-1);
+    });
+    it("includes chamber temp when provided and > 0", () => {
+        const input = {
+            ...minimalInput,
+            chamberTemp: 50,
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        const chamberKey = findCBORKey(bytes, OPT_KEY.CHAMBER_TEMPERATURE);
+        expect(chamberKey).toBeGreaterThan(0);
+    });
+    it("omits chamber temp when null", () => {
+        const result = generateOpenPrintTagBinary(minimalInput);
+        const bytes = Array.from(result);
+        expect(findCBORKey(bytes, OPT_KEY.CHAMBER_TEMPERATURE)).toBe(-1);
+    });
+    it("omits chamber temp when zero", () => {
+        const input = {
+            ...minimalInput,
+            chamberTemp: 0,
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        expect(findCBORKey(bytes, OPT_KEY.CHAMBER_TEMPERATURE)).toBe(-1);
+    });
+    it("uses custom country of origin", () => {
+        const input = {
+            ...minimalInput,
+            countryOfOrigin: "CZ",
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const text = new TextDecoder().decode(result);
+        expect(text).toContain("CZ");
+    });
+    it("truncates material name to 31 chars", () => {
+        const input = {
+            ...minimalInput,
+            materialName: "A".repeat(50),
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const text = new TextDecoder().decode(result);
+        // Should contain at most 31 A's in a row
+        const match = text.match(/A+/g);
+        const longest = match ? Math.max(...match.map((s) => s.length)) : 0;
+        expect(longest).toBeLessThanOrEqual(31);
+    });
+    it("truncates brand name to 31 chars", () => {
+        const input = {
+            ...minimalInput,
+            brandName: "B".repeat(50),
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const text = new TextDecoder().decode(result);
+        const match = text.match(/B+/g);
+        const longest = match ? Math.max(...match.map((s) => s.length)) : 0;
+        expect(longest).toBeLessThanOrEqual(31);
+    });
+    it("truncates country of origin to 2 chars", () => {
+        const input = {
+            ...minimalInput,
+            countryOfOrigin: "USA",
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const text = new TextDecoder().decode(result);
+        // Should contain "US" not "USA"
+        expect(text).toContain("US");
+    });
+    it("produces valid binary for a fully-populated filament", () => {
+        const input = {
+            materialName: "Prusament PLA Galaxy Black",
+            brandName: "Prusament",
+            materialType: "PLA",
+            color: "#1a1a1a",
+            density: 1.24,
+            diameter: 1.75,
+            nozzleTemp: 215,
+            nozzleTempFirstLayer: 220,
+            bedTemp: 60,
+            bedTempFirstLayer: 65,
+            chamberTemp: 0,
+            weightGrams: 1000,
+            countryOfOrigin: "CZ",
+        };
+        const result = generateOpenPrintTagBinary(input);
+        expect(result.byteLength).toBeGreaterThan(20);
+        expect(result[0]).toBe(0xa1); // meta map
+        // Find main map
+        const bytes = Array.from(result);
+        const bfIdx = bytes.indexOf(0xbf);
+        expect(bfIdx).toBeGreaterThan(0);
+        // Last byte is empty aux map (0xA0), second-to-last is break (0xFF)
+        expect(bytes[bytes.length - 1]).toBe(0xa0);
+        expect(bytes[bytes.length - 2]).toBe(0xff);
+    });
+    it("uses nozzleTempFirstLayer to derive min print temp", () => {
+        const input = {
+            ...minimalInput,
+            nozzleTemp: 230,
+            nozzleTempFirstLayer: 240,
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        // min print temp should be nozzleTempFirstLayer - 20 = 220
+        const minPrintKey = findCBORKey(bytes, OPT_KEY.MIN_PRINT_TEMPERATURE);
+        expect(minPrintKey).toBeGreaterThan(0);
+        expect(bytes[minPrintKey + 2]).toBe(0x18); // uint8 follows
+        expect(bytes[minPrintKey + 3]).toBe(220);
+    });
+    it("uses bedTempFirstLayer as min bed temp", () => {
+        const input = {
+            ...minimalInput,
+            bedTemp: 80,
+            bedTempFirstLayer: 70,
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        const minBedKey = findCBORKey(bytes, OPT_KEY.MIN_BED_TEMPERATURE);
+        expect(minBedKey).toBeGreaterThan(0);
+        expect(bytes[minBedKey + 2]).toBe(0x18); // uint8
+        expect(bytes[minBedKey + 3]).toBe(70);
+    });
+    it("meta aux_region_offset points to the aux map within the payload", () => {
+        const result = generateOpenPrintTagBinary(minimalInput);
+        const bytes = Array.from(result);
+        // Meta: 0xA1 0x02 0x18 <offset>
+        expect(bytes[0]).toBe(0xa1);
+        expect(bytes[1]).toBe(0x02); // key = aux_region_offset
+        expect(bytes[2]).toBe(0x18); // uint8 follows
+        const offset = bytes[3];
+        // aux_region_offset points to the empty aux map (0xA0), one byte before end
+        expect(offset).toBe(result.byteLength - 1);
+        expect(bytes[offset]).toBe(0xa0); // empty map at that offset
+    });
+    it("handles large payloads requiring 5-byte meta size", async () => {
+        // The encoder caps strings at 31 chars, so normal inputs can't exceed 256 bytes.
+        // We verify the >= 256 meta branch by manually constructing a large payload
+        // with a 5-byte meta header and decoding it.
+        // Build the main map content first, then calculate total size
+        const mainContent = [];
+        mainContent.push(0xbf); // indefinite map start
+        mainContent.push(0x08, 0x00); // material_class = FFF
+        mainContent.push(0x09, 0x00); // material_type = PLA
+        mainContent.push(0x0a, 0x64, 0x54, 0x65, 0x73, 0x74); // material_name = "Test"
+        mainContent.push(0x0b, 0x65, 0x42, 0x72, 0x61, 0x6e, 0x64); // brand_name = "Brand"
+        // Pad with key/value pairs (2 bytes each) until main content >= 252 bytes
+        // (5-byte meta + 252 = 257 > 256, triggering the branch)
+        while (mainContent.length < 252) {
+            mainContent.push(0x17, 0x00); // key 23 = 0, repeated padding
+        }
+        mainContent.push(0xff); // break
+        const metaSize = 5; // 0xA1 + 0x02 + 0x19 + hi + lo
+        const totalSize = metaSize + mainContent.length;
+        const largePayload = new Uint8Array(totalSize);
+        largePayload[0] = 0xa1; // meta: definite map, 1 pair
+        largePayload[1] = 0x02; // key: aux_region_offset
+        largePayload[2] = 0x19; // uint16 follows
+        largePayload[3] = (totalSize >> 8) & 0xff;
+        largePayload[4] = totalSize & 0xff;
+        largePayload.set(mainContent, metaSize);
+        // Verify the decoder handles the 5-byte meta header correctly
+        const { decodeOpenPrintTagBinary } = await import("@/lib/openprinttag-decode");
+        const decoded = decodeOpenPrintTagBinary(largePayload);
+        expect(decoded.materialName).toBe("Test");
+        expect(decoded.brandName).toBe("Brand");
+        expect(decoded.meta.AUX_REGION_OFFSET).toBe(totalSize);
+    });
+    it("includes empty_container_weight when emptySpoolWeight provided", () => {
+        const input = {
+            ...minimalInput,
+            emptySpoolWeight: 250,
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        const key = findCBORKey(bytes, OPT_KEY.EMPTY_CONTAINER_WEIGHT);
+        expect(key).toBeGreaterThan(0);
+    });
+    it("omits empty_container_weight when emptySpoolWeight is null", () => {
+        const result = generateOpenPrintTagBinary(minimalInput);
+        const bytes = Array.from(result);
+        const key = findCBORKey(bytes, OPT_KEY.EMPTY_CONTAINER_WEIGHT);
+        expect(key).toBe(-1);
+    });
+    it("encodes shore_hardness_a at key 31", () => {
+        const input = {
+            ...minimalInput,
+            materialType: "TPU",
+            shoreHardnessA: 95,
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        const keyIdx = findCBORKey(bytes, OPT_KEY.SHORE_HARDNESS_A);
+        expect(keyIdx).not.toBe(-1);
+        // Key 31 >= 24, so encoded as 0x18 0x1f; value at keyIdx + 2
+        expect(bytes[keyIdx + 2]).toBe(0x18); // uint8 prefix
+        expect(bytes[keyIdx + 3]).toBe(95);
+    });
+    it("encodes shore_hardness_d at key 32", () => {
+        const input = {
+            ...minimalInput,
+            shoreHardnessD: 60,
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        const keyIdx = findCBORKey(bytes, OPT_KEY.SHORE_HARDNESS_D);
+        expect(keyIdx).not.toBe(-1);
+        expect(bytes[keyIdx + 2]).toBe(0x18);
+        expect(bytes[keyIdx + 3]).toBe(60);
+    });
+    it("omits shore hardness when null", () => {
+        const result = generateOpenPrintTagBinary(minimalInput);
+        const bytes = Array.from(result);
+        expect(findCBORKey(bytes, OPT_KEY.SHORE_HARDNESS_A)).toBe(-1);
+        expect(findCBORKey(bytes, OPT_KEY.SHORE_HARDNESS_D)).toBe(-1);
+    });
+    it("encodes optTags merged with abrasive/soluble (sorted, deduplicated)", () => {
+        const input = {
+            ...minimalInput,
+            abrasive: true,
+            optTags: [71, 4, 16], // high speed, abrasive (dup), matte
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        const keyIdx = findCBORKey(bytes, OPT_KEY.TAGS);
+        expect(keyIdx).not.toBe(-1);
+        // Tags key is 28 >= 24, value starts at keyIdx + 2
+        const arrStart = keyIdx + 2;
+        // Should be definite array of length 3 (4=abrasive, 16=matte, 71=high_speed)
+        expect(bytes[arrStart] & 0xf0).toBe(0x80); // major type 4 (array)
+        expect(bytes[arrStart] & 0x0f).toBe(3); // 3 items
+        // Items should be sorted: 4, 16, 71
+        expect(bytes[arrStart + 1]).toBe(4);
+        expect(bytes[arrStart + 2]).toBe(16);
+        expect(bytes[arrStart + 3]).toBe(0x18); // 71 >= 24
+        expect(bytes[arrStart + 4]).toBe(71);
+    });
+    // GH #634: a stored negative tag used to make encodeCBORUint throw
+    // RangeError (500-ing the .bin export); a fractional tag would coerce
+    // into a *different* tag id. Both are skipped — never rounded.
+    it("skips negative and fractional optTags instead of throwing (GH #634)", () => {
+        const input = {
+            ...minimalInput,
+            optTags: [-1, 1.5, 16],
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        const keyIdx = findCBORKey(bytes, OPT_KEY.TAGS);
+        expect(keyIdx).not.toBe(-1);
+        const arrStart = keyIdx + 2;
+        // Only the valid tag (16 = matte) survives
+        expect(bytes[arrStart]).toBe(0x81); // array of 1
+        expect(bytes[arrStart + 1]).toBe(16);
+    });
+    it("omits the tags key entirely when every optTag is invalid", () => {
+        const input = {
+            ...minimalInput,
+            optTags: [-5, 2.5],
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        expect(findCBORKey(bytes, OPT_KEY.TAGS)).toBe(-1);
+    });
+    // GH #650: a value above the encoder's 2^32-1 uint ceiling would be
+    // truncated to its low 32 bits (e.g. 2^32+16 → 16) and silently encode
+    // a *different* tag. It must be skipped, not wrapped.
+    it("skips optTags above the CBOR uint32 ceiling instead of truncating (GH #650)", () => {
+        const input = {
+            ...minimalInput,
+            optTags: [2 ** 32 + 16, 4],
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        const keyIdx = findCBORKey(bytes, OPT_KEY.TAGS);
+        expect(keyIdx).not.toBe(-1);
+        const arrStart = keyIdx + 2;
+        // Only the valid tag (4) survives — the oversized one is dropped, NOT
+        // truncated to 16 (which would have produced an array of 2).
+        expect(bytes[arrStart]).toBe(0x81); // array of 1
+        expect(bytes[arrStart + 1]).toBe(4);
+    });
+    it("rounds fractional drying temperature and time (GH #634)", () => {
+        const input = {
+            ...minimalInput,
+            dryingTemperature: 54.5,
+            dryingTime: 359.6,
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        const tempIdx = findCBORKey(bytes, OPT_KEY.DRYING_TEMPERATURE);
+        expect(tempIdx).not.toBe(-1);
+        expect(bytes[tempIdx + 2]).toBe(0x18); // uint8 follows
+        expect(bytes[tempIdx + 3]).toBe(55); // Math.round(54.5)
+        const timeIdx = findCBORKey(bytes, OPT_KEY.DRYING_TIME);
+        expect(timeIdx).not.toBe(-1);
+        expect(bytes[timeIdx + 2]).toBe(0x19); // uint16 follows
+        expect(bytes[timeIdx + 3]).toBe(0x01); // 360 = 0x0168
+        expect(bytes[timeIdx + 4]).toBe(0x68);
+    });
+    it("caps oversized dryingTime instead of wrapping past 2^32 (GH #634)", () => {
+        const input = {
+            ...minimalInput,
+            dryingTime: 2 ** 32 + 5,
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        const timeIdx = findCBORKey(bytes, OPT_KEY.DRYING_TIME);
+        expect(timeIdx).not.toBe(-1);
+        // Capped at 10080 minutes (7 days) = 0x2760
+        expect(bytes[timeIdx + 2]).toBe(0x19); // uint16 follows
+        expect(bytes[timeIdx + 3]).toBe(0x27);
+        expect(bytes[timeIdx + 4]).toBe(0x60);
+    });
+    it("rounds fractional shore hardness and caps at 100 (GH #634)", () => {
+        const input = {
+            ...minimalInput,
+            shoreHardnessA: 95.6,
+            shoreHardnessD: 150,
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        const aIdx = findCBORKey(bytes, OPT_KEY.SHORE_HARDNESS_A);
+        expect(aIdx).not.toBe(-1);
+        expect(bytes[aIdx + 2]).toBe(0x18);
+        expect(bytes[aIdx + 3]).toBe(96); // Math.round(95.6)
+        const dIdx = findCBORKey(bytes, OPT_KEY.SHORE_HARDNESS_D);
+        expect(dIdx).not.toBe(-1);
+        expect(bytes[dIdx + 2]).toBe(0x18);
+        expect(bytes[dIdx + 3]).toBe(100); // capped to the Shore scale
+    });
+    it("keeps the everyday nozzle temp in MAX even when first-layer >= nozzle+20 (GH #634 / #952.4)", () => {
+        const input = {
+            ...minimalInput,
+            nozzleTemp: 230,
+            nozzleTempFirstLayer: 260, // derived min would be 240 > everyday 230
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        const minIdx = findCBORKey(bytes, OPT_KEY.MIN_PRINT_TEMPERATURE);
+        const maxIdx = findCBORKey(bytes, OPT_KEY.MAX_PRINT_TEMPERATURE);
+        expect(minIdx).not.toBe(-1);
+        expect(maxIdx).not.toBe(-1);
+        // GH #952.4: MAX is pinned to the EVERYDAY temp (230) so the decoder reads it
+        // back correctly; MIN is clamped to it (min ≤ max holds — the #634 invariant).
+        // The first-layer excess (260) can't extend a pinned MAX, so it isn't stored.
+        expect(bytes[minIdx + 2]).toBe(0x18);
+        expect(bytes[minIdx + 3]).toBe(230);
+        expect(bytes[maxIdx + 2]).toBe(0x18);
+        expect(bytes[maxIdx + 3]).toBe(230);
+        // Preheat derives from the effective min: 230 - 20 = 210
+        const preheatIdx = findCBORKey(bytes, OPT_KEY.PREHEAT_TEMPERATURE);
+        expect(preheatIdx).not.toBe(-1);
+        expect(bytes[preheatIdx + 2]).toBe(0x18);
+        expect(bytes[preheatIdx + 3]).toBe(210);
+    });
+    it("appends auxiliary region with consumed_weight", () => {
+        const input = {
+            ...minimalInput,
+            consumedWeight: 150,
+        };
+        const result = generateOpenPrintTagBinary(input);
+        const bytes = Array.from(result);
+        // The aux region should be appended after the main map
+        // Look for an indefinite map (0xBF) after the first 0xFF (main map end)
+        const mainEnd = bytes.indexOf(0xff);
+        const auxStart = bytes.indexOf(0xbf, mainEnd + 1);
+        expect(auxStart).toBeGreaterThan(mainEnd);
+        // Key 0 = consumed_weight, value = 150 (0x18, 0x96)
+        expect(bytes[auxStart + 1]).toBe(0); // key 0
+        expect(bytes[auxStart + 2]).toBe(0x18); // uint8 prefix
+        expect(bytes[auxStart + 3]).toBe(150);
+    });
+    it("omits auxiliary region when consumedWeight is null", () => {
+        const result = generateOpenPrintTagBinary(minimalInput);
+        const bytes = Array.from(result);
+        // Count 0xBF occurrences — should be exactly 1 (main map only)
+        const bfCount = bytes.filter((b) => b === 0xbf).length;
+        expect(bfCount).toBe(1);
+    });
+    it("uses a 3-byte meta header when the whole payload is < 24 bytes", () => {
+        // Empty names + unknown material type produce a minimal main map so the
+        // total falls below 24, exercising the 3-byte meta branch (0xA1 0x02 <val<24>).
+        const result = generateOpenPrintTagBinary({
+            materialName: "",
+            brandName: "",
+            materialType: "",
+        });
+        const bytes = Array.from(result);
+        expect(result.byteLength).toBeLessThan(24);
+        expect(bytes[0]).toBe(0xa1); // meta map
+        expect(bytes[1]).toBe(0x02); // key = aux_region_offset
+        // Offset encodes directly as a single byte (< 24), then the main map begins.
+        expect(bytes[2]).toBeLessThan(24);
+        expect(bytes[3]).toBe(0xbf); // main indefinite map starts right after the 3-byte meta
+        // The offset points at the trailing empty aux map (last byte).
+        expect(bytes[bytes[2]]).toBe(0xa0);
+    });
+    it("uses a 5-byte meta header when the payload is >= 256 bytes", () => {
+        // A large distinct-tag array pushes the total over 256, exercising the
+        // 5-byte meta branch (0xA1 0x02 0x19 hi lo) — the only public-API way to
+        // exceed the 31-char string caps.
+        const manyTags = Array.from({ length: 300 }, (_, i) => i);
+        const result = generateOpenPrintTagBinary({
+            ...minimalInput,
+            optTags: manyTags,
+        });
+        const bytes = Array.from(result);
+        expect(result.byteLength).toBeGreaterThanOrEqual(256);
+        expect(bytes[0]).toBe(0xa1);
+        expect(bytes[1]).toBe(0x02);
+        expect(bytes[2]).toBe(0x19); // uint16 offset follows
+        const offset = (bytes[3] << 8) | bytes[4];
+        expect(offset).toBe(result.byteLength - 1);
+        expect(bytes[offset]).toBe(0xa0); // empty aux map at the offset
+    });
+    it("encodes a 24–255-length tags array with a 0x98 uint8 header", () => {
+        const tags30 = Array.from({ length: 30 }, (_, i) => i);
+        const result = generateOpenPrintTagBinary({ ...minimalInput, optTags: tags30 });
+        const bytes = Array.from(result);
+        const keyIdx = findCBORKey(bytes, OPT_KEY.TAGS);
+        expect(keyIdx).not.toBe(-1);
+        // Tags key 28 >= 24, so the array header starts at keyIdx + 2.
+        expect(bytes[keyIdx + 2]).toBe(0x98); // definite array, uint8 length
+        expect(bytes[keyIdx + 3]).toBe(30);
+    });
+    it("encodes a 256+-length tags array with a 0x99 uint16 header", () => {
+        const manyTags = Array.from({ length: 300 }, (_, i) => i);
+        const result = generateOpenPrintTagBinary({ ...minimalInput, optTags: manyTags });
+        const bytes = Array.from(result);
+        const keyIdx = findCBORKey(bytes, OPT_KEY.TAGS);
+        expect(keyIdx).not.toBe(-1);
+        expect(bytes[keyIdx + 2]).toBe(0x99); // definite array, uint16 length
+        expect(bytes[keyIdx + 3]).toBe((300 >> 8) & 0xff); // 0x01
+        expect(bytes[keyIdx + 4]).toBe(300 & 0xff); // 0x2c
+    });
+    it("encodes secondary colors into their slots, skipping malformed entries (GH #477)", async () => {
+        // Slot 1 ("notacolor") is unparseable; the encoder must skip it (rgba === null)
+        // and write slots 0 and 2 in their own key slots. Round-trip through the
+        // decoder to assert the observable result rather than raw byte offsets.
+        const result = generateOpenPrintTagBinary({
+            ...minimalInput,
+            secondaryColors: ["#112233", "notacolor", "#445566"],
+        });
+        const { decodeOpenPrintTagBinary } = await import("@/lib/openprinttag-decode");
+        const decoded = decodeOpenPrintTagBinary(result);
+        // Only the two valid entries survive; the malformed middle slot is dropped.
+        expect(decoded.secondaryColors).toEqual(["#112233", "#445566"]);
+    });
+    it("emits no secondary colors when every entry is malformed", async () => {
+        const result = generateOpenPrintTagBinary({
+            ...minimalInput,
+            secondaryColors: ["nope", "#12"],
+        });
+        const { decodeOpenPrintTagBinary } = await import("@/lib/openprinttag-decode");
+        const decoded = decodeOpenPrintTagBinary(result);
+        expect(decoded.secondaryColors).toBeUndefined();
+    });
+});
+// ── Constants ───────────────────────────────────────────────────────
+describe("OPT_KEY constants", () => {
+    it("has expected key values from the spec", () => {
+        expect(OPT_KEY.MATERIAL_CLASS).toBe(8);
+        expect(OPT_KEY.MATERIAL_TYPE).toBe(9);
+        expect(OPT_KEY.MATERIAL_NAME).toBe(10);
+        expect(OPT_KEY.BRAND_NAME).toBe(11);
+        expect(OPT_KEY.NOMINAL_NETTO_FULL_WEIGHT).toBe(16);
+        expect(OPT_KEY.FILAMENT_DIAMETER).toBe(30);
+        expect(OPT_KEY.SHORE_HARDNESS_A).toBe(31);
+        expect(OPT_KEY.SHORE_HARDNESS_D).toBe(32);
+        expect(OPT_KEY.MIN_PRINT_TEMPERATURE).toBe(34);
+        expect(OPT_KEY.MAX_PRINT_TEMPERATURE).toBe(35);
+        expect(OPT_KEY.MATERIAL_ABBREVIATION).toBe(52);
+        expect(OPT_KEY.COUNTRY_OF_ORIGIN).toBe(55);
+        expect(OPT_KEY.DRYING_TEMPERATURE).toBe(57);
+        expect(OPT_KEY.DRYING_TIME).toBe(58);
+        expect(OPT_KEY.AUX_CONSUMED_WEIGHT).toBe(0);
+    });
+});
+describe("OPT_TAG constants", () => {
+    it("has expected tag values from the spec", () => {
+        expect(OPT_TAG.ABRASIVE).toBe(4);
+        expect(OPT_TAG.WATER_SOLUBLE).toBe(13);
+        expect(OPT_TAG.MATTE).toBe(16);
+        expect(OPT_TAG.SILK).toBe(17);
+        expect(OPT_TAG.GLOW_IN_THE_DARK).toBe(24);
+        expect(OPT_TAG.CONTAINS_CARBON_FIBER).toBe(31);
+        expect(OPT_TAG.RECYCLED).toBe(49);
+        expect(OPT_TAG.HIGH_SPEED).toBe(71);
+    });
+});
+describe("MATERIAL_CLASS constants", () => {
+    it("has FFF = 0 and SLA = 1", () => {
+        expect(MATERIAL_CLASS.FFF).toBe(0);
+        expect(MATERIAL_CLASS.SLA).toBe(1);
+    });
+});
+describe("MATERIAL_TYPE constants (per OpenPrintTag spec)", () => {
+    it("has correct enum values from data/material_type_enum.yaml", () => {
+        expect(MATERIAL_TYPE.PLA).toBe(0);
+        expect(MATERIAL_TYPE.PETG).toBe(1);
+        expect(MATERIAL_TYPE.TPU).toBe(2);
+        expect(MATERIAL_TYPE.ABS).toBe(3);
+        expect(MATERIAL_TYPE.ASA).toBe(4);
+        expect(MATERIAL_TYPE.PC).toBe(5);
+        expect(MATERIAL_TYPE.PCTG).toBe(6);
+        expect(MATERIAL_TYPE.PP).toBe(7);
+        expect(MATERIAL_TYPE.PA6).toBe(8);
+        expect(MATERIAL_TYPE.PA11).toBe(9);
+        expect(MATERIAL_TYPE.PA12).toBe(10);
+        expect(MATERIAL_TYPE.PA66).toBe(11);
+        expect(MATERIAL_TYPE.HIPS).toBe(14);
+        expect(MATERIAL_TYPE.PVA).toBe(20);
+        expect(MATERIAL_TYPE.POM).toBe(34);
+        expect(MATERIAL_TYPE.PEBA).toBe(28);
+        expect(MATERIAL_TYPE.PPA).toBe(30);
+        expect(MATERIAL_TYPE.EVA).toBe(41);
+    });
+});
+// ── Helper to find a CBOR key in the byte stream ────────────────────
+/**
+ * Find the position of a CBOR integer key in a byte array.
+ * For keys >= 24, looks for the 0x18+key pair. Returns the index of 0x18.
+ * For keys < 24, looks for the single byte. Returns the index of the byte.
+ *
+ * To get the value position after the key:
+ *   key < 24:  value starts at keyIdx + 1
+ *   key >= 24: value starts at keyIdx + 2
+ *
+ * Returns -1 if not found.
+ */
+function findCBORKey(bytes, key) {
+    if (key < 24) {
+        // Direct encoding: single byte — search within the main indefinite map
+        // Skip meta map to avoid false positives
+        const bfIdx = bytes.indexOf(0xbf);
+        if (bfIdx === -1)
+            return -1;
+        for (let i = bfIdx + 1; i < bytes.length - 1; i++) {
+            if (bytes[i] === key)
+                return i;
+        }
+    }
+    else if (key < 256) {
+        // uint8: 0x18 followed by key
+        for (let i = 0; i < bytes.length - 1; i++) {
+            if (bytes[i] === 0x18 && bytes[i + 1] === key)
+                return i;
+        }
+    }
+    return -1;
+}
