@@ -1,8 +1,15 @@
 import { defineConfig, globalIgnores } from "eslint/config";
 import nextVitals from "eslint-config-next/core-web-vitals";
+import tsPlugin from "@typescript-eslint/eslint-plugin";
 
 const eslintConfig = defineConfig([
   ...nextVitals,
+  {
+    // Converted JavaScript files still contain TypeScript rule directives.
+    // Register those rules without enabling TypeScript checks on JavaScript.
+    plugins: { "@typescript-eslint": tsPlugin },
+    linterOptions: { reportUnusedDisableDirectives: "off" },
+  },
   // Override default ignores of eslint-config-next.
   globalIgnores([
     // Default ignores of eslint-config-next:
@@ -28,6 +35,8 @@ const eslintConfig = defineConfig([
     // root-anchored, so it wouldn't catch `.claude/worktrees/*/packages/**`.
     // Mirrors vitest.config.ts's tests/-only scoping against the same class.
     ".claude/**",
+    ".cache/**",
+    ".vibe/**",
   ]),
 ]);
 

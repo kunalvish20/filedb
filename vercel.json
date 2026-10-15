@@ -1,0 +1,6 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "installCommand": "ELECTRON_SKIP_BINARY_DOWNLOAD=1 MONGOMS_DISABLE_POSTINSTALL=1 npm ci --include=dev --no-audit --no-fund",
+  "buildCommand": "npm run build"
+}

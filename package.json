@@ -9,6 +9,9 @@
   "homepage": "https://github.com/kunalvish20",
   "license": "(AGPL-3.0-or-later AND CC-BY-NC-ND-4.0)",
   "private": true,
+  "engines": {
+    "node": "^20.19.0 || ^22.12.0 || ^24.0.0"
+  },
   "main": "electron-dist/main.js",
   "scripts": {
     "dev": "next dev -p 3456",
@@ -33,7 +36,6 @@
     "backfill:spools": "tsx scripts/backfill-spools.js"
   },
   "dependencies": {
-    "@pokusew/pcsclite": "^0.6.0",
     "bonjour-service": "^1.4.1",
     "electron-store": "^11.0.2",
     "electron-updater": "^6.8.3",
@@ -54,6 +56,9 @@
     "tar": "^7.5.16",
     "undici": "^6.28.0",
     "yaml": "^2.8.3"
+  },
+  "optionalDependencies": {
+    "@pokusew/pcsclite": "^0.6.0"
   },
   "overrides": {
     "postcss": "^8.5.18",
@@ -85,6 +90,7 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@types/swagger-ui-react": "^5.18.0",
+    "@typescript-eslint/eslint-plugin": "^8.59.0",
     "@vitest/coverage-v8": "^4.1.1",
     "concurrently": "^9.2.1",
     "electron": "^41.10.4",

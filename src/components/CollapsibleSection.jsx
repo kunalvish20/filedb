@@ -56,8 +56,8 @@ export default function CollapsibleSection({ id, title, subtitle, defaultOpen = 
     // defaultOpen. We accept one re-render after hydration in exchange.
     useEffect(() => {
         const stored = readStoredOpen(id, defaultOpen);
-        // eslint-disable-next-line react-hooks/set-state-in-effect -- post-hydration sync from localStorage
         if (stored !== defaultOpen)
+            // eslint-disable-next-line react-hooks/set-state-in-effect -- post-hydration sync from localStorage
             setOpen(stored);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);

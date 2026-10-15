@@ -1,0 +1,32 @@
+name: Vercel build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  web-build:
+    runs-on: ubuntu-latest
+    env:
+      VERCEL: "1"
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      MONGOMS_DISABLE_POSTINSTALL: "1"
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      # Deliberately install without PC/SC system libraries, as on Vercel.
+      - name: Install web build dependencies
+        run: npm ci --include=dev --no-audit --no-fund
+      - name: Lint
+        run: npm run lint
+      - name: Build for Vercel
+        run: npm run build

@@ -43,8 +43,8 @@ export function TranslationProvider({ children }) {
     // is the accepted trade-off.
     useEffect(() => {
         const stored = readStoredLocale();
-        // eslint-disable-next-line react-hooks/set-state-in-effect -- post-hydration sync from localStorage
         if (stored !== DEFAULT_LOCALE)
+            // eslint-disable-next-line react-hooks/set-state-in-effect -- post-hydration sync from localStorage
             setLocaleState(stored);
     }, []);
     // In Electron, electron-store is the source of truth — override the

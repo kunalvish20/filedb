@@ -117,6 +117,13 @@ npm run electron:dev          # or run as desktop app
 
 See the [Setup Guide](docs/setup.md) for detailed instructions.
 
+### Vercel
+
+Import this repository with the Next.js preset and set `MONGODB_URI` in Vercel
+Environment Variables. The committed install configuration supports cloud
+builds without desktop hardware dependencies. See [Deploying to Vercel](DEPLOYMENT.md)
+for database setup, access protection, and hosting limits.
+
 ## Documentation
 
 | Document | Description |

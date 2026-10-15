@@ -1,7 +1,8 @@
 import { readFileSync } from "fs";
 const pkg = JSON.parse(readFileSync("./package.json", "utf-8"));
 const nextConfig = {
-    output: "standalone",
+    // Vercel packages its own functions; standalone output is for desktop/Docker.
+    output: process.env.VERCEL === "1" ? undefined : "standalone",
     allowedDevOrigins: process.env.ALLOWED_DEV_ORIGINS
         ? process.env.ALLOWED_DEV_ORIGINS.split(",").map(s => s.trim())
         : [],
