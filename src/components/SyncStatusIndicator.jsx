@@ -2,6 +2,7 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useTranslation } from "@/i18n/TranslationProvider";
 import { useDateFormat } from "@/hooks/useDateFormat";
+import { useDatabaseConnection } from "./DatabaseConnectionProvider";
 function formatRelativeTime(iso, t) {
     const diff = Date.now() - new Date(iso).getTime();
     const mins = Math.floor(diff / 60000);
@@ -17,6 +18,7 @@ function formatRelativeTime(iso, t) {
 export default function SyncStatusIndicator() {
     const { t } = useTranslation();
     const { formatDateTime } = useDateFormat();
+    const { status: databaseStatus } = useDatabaseConnection();
     const [status, setStatus] = useState(null);
     const [mode, setMode] = useState("");
     const [isFallback, setIsFallback] = useState(false);
@@ -127,13 +129,18 @@ export default function SyncStatusIndicator() {
     if (!mounted)
         return null;
     // ── Determine what to display ──
-    // Non-Electron (web app): show simple online/offline pill
+    // Browser connectivity alone does not prove the server can reach MongoDB.
     if (!isElectron) {
-        return (<span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs ${online
+        const connected = online && databaseStatus === "ready";
+        const label = !online ? "sync.status.offline"
+            : databaseStatus === "checking" ? "database.checking"
+                : connected ? "sync.status.connected"
+                    : databaseStatus === "unconfigured" ? "database.setup.title" : "sync.status.noConnection";
+        return (<span role="status" className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs ${connected
                 ? "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-400"
                 : "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-400"}`}>
-        <span className={`w-1.5 h-1.5 rounded-full ${online ? "bg-green-500" : "bg-red-500"}`}/>
-        {online ? t("sync.status.connected") : t("sync.status.offline")}
+        <span className={`w-1.5 h-1.5 rounded-full ${connected ? "bg-green-500" : "bg-red-500"}`}/>
+        {t(label)}
       </span>);
     }
     // GH #527: first-run Electron has connectionMode === "" because the

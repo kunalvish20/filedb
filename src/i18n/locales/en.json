@@ -1780,5 +1780,11 @@
   "new.prusamentDescription": "Use a spool ID or QR link",
   "new.iniDescription": "Upload a slicer profile",
   "new.cloneDescription": "Reuse a saved filament",
-  "prusament.import.inrCostHint": "Enter your purchase cost in Indian rupees after import."
+  "prusament.import.inrCostHint": "Enter your purchase cost in Indian rupees after import.",
+  "database.checking": "Checking database…",
+  "database.setup.title": "Database setup needed",
+  "database.setup.description": "Connect a MongoDB Atlas database to this hosting project, confirm MONGODB_URI is set for Production, then redeploy. You can fill in the form, but filaments cannot be saved until the database is connected.",
+  "database.setup.guide": "MongoDB Atlas setup guide",
+  "database.unavailable.title": "Database connection unavailable",
+  "database.unavailable.description": "Your form entries are still here. Check the database credentials and Atlas Network Access settings, then try again."
 }

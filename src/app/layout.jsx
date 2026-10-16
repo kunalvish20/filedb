@@ -4,6 +4,7 @@ import AppHeader from "@/components/AppHeader";
 import ClientProviders from "@/components/ClientProviders";
 import SkipToMain from "@/components/SkipToMain";
 import { themeInitScript } from "@/lib/themeInitScript";
+import DatabaseConnectionNotice from "@/components/DatabaseConnectionNotice";
 const geistSans = Geist({
     variable: "--font-geist-sans",
     subsets: ["latin"],
@@ -54,7 +55,7 @@ export default function RootLayout({ children, }) {
             the locale-aware label resolves via `t()`. */}
           <SkipToMain />
           <AppHeader />
-          <div className="app-content">{children}</div>
+          <div className="app-content"><DatabaseConnectionNotice />{children}</div>
         </ClientProviders>
       </body>
     </html>);

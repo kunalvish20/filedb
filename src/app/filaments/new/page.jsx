@@ -9,6 +9,7 @@ import UnsavedChangesDialog from "@/components/UnsavedChangesDialog";
 import { useNfcContext } from "@/components/NfcProvider";
 import { useUnsavedChanges } from "@/hooks/useUnsavedChanges";
 import { useTranslation } from "@/i18n/TranslationProvider";
+import { readApiArray } from "@/lib/readApiArray";
 function NewFilamentContent() {
     const searchParams = useSearchParams();
     const { toast } = useToast();
@@ -158,8 +159,13 @@ function NewFilamentContent() {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
+        }).catch(() => {
+            toast(t("new.toast.createFailed"), "error");
+            return null;
         });
         let res = await post(data);
+        if (!res)
+            return false;
         // GH #605 (Phase 2b): creating the FIRST variant of a parent that still
         // carries its own color/spools turns that parent into a template — the
         // server moves the color + spools onto a new sibling variant, and 409s
@@ -170,7 +176,7 @@ function NewFilamentContent() {
             const conflict = await res.json().catch(() => null);
             if (conflict?.error !== "parent_promotion_required") {
                 toast(conflict?.error || t("new.toast.createFailed"), "error");
-                return;
+                return false;
             }
             const ok = await confirm({
                 title: t("new.promote.title"),
@@ -182,17 +188,21 @@ function NewFilamentContent() {
                 confirmLabel: t("new.promote.confirm"),
             });
             if (!ok)
-                return;
+                return false;
             res = await post({ ...data, promoteParent: true });
+            if (!res)
+                return false;
         }
         if (res.ok) {
             const created = await res.json();
             toast(t("new.toast.created"));
             navigate(`/filaments/${created._id}`);
+            return true;
         }
         else {
             const body = await res.json().catch(() => null);
             toast(body?.error || t("new.toast.createFailed"), "error");
+            return false;
         }
     };
     // Initialize from NFC query params
@@ -344,7 +354,7 @@ function NewFilamentContent() {
     useEffect(() => {
         const ac = new AbortController();
         fetch("/api/filaments/parents", { signal: ac.signal })
-            .then((r) => r.json())
+            .then(readApiArray)
             .then(setCloneOptions)
             .catch((err) => {
             if (err instanceof DOMException && err.name === "AbortError")

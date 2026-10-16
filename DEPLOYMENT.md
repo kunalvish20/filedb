@@ -1,5 +1,31 @@
 # Deploying to Vercel
 
+## Easiest first-time database setup
+
+This application uses MongoDB. Supabase provides PostgreSQL and requires a
+database-layer migration before it can replace MongoDB here.
+
+1. Open the [MongoDB Atlas integration in Vercel](https://vercel.com/marketplace/mongodbatlas/atlas)
+   and click **Install**.
+2. Select the **Free** cluster tier and the **Free ($0)** installation plan.
+   Set the database name to `spilofila`, choose a region, and create the cluster.
+3. When the resource becomes **Available**, connect it to the Vercel project
+   serving your site's actual domain. If you have several projects imported
+   from this repository, connecting one does not configure the others.
+4. In that project's **Settings → Environment Variables**, confirm that the
+   integration added `MONGODB_URI` for **Production** (and Preview if used).
+   The integration creates the URI for you; do not paste it into source code.
+5. Redeploy the latest `main` deployment. Environment changes take effect on
+   the new deployment.
+6. Open `/api/health`. A working connection returns `{"status":"ready"}`.
+   Then open `/filaments/new`, enter a name, vendor, material, and cost, and save.
+   The new filament should appear in the Filaments list.
+
+The integration provisions database access and network settings automatically.
+See the [official integration instructions](https://www.mongodb.com/docs/atlas/reference/partner-integrations/vercel/).
+
+## Connecting an existing MongoDB Atlas database
+
 1. Import `kunalvish20/filedb`, select the `main` branch, and leave the root
    directory at the repository root. Use the **Next.js** framework preset.
 2. Add `MONGODB_URI` in **Settings → Environment Variables** for Production

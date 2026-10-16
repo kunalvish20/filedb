@@ -1780,5 +1780,11 @@
   "new.prusamentDescription": "Spulen-ID oder QR-Link verwenden",
   "new.iniDescription": "Slicer-Profil hochladen",
   "new.cloneDescription": "Gespeichertes Filament verwenden",
-  "prusament.import.inrCostHint": "Nach dem Import die Einkaufskosten in indischen Rupien eingeben."
+  "prusament.import.inrCostHint": "Nach dem Import die Einkaufskosten in indischen Rupien eingeben.",
+  "database.checking": "Datenbank wird geprüft…",
+  "database.setup.title": "Datenbankeinrichtung erforderlich",
+  "database.setup.description": "Eine MongoDB-Atlas-Datenbank mit diesem Hosting-Projekt verbinden, MONGODB_URI für Production setzen und erneut bereitstellen. Das Formular kann ausgefüllt werden; Filamente lassen sich erst mit verbundener Datenbank speichern.",
+  "database.setup.guide": "Anleitung zur Einrichtung von MongoDB Atlas",
+  "database.unavailable.title": "Datenbankverbindung nicht verfügbar",
+  "database.unavailable.description": "Ihre Formulareingaben bleiben erhalten. Prüfen Sie die Datenbank-Zugangsdaten und die Atlas-Netzwerkzugriffseinstellungen und versuchen Sie es erneut."
 }

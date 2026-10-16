@@ -11,6 +11,7 @@ import { filterColorSuggestions, lookupCssNamedColor, isBlankColorHex, isIncompl
 import { deriveArrangement, arrangementToOptTag, stripArrangementTags, seedFormColorHex, normalizeColorHexInput, submittedColorValue, } from "@/lib/filamentColors";
 import { isInvertedNozzleRange } from "@/lib/temperatureRange";
 import { unwrapIniString, wrapIniString } from "@/lib/parseIni";
+import { readApiArray } from "@/lib/readApiArray";
 /**
  * Generate a stable unique id for a client-side list row. Using crypto.randomUUID
  * when available (secure contexts only) with a math-random fallback for legacy
@@ -253,11 +254,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange, isP
     useEffect(() => {
         const ac = new AbortController();
         fetch("/api/filaments/types", { signal: ac.signal })
-            .then((r) => {
-            if (!r.ok)
-                throw new Error();
-            return r.json();
-        })
+            .then(readApiArray)
             .then((dbTypes) => {
             const merged = Array.from(new Set([...DEFAULT_FILAMENT_TYPES, ...dbTypes])).sort();
             setFilamentTypes(merged);
@@ -270,11 +267,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange, isP
     useEffect(() => {
         const ac = new AbortController();
         fetch("/api/filaments/vendors", { signal: ac.signal })
-            .then((r) => {
-            if (!r.ok)
-                throw new Error();
-            return r.json();
-        })
+            .then(readApiArray)
             .then((v) => setVendorOptions(v))
             .catch(() => { if (!ac.signal.aborted)
             addFetchError("vendors"); });
@@ -287,11 +280,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange, isP
     useEffect(() => {
         const ac = new AbortController();
         fetch("/api/filaments/colors", { signal: ac.signal })
-            .then((r) => {
-            if (!r.ok)
-                throw new Error();
-            return r.json();
-        })
+            .then(readApiArray)
             .then((pairs) => {
             setColorNameSuggestions(pairs.map((p) => ({ name: p.name, hex: p.hex, source: "db" })));
         })
@@ -304,11 +293,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange, isP
         const ac = new AbortController();
         const exclude = initialData?._id || "";
         fetch(`/api/filaments/parents${exclude ? `?exclude=${exclude}` : ""}`, { signal: ac.signal })
-            .then((r) => {
-            if (!r.ok)
-                throw new Error();
-            return r.json();
-        })
+            .then(readApiArray)
             .then(setParentOptions)
             .catch(() => { if (!ac.signal.aborted)
             addFetchError("parent filaments"); })
@@ -341,15 +326,15 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange, isP
             return;
         const ac = new AbortController();
         fetch(`/api/filaments?vendor=${encodeURIComponent(form.vendor)}`, { signal: ac.signal })
-            .then((r) => r.json())
+            .then(readApiArray)
             .then((data) => {
             const suggestions = data
                 .filter((f) => f.tdsUrl && f.name !== form.name)
                 .map((f) => ({ name: f.name, tdsUrl: f.tdsUrl }));
             setTdsSuggestions(suggestions);
         })
-            .catch((err) => { if (!ac.signal.aborted)
-            console.error(err); });
+            .catch(() => { if (!ac.signal.aborted)
+            addFetchError("TDS suggestions"); });
         return () => ac.abort();
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [form.vendor]);
@@ -521,11 +506,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange, isP
     useEffect(() => {
         const ac = new AbortController();
         fetch("/api/nozzles", { signal: ac.signal })
-            .then((r) => {
-            if (!r.ok)
-                throw new Error();
-            return r.json();
-        })
+            .then(readApiArray)
             .then(setNozzles)
             .catch(() => { if (!ac.signal.aborted)
             addFetchError("nozzles"); })
@@ -536,11 +517,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange, isP
     useEffect(() => {
         const ac = new AbortController();
         fetch("/api/printers", { signal: ac.signal })
-            .then((r) => {
-            if (!r.ok)
-                throw new Error();
-            return r.json();
-        })
+            .then(readApiArray)
             .then(setPrinters)
             .catch(() => { if (!ac.signal.aborted)
             addFetchError("printers"); })
@@ -551,11 +528,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange, isP
     useEffect(() => {
         const ac = new AbortController();
         fetch("/api/bed-types", { signal: ac.signal })
-            .then((r) => {
-            if (!r.ok)
-                throw new Error();
-            return r.json();
-        })
+            .then(readApiArray)
             .then(setBedTypes)
             .catch(() => { if (!ac.signal.aborted)
             addFetchError("bed types"); })
@@ -684,7 +657,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange, isP
             // null — the API and schema accept it; pre-fix the UI could never
             // produce a null color outside the coextruded arrangement.
             const submittedColor = submittedColorValue(form.color, form.optTags);
-            await onSubmit({
+            const saved = await onSubmit({
                 name: form.name,
                 vendor: form.vendor,
                 type: form.type,
@@ -805,6 +778,8 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange, isP
                 parentId: form.parentId || null,
                 settings,
             });
+            if (saved === false)
+                return;
             savedRef.current = true;
             // GH #286: re-baseline so the just-saved state counts as clean.
             setDirtyBaseline(JSON.stringify({ form, calibrations, presets }));

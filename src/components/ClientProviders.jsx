@@ -7,9 +7,11 @@ import ThemeProvider from "./ThemeProvider";
 import UpdateBanner from "./UpdateBanner";
 import DevModeBanner from "./DevModeBanner";
 import { TranslationProvider } from "@/i18n/TranslationProvider";
+import DatabaseConnectionProvider from "./DatabaseConnectionProvider";
 export default function ClientProviders({ children }) {
     return (<ThemeProvider>
       <TranslationProvider>
+        <DatabaseConnectionProvider>
         <ToastProvider>
           {/* GH #343 (#1): in-app confirm replaces native window.confirm() —
             themed, asynchronous, and doesn't freeze the renderer. */}
@@ -25,6 +27,7 @@ export default function ClientProviders({ children }) {
             </NfcProvider>
           </ConfirmProvider>
         </ToastProvider>
+        </DatabaseConnectionProvider>
       </TranslationProvider>
     </ThemeProvider>);
 }
